@@ -5,7 +5,7 @@ import { isIP } from "node:net";
 import { z } from "zod";
 import { privateDirectory, readPrivate, writePrivate } from "./private-files.js";
 import { strictJson } from "./json.js";
-import { canonical, canonicalArguments, touchTools, passiveTools, readTools, isInputOperation, isPowerKey } from "./operation.js";
+import { canonical, canonicalArguments, touchTools, expertGrantableTools, passiveTools, readTools, isInputOperation, isPowerKey } from "./operation.js";
 export { canonical, touchTools, passiveTools, readTools } from "./operation.js";
 
 export class PolicyError extends Error {
@@ -59,7 +59,7 @@ export class OwnerSecurity {
         if (!this.config.allowedApps.includes(grant.package) || grant.package === this.config.browserPackage || grant.tools.some(t => !touchTools.has(t))) throw new Error();
       }
       for (const grant of this.config.expertSandbox?.grants || []) {
-        if (!this.config.allowedApps.includes(grant.package) || grant.tools.some(t => readTools.has(t) || t === "android_press_key")) throw new Error();
+        if (!this.config.allowedApps.includes(grant.package) || grant.tools.some(t => !expertGrantableTools.has(t))) throw new Error();
       }
       this.directory = privateDirectory(path.resolve(base, this.config.dataDirectory));
       const marker = path.join(this.directory, "owner.json");
@@ -93,7 +93,7 @@ export class OwnerSecurity {
     // Power transitions have no app target, and always require explicit owner approval.
     const power = name === "android_device_info" || (name === "android_press_key" && isPowerKey(args.key));
     if (!power) this.package(args.expectedPackage);
-    const preapproved = !power && name !== "android_press_key" && [...this.config.gameGrants, ...(this.config.expertSandbox?.grants || [])]
+    const preapproved = !power && expertGrantableTools.has(name) && [...this.config.gameGrants, ...(this.config.expertSandbox?.grants || [])]
       .some(g => g.package === args.expectedPackage && g.tools.includes(name));
     if (preapproved) return;
     const grant = args.approval as any;

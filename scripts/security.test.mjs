@@ -16,7 +16,7 @@ import { LIMITS, boundedValue } from '../dist/limits.js';
 import { UiInspector } from '../dist/ui.js';
 import { assertPrivate } from '../dist/private-files.js';
 import { Executor } from '../dist/executor.js';
-import { normalizeKey, actionBinding } from '../dist/operation.js';
+import { normalizeKey, actionBinding, expertGrantableTools } from '../dist/operation.js';
 import { localDeviceSerial } from '../dist/device.js';
 import { strictJson } from '../dist/json.js';
 
@@ -88,6 +88,24 @@ test('small defensive limit fixtures reject deep/long collections and bound XML 
   assert.throws(() => new UiInspector({ adb: () => Buffer.from(xml) }).getElements('fixture'), /depth limit/);
 });
 
+test('expert grants reject unknown, legacy, read and key tools before service construction', () => {
+  const owner = fixtureOwner(fresh('exact-grants'), {
+    expertSandbox: { trustedOperators: true, disposablePhone: true, isolatedEnvironment: true, acceptsRisk: true,
+      grants: [{ package: 'org.example.game', tools: [...expertGrantableTools] }] },
+  });
+  const security = new OwnerSecurity(owner.file);
+  const args = { requestId: 'exact-grant-fixture', expectedPackage: 'org.example.game' };
+  for (const name of expertGrantableTools) security.authorize(name, args);
+  for (const name of ['android_future_action', 'android_install_app', 'android_connect_wifi', 'android_take_screenshot', 'android_device_info', 'android_press_key']) {
+    owner.config.expertSandbox.grants[0].tools = [name];
+    fs.writeFileSync(owner.file, JSON.stringify(owner.config));
+    assert.throws(() => new OwnerSecurity(owner.file), /Invalid owner security configuration/);
+  }
+  // Even accidental in-memory insertion cannot turn an unknown tool into a grant.
+  security.config.expertSandbox.grants[0].tools.push('android_future_action');
+  assert.throws(() => security.authorize('android_future_action', args), /OWNER_APPROVAL_REQUIRED/);
+});
+
 test('retention removes source text but keeps replay tombstones; ledger capacity fails before new work', () => {
   const journal = new ActivityJournal(fresh('retention'), { events: 3, requestIds: 2, retentionMs: 1 });
   const id = journal.begin('android_tap', {}, {}, 'phone', 'retained-request-one');
@@ -109,6 +127,8 @@ test('authentication, field/body/batch caps and legacy filtering reject requests
     assert.equal((await fetch(f.endpoint + '/mcp', { method: 'POST', headers, body })).status, 413);
   const catalog = (await f.client.listTools()).tools;
   assert.equal(catalog.length, 26);
+  for (const name of expertGrantableTools) assert.match(catalog.find(tool => tool.name === name)?.description || '', /explicit local owner grant/);
+  for (const name of ['android_press_key', 'android_device_info']) assert.match(catalog.find(tool => tool.name === name).description, /cannot be pregranted/);
   for (const name of ['android_install_app', 'android_list_devices', 'android_connect_wifi', 'android_save_screenshot']) {
     assert(!catalog.some(t => t.name === name));
     assert((await f.client.callTool({ name, arguments: {} })).isError);

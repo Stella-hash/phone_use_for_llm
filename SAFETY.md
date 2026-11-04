@@ -55,6 +55,14 @@ erasure from SSDs or backups. The replay ledger deliberately retains request
 hashes after source expiry, then stops new ID-bearing operations at capacity.
 History is operational evidence, not a tamper-proof audit log.
 
+`requestBinding.argsDigest` is deterministic, unkeyed SHA-256 over the tool and
+all normalized arguments except `approval`, including input `text`. It provides
+request comparison, **not confidentiality**. A reader in the same owner domain
+who knows the remaining arguments can test guesses for low-entropy values such
+as short phrases or OTPs. Receipts, replay tombstones and exports retain this
+metadata even after source expiry or when `context.private` omits observations.
+Raw-text omission does not make these artifacts anonymous or secret-free.
+
 Ordinary observation text and image previews are returned to the connected MCP
 client, which may send them to its model provider and retain its own copies.
 Localhost binding and service retention limits do not govern that client's or

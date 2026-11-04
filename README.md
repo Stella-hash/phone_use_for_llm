@@ -17,7 +17,9 @@ a trusted computer, a USB-connected Android phone, and a client able to reach th
 computer's authenticated local MCP endpoint. It does not include a language
 model, a hosted connector, or an unattended controller.
 
-**0.9 is a release candidate awaiting independent review.** It defaults to one
+**0.9 remains a release candidate.** The R2 repair has received independent
+review; final integration and hosted publication gates remain tracked in
+[release preparation](docs/RELEASE-PREPARATION.md). It defaults to one
 authenticated owner and per-input approval, with explicit opt-in grants for
 appropriate games and empty sandboxes. Use a dedicated, resettable spare phone
 without real accounts or irreplaceable data, and an isolated host/network. Here,
@@ -97,10 +99,10 @@ running this service on localhost does not make the whole interaction local.
 
 ## Install and configure the strict default
 
-Work from the reviewed candidate identified in [R2 validation](docs/R2-VALIDATION.md).
-During private review, the older default-branch baseline is not interchangeable
-with `gc/red-team-r2`. The owner will select the reviewed public entrypoint before
-release; the commands below assume you are already in that source checkout.
+Use `main` for the integrated source. Review scope and validation limits are
+recorded in [release preparation](docs/RELEASE-PREPARATION.md) and
+[R2 validation](docs/R2-VALIDATION.md); use the checks attached to the exact commit
+you deploy. The commands below assume you are already in that source checkout.
 
 Requirements: Node.js 24 or newer, pnpm 11.25.0, and Android platform-tools for
 actual device use. Windows and POSIX permission handling differ; see validation
@@ -271,6 +273,14 @@ Raw input strings and approval signatures are not journaled or echoed in tool
 errors. Text-input actions omit their follow-up text/image to avoid copying the
 input. Separately requested observations can still contain app text and secrets;
 password masking is narrow and cannot detect every private field.
+
+Receipts and the replay ledger retain `requestBinding.argsDigest`: a deterministic,
+unkeyed SHA-256 of the tool and all normalized arguments except `approval`, including
+input `text`. **This binds a request; it is not encryption or a confidentiality
+mechanism.** A reader with access in the same owner domain who knows the other
+arguments can compare guesses for short, predictable text, including OTPs. The
+digest survives source-record expiry and `context.private`; protect receipts and
+exports as sensitive metadata, and keep real secrets out of this dedicated phone.
 
 History and images are bound to one owner directory. An existing unbound or
 different-owner directory is rejected. Source records expire after seven days or

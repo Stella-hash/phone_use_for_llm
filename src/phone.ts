@@ -12,6 +12,7 @@ import { LIMITS, readRequest } from "./limits.js";
 import { DEFAULT_IMAGE_EDGE } from "./image-delivery.js";
 import { descriptions } from "./tool-descriptions.js";
 import { localDeviceSerial } from "./device.js";
+import { expertGrantableTools } from "./operation.js";
 
 // Validate security before constructing transports, storage or any device executor.
 const security = new OwnerSecurity(process.env.PHONE_SECURITY_FILE);
@@ -72,6 +73,9 @@ const custom: Tool[] = [
       receiptOnly: { type: "boolean", default: false }, includeScreenshot: { type: "boolean", default: false } }, additionalProperties: false }, annotations: { readOnlyHint: true } },
 ];
 catalog.push(...custom);
+for (const name of expertGrantableTools) {
+  if (!catalog.some(tool => tool.name === name) || readTools.has(name)) throw new Error("Grantable tool is absent from the public input catalog");
+}
 const delayedObservationTools = new Set(["android_tap", "android_tap_element", "android_double_tap",
   "android_long_press", "android_swipe", "android_drag", "android_gesture"]);
 const actionImageTools = new Set(catalog.filter(tool => !tool.name.startsWith("android_activity_")
@@ -124,7 +128,10 @@ for (const tool of catalog) {
   bound(tool.inputSchema);
   tool.annotations = { ...tool.annotations, readOnlyHint: readTools.has(tool.name) && tool.name !== "android_device_info", openWorldHint: true };
   tool.description = descriptions[tool.name] || tool.title || tool.name;
-  tool.description += " Owner-authenticated single-owner service. No automatic wake. Input requires requestId and independent approval or an explicit local owner grant. Live UI reads/inputs require known-unlocked, awake state and configured apps; Chrome also requires an exact allowed expectedUrl. Receipt acknowledgement does not establish app completion.";
+  tool.description += " Owner-authenticated single-owner service. No automatic wake.";
+  if (expertGrantableTools.has(tool.name)) tool.description += " Input requires requestId and independent approval or an explicit local owner grant.";
+  else if (!readTools.has(tool.name) || tool.name === "android_device_info") tool.description += " Input requires requestId and independent owner approval every time; it cannot be pregranted.";
+  tool.description += " Live UI reads/inputs require known-unlocked, awake state and configured apps; Chrome also requires an exact allowed expectedUrl. Receipt acknowledgement does not establish app completion.";
 }
 const executor = new Executor(security, device, client, catalog);
 function makeServer() {
