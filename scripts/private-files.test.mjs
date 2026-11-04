@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { privateDirectory, writePrivate, readPrivateSnapshot } from '../dist/private-files.js';
 
 test('private file snapshots preserve stable identity and reject excessive size on this filesystem', () => {
@@ -17,7 +18,8 @@ test('private file snapshots preserve stable identity and reject excessive size 
     const fd = fs.openSync(file, 'r');
     try {
       const fields = s => Object.fromEntries(['dev','ino','nlink','size','mtimeNs','ctimeNs'].map(k => [k, String(s[k])]));
-      throw new Error('Synthetic filesystem diagnostics: ' + JSON.stringify({ path: fields(fs.lstatSync(file, { bigint: true })), descriptor: fields(fs.fstatSync(fd, { bigint: true })) }), { cause: error });
+      const acl = process.platform === 'win32' ? execFileSync('powershell.exe', ['-NoProfile','-Command', '$a=Get-Acl -LiteralPath $env:PHONE_FIXTURE_FILE; [pscustomobject]@{owner=$a.Owner;user=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value;access=$a.AccessToString}|ConvertTo-Json -Compress'], { env: { ...process.env, PHONE_FIXTURE_FILE: file }, encoding: 'utf8', windowsHide: true }).trim() : null;
+      throw new Error('Synthetic filesystem diagnostics: ' + JSON.stringify({ path: fields(fs.lstatSync(file, { bigint: true })), descriptor: fields(fs.fstatSync(fd, { bigint: true })), acl }), { cause: error });
     } finally { fs.closeSync(fd); }
   }
 });

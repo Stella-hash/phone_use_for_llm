@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { createHash } from "node:crypto";
-import { privateDirectory, noLinks } from "./private-files.js";
+import { privateDirectory, noLinks, protectDatabaseFiles } from "./private-files.js";
 import { LIMITS } from "./limits.js";
 import { readJsonResponse } from "./response.js";
 import { isInputOperation, actionBinding } from "./operation.js";
@@ -46,6 +46,7 @@ export class ActivityJournal {
         id INTEGER PRIMARY KEY AUTOINCREMENT, through_event_id INTEGER NOT NULL,
         created_at TEXT NOT NULL, payload TEXT NOT NULL);
       UPDATE events SET outcome='uncertain_after_restart', finished_at=datetime('now') WHERE finished_at IS NULL AND outcome='running';`);
+    protectDatabaseFiles(directory);
     const columns = this.db.prepare("PRAGMA table_info(events)").all() as any[];
     if (!columns.some(column => column.name === "request_id")) this.db.exec("ALTER TABLE events ADD COLUMN request_id TEXT");
     this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS events_request_id ON events(request_id) WHERE request_id IS NOT NULL");

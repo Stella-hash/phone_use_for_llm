@@ -18,14 +18,16 @@ $p=$env:PHONE_ACL_TARGET
 $sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User
 $system=[System.Security.Principal.SecurityIdentifier]::new('S-1-5-18')
 if ([System.IO.File]::GetAttributes($p) -band [System.IO.FileAttributes]::ReparsePoint) { throw 'links forbidden' }
-${set ? `$acl=[System.Security.AccessControl.DirectorySecurity]::new()
+$directory=[System.IO.Directory]::Exists($p)
+${set ? `$acl=if ($directory) { [System.Security.AccessControl.DirectorySecurity]::new() } else { [System.Security.AccessControl.FileSecurity]::new() }
 $acl.SetOwner($sid)
 $acl.SetAccessRuleProtection($true,$false)
 foreach ($who in @($sid,$system)) {
-  $rule=[System.Security.AccessControl.FileSystemAccessRule]::new($who,'FullControl','ContainerInherit,ObjectInherit','None','Allow')
+  $inherit=if ($directory) { 'ContainerInherit,ObjectInherit' } else { 'None' }
+  $rule=[System.Security.AccessControl.FileSystemAccessRule]::new($who,'FullControl',$inherit,'None','Allow')
   $acl.AddAccessRule($rule)
 }
-[System.IO.Directory]::SetAccessControl($p,$acl)` : ""}
+if ($directory) { [System.IO.Directory]::SetAccessControl($p,$acl) } else { [System.IO.File]::SetAccessControl($p,$acl) }` : ""}
 $acl=if ([System.IO.Directory]::Exists($p)) { [System.IO.Directory]::GetAccessControl($p) } else { [System.IO.File]::GetAccessControl($p) }
 foreach ($rule in $acl.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier])) {
   if ($rule.AccessControlType -eq 'Allow' -and $rule.IdentityReference.Value -notin @($sid.Value,$system.Value)) { throw 'not private' }
@@ -59,7 +61,24 @@ export function privateDirectory(target: string) {
 
 export function writePrivate(target: string, value: string | Buffer, fresh = true) {
   noLinks(target);
+  if (!fresh && fs.existsSync(target)) assertPrivate(target);
   fs.writeFileSync(target, value, { mode: 0o600, flag: fresh ? "wx" : "w" });
+  // Elevated Windows tokens can default new files to the Administrators owner.
+  // Set the individual owner explicitly, keeping the same restricted DACL.
+  if (process.platform === "win32") windowsAcl(target, true);
+}
+
+/** Tighten files created by SQLite inside the already validated owner directory. */
+export function protectDatabaseFiles(directory: string) {
+  for (const suffix of ["", "-wal", "-shm"]) {
+    const file = path.join(directory, "activity.sqlite3" + suffix);
+    noLinks(file);
+    if (!fs.existsSync(file)) continue;
+    const stat = fs.statSync(file);
+    if (!stat.isFile() || stat.nlink !== 1) throw new Error("Invalid database file");
+    if (process.platform === "win32") windowsAcl(file, true);
+    else fs.chmodSync(file, 0o600);
+  }
 }
 
 export function readPrivate(target: string, maxBytes: number) {

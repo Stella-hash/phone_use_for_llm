@@ -45,6 +45,16 @@ suite then passed. Clean-start verification exposed synchronous child helpers
 blocking connection lifecycle processing; async helpers fixed it without retrying
 input. Clean-start and local receipt-client checks passed again after that fix.
 
+Hosted Windows subsequently found a real provisioning gap: directory ACLs passed,
+but newly created files did not pass the individual-owner check. Path/descriptor
+identity metadata agreed. Windows elevated tokens can default object ownership
+to an administrator group; see Microsoft's [object ownership documentation](https://learn.microsoft.com/en-us/windows/win32/secauthz/owner-of-a-new-object).
+New private files and SQLite files now explicitly receive the current user owner
+and the same user/SYSTEM-only DACL. Read checks remain strict. A dedicated snapshot
+test was added; the focused file, signer and journal tests all passed locally.
+The final hosted suite includes that additional test (88 total); use the exact
+commit's checks for its outcome, rather than the earlier local count above.
+
 Repeat the two source scans with `python scripts/scan-source.py HEAD GITLEAKS_BINARY`
 in an environment containing detect-secrets 1.5.0. The fingerprint exceptions in
 `scripts/secret-scan-baseline.json` carry reasons; no entire source file is skipped.
