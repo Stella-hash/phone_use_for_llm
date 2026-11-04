@@ -16,6 +16,9 @@ import { LIMITS, boundedValue } from '../dist/limits.js';
 import { UiInspector } from '../dist/ui.js';
 import { assertPrivate } from '../dist/private-files.js';
 import { Executor } from '../dist/executor.js';
+import { normalizeKey, actionBinding } from '../dist/operation.js';
+import { localDeviceSerial } from '../dist/device.js';
+import { strictJson } from '../dist/json.js';
 
 fs.mkdirSync('.runtime', { recursive: true });
 const fresh = name => fs.mkdtempSync(path.resolve('.runtime/' + name + '-'));
@@ -35,7 +38,7 @@ async function fixtureServer(t, env = {}, config = {}) {
   t.after(async () => { await client.close(); if (child.exitCode === null) { child.kill(); await new Promise(r => child.once('exit', r)); } });
   for (let n = 0; ; n++) {
     try { assert((await fetch(endpoint + '/healthz', { headers: owner.headers })).ok); break; }
-    catch { if (n > 160 || child.exitCode !== null) throw Error(stderr); await new Promise(r => setTimeout(r, 50)); }
+    catch { if (n > 400 || child.exitCode !== null) throw Error('Fixture startup failed or exceeded 20 seconds: ' + stderr); await new Promise(r => setTimeout(r, 50)); }
   }
   await client.connect(new StreamableHTTPClientTransport(new URL(endpoint + '/mcp'), { requestInit: { headers: owner.headers } }));
   const rows = () => fs.existsSync(trace) ? fs.readFileSync(trace, 'utf8').trim().split('\n').filter(Boolean).map(r => JSON.parse(r)) : [];
@@ -158,7 +161,8 @@ test('image paths stay inside the owner store and expiry removes evidence withou
 test('focus changes after acknowledged input omit UI instead of erasing the receipt or reading the new app', async t => {
   const f = await fixtureServer(t, { PHONE_TEST_FOCUS_AFTER_INPUT: 'org.unapproved.dialog' });
   const result = await f.signed('android_tap', { x: 1, y: 2, requestId: 'focus-transition-001' });
-  assert(!result.isError, JSON.stringify(result));
+  assert(result.isError, JSON.stringify(result));
+  assert.equal(texts(result).find(x => x.phoneReceipt).phoneReceipt.callOutcome, 'policy_drift');
   assert.equal(texts(result).find(x => x.phoneReceipt).phoneReceipt.execution, 'acknowledged');
   assert.equal(texts(result).find(x => x.phoneReceipt).phoneReceipt.screenshotAvailable, false);
   assert(!result.content.some(c => c.type === 'image'));
@@ -168,8 +172,78 @@ test('focus changes after acknowledged input omit UI instead of erasing the rece
 test('lock appearing after input preserves acknowledgement and prevents all post-action UI reads', async t => {
   const f = await fixtureServer(t, { PHONE_TEST_LOCK_AFTER_INPUT: '1' });
   const result = await f.signed('android_tap', { x: 1, y: 2, requestId: 'lock-transition-001' });
-  assert(!result.isError); assert.equal(texts(result).find(x => x.phoneReceipt).phoneReceipt.execution, 'acknowledged');
+  assert(result.isError); assert.equal(texts(result).find(x => x.phoneReceipt).phoneReceipt.execution, 'acknowledged');
   assert(!JSON.stringify(f.rows()).match(/uiautomator|screencap/));
+});
+
+test('key aliases share signing, dispatch and receipt semantics and cannot be pregranted', async t => {
+  const f = await fixtureServer(t);
+  for (const [key, canonical] of [[' soft_sleep ', 'KEYCODE_SOFT_SLEEP'], ['00276', 'KEYCODE_SOFT_SLEEP'], [' keycode_sleep ', 'KEYCODE_SLEEP'], ['00026', 'KEYCODE_POWER'], ['224', 'KEYCODE_WAKEUP']]) {
+    assert.equal(normalizeKey(key), canonical);
+    const args = { key, requestId: 'alias-' + randomUUID(), expectedPackage: 'org.example.game' };
+    const refused = await f.client.callTool({ name: 'android_press_key', arguments: args });
+    assert(refused.isError); assert(!f.rows().some(r => r.args[0] === 'input'));
+  }
+  const result = await f.signed('android_press_key', { key: ' 00276 ', requestId: 'signed-sleep-alias' });
+  assert(!result.isError);
+  assert.equal(texts(result).find(x => x.phoneReceipt).phoneReceipt.requestBinding.normalizedKey, 'KEYCODE_SOFT_SLEEP');
+  assert(f.rows().some(r => r.args[0] === 'input' && r.args[2] === 'KEYCODE_SOFT_SLEEP'));
+  const owner = fixtureOwner(fresh('bad-key-grant'), { expertSandbox: { trustedOperators: true, disposablePhone: true,
+    isolatedEnvironment: true, acceptsRisk: true, grants: [{ package: 'org.example.game', tools: ['android_press_key'] }] } });
+  assert.throws(() => new OwnerSecurity(owner.file), /configuration/);
+});
+
+test('Chrome launch and disallowed URL fail before input; navigation drift keeps acknowledged error receipt', async t => {
+  const f = await fixtureServer(t, { PHONE_TEST_PACKAGE: 'com.android.chrome', PHONE_TEST_URL_AFTER_INPUT: 'https://unapproved.example/page' });
+  for (const [name, args] of [['android_launch_app', { packageName: 'com.android.chrome' }], ['android_open_url', { url: 'https://unapproved.example/page' }]]) {
+    const result = await f.signed(name, { ...args, expectedPackage: 'com.android.chrome', requestId: randomUUID() });
+    assert(result.isError);
+    assert.equal(texts(result).find(x => x.phoneReceipt).phoneReceipt.execution, 'not_started');
+  }
+  assert(!f.rows().some(r => ['am','monkey','input'].includes(r.args[0])));
+  const result = await f.signed('android_open_url', { url: 'https://fixture.example/page', expectedPackage: 'com.android.chrome', requestId: 'url-post-drift' });
+  assert(result.isError);
+  const receipt = texts(result).find(x => x.phoneReceipt).phoneReceipt;
+  assert.equal(receipt.execution, 'acknowledged'); assert.equal(receipt.callOutcome, 'policy_drift');
+  assert(!f.rows().some(r => /uiautomator|screencap/.test(r.args.join(' '))));
+});
+
+test('passive reads cannot reserve action IDs; recovery verifies tool and normalized argument digest', async t => {
+  const f = await fixtureServer(t); const id = 'read-then-action';
+  for (const name of ['android_power_status', 'android_device_info', 'android_list_elements', 'android_take_screenshot'])
+    assert((await f.client.callTool({ name, arguments: { requestId: id } })).isError);
+  assert.equal(f.rows().length, 0);
+  const request = f.owner.authorize({ name: 'android_tap', arguments: { x: 2, y: 3, requestId: id, expectedPackage: 'org.example.game' } });
+  const result = await f.client.callTool(request); assert(!result.isError);
+  const binding = actionBinding(request.name, request.arguments);
+  const recovered = await f.client.callTool({ name: 'android_activity_open', arguments: { requestId: id, receiptOnly: true, expectedTool: binding.tool, expectedArgsDigest: binding.argsDigest } });
+  assert.deepEqual(texts(recovered)[0].phoneReceipt.requestBinding, binding);
+  const mismatch = await f.client.callTool({ name: 'android_activity_open', arguments: { requestId: id, receiptOnly: true, expectedTool: 'android_swipe', expectedArgsDigest: binding.argsDigest } });
+  assert(mismatch.isError);
+  assert((await f.signed('android_tap', { x: 8, y: 3, requestId: id })).isError);
+  assert.equal(f.rows().filter(r => r.args[0] === 'input' && r.args[1] === 'tap').length, 1);
+});
+
+for (const tool of ['android_type_text', 'android_set_text']) for (const [label, env] of [['stable', {}], ['focus', { PHONE_TEST_FOCUS_AFTER_INPUT: 'org.unapproved.dialog' }],
+  ['locked', { PHONE_TEST_LOCK_AFTER_INPUT: '1' }], ['url', { PHONE_TEST_URL_AFTER_INPUT: 'https://unapproved.example/page' }]])
+test(`${tool} post-check ${label} verifies metadata without reading typed contents`, async t => {
+  const f = await fixtureServer(t, { PHONE_TEST_TEXT_SUCCESS: '1', PHONE_TEST_PACKAGE: 'com.android.chrome', ...env });
+  const marker = 'SYNTHETIC_PRIVATE_TEXT_' + randomUUID();
+  const result = await f.signed(tool, { text: marker, expectedPackage: 'com.android.chrome', requestId: randomUUID() });
+  assert.equal(!!result.isError, label !== 'stable');
+  const receipt = texts(result).find(x => x.phoneReceipt).phoneReceipt;
+  assert.equal(receipt.execution, 'acknowledged');
+  assert.equal(receipt.callOutcome, label === 'stable' ? 'completed' : 'policy_drift');
+  assert(!JSON.stringify(result).includes(marker));
+  const rows = f.rows(); const inputAt = rows.findIndex(r => (r.args[0] === 'input' && r.args[1] === 'text') || r.args.at(-1) === 'dev.gc.agentphone.helper/.UnicodeInstrumentation'); assert(inputAt >= 0);
+  assert(!rows.slice(inputAt + 1).some(r => /uiautomator|screencap|DOMSnapshot|Accessibility/.test(r.args.join(' '))));
+});
+
+test('strict JSON and local transport validation reject ambiguity without any device discovery', () => {
+  for (const input of ['{"x":1,"x":2}', '{"x":1,"\\u0078":2}', '{"a":[{"x":1,"x":2}]}']) assert.throws(() => strictJson(input), /Duplicate/);
+  assert.deepEqual(strictJson('{"x":{"a":1},"y":{"a":2},"z":["x",{"a":3}]}'), { x: { a: 1 }, y: { a: 2 }, z: ['x', { a: 3 }] });
+  for (const serial of ['192.0.2.1:5555', 'adb-example-guid._adb-tls-connect._tcp', 'adb-example-guid._adb-tls-pairing._tcp', 'device._adb._tcp', 'device._adb_secure._tcp']) assert.throws(() => localDeviceSerial(serial), /wireless/);
+  assert.equal(localDeviceSerial('USB_FIXTURE_01'), 'USB_FIXTURE_01'); assert.equal(localDeviceSerial('emulator-5554'), 'emulator-5554');
 });
 
 test('journal admission failure does not prevent an authenticated saved-receipt read', async () => {

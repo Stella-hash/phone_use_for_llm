@@ -1,7 +1,8 @@
-# Release candidate validation — 2026-11-04
+# Baseline release candidate validation — 2026-11-04
 
-Status: builder verification completed; independent review and public release are
-pending. Review the exact Git commit carrying this file. This record contains no
+Historical scope: baseline `e600879c80284496c9aa837519f8e3648e818613` before the
+second review repair. Current status is in [R2 validation](R2-VALIDATION.md).
+This baseline record contains no
 real device observations, private configurations, raw activity logs or red-team
 report material.
 

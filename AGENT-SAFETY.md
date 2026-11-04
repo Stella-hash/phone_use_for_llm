@@ -14,14 +14,22 @@
 - Coordinate clients sharing the owner's screen. A tool-level queue does not
   grant exclusive possession of a multi-step task or exclude human touches.
 - If transport fails, query `android_activity_open(requestId, receiptOnly=true)`.
+  Verify `requestBinding.tool` and `requestBinding.argsDigest` against the original
+  normalized request; use `expectedTool`/`expectedArgsDigest` or the local client's
+  `--recover ORIGINAL_REQUEST_FILE`. A mismatch or missing binding stays unknown.
   Do not replay under a new ID. Acknowledged input is not proof of goal completion;
   `unconfirmed`, missing or expired evidence stays uncertain.
 - An unavailable image does not negate the receipt. Ask for its retained image
   only when useful. Preview pixel coordinates need `phoneImage.coordinateScale`;
   Chrome CSS bounds are a different coordinate space.
 - Do not enter passwords, recovery codes, payment credentials or account secrets.
-  Let the owner handle sensitive workflows directly. Ordinary coordinate tools
+  Real banking/trading/payments, identity, health, workplace, recovery and security
+  administration are prohibited even with owner approval or expert grants. Read
+  market articles only logged out or with an unfunded disposable/test read-only
+  account without transaction authority. Ordinary coordinate tools
   cannot identify all purchases or publications, even in an allowed app.
+- All key inputs require per-request approval. `policy_drift` means the complete
+  post-check failed; preserve any input acknowledgement and do not replay it.
 - Saved reading text requires explicit owner retention. If absent, report that
   absence. Do not turn on retention, summarize unread content, or infer that an
   article/picture sequence ended merely because text stopped changing.

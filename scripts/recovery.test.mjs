@@ -21,7 +21,7 @@ test('dropped image response recovers by caller ID without replay; deferred acti
     PHONE_SECURITY_FILE:owner.file,PHONE_TEST_AWAKE:'1',PHONE_DEVICE:'synthetic-device',PHONE_PORT:String(port),PHONE_DATA_DIR:directory,PHONE_TEST_TRACE:trace,PHONE_SUMMARY_API_KEY:'',PHONE_SUMMARY_KEY_FILE:''}});
   let errors='';child.stderr.on('data',chunk=>errors+=chunk);
   t.after(()=>child.kill());
-  for(let n=0;;n++){try{assert((await fetch(`http://127.0.0.1:${port}/healthz`,{headers:owner.headers})).ok);break;}catch{if(n>100||child.exitCode!==null)throw Error(errors);await new Promise(r=>setTimeout(r,50));}}
+  for(let n=0;;n++){try{assert((await fetch(`http://127.0.0.1:${port}/healthz`,{headers:owner.headers})).ok);break;}catch{if(n>400||child.exitCode!==null)throw Error('Fixture startup failed or exceeded 20 seconds: '+errors);await new Promise(r=>setTimeout(r,50));}}
   let dropped=0;
   const proxy=http.createServer(async(req,res)=>{
     try{

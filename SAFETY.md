@@ -11,6 +11,14 @@ debugging are privileged capabilities. Host administrators and processes running
 as the service OS account can bypass this service; protect that account and keep
 the human approval key away from agent-accessible files.
 
+Current-version prohibition in every profile, including signed and expert input:
+do not use real banking, brokerage/trading, payments, identity verification,
+health records, workplace accounts, account recovery or security administration.
+Owner approval does not make these supported workflows. Market/news reading,
+including moomoo, is limited to logged-out pages or an unfunded disposable/test
+read-only account without trading or payment authority. Do not enable grants on
+a device holding real accounts. Package checks cannot detect every such context.
+
 The bearer token authenticates a single owner. Every authorized client of that
 owner shares history/images and one phone; actor/session fields are not tenant
 boundaries. Use separate processes, tokens, data directories and devices for
@@ -55,6 +63,7 @@ On a suspected boundary failure: stop the service, disconnect the device/ADB,
 preserve a minimal private record, and rotate exposed credentials as appropriate.
 Do not publish raw screenshots, tokens, config files or personal logs in issues.
 Report a minimal synthetic case without exploit chains or private target data.
+See [SECURITY.md](SECURITY.md) for the reporting and release gate.
 
 The software is supplied under the [MIT License](LICENSE). It carries no warranty;
 read its disclaimer and evaluate your own deployment obligations.

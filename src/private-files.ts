@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 
 // Storage is private to the host OS account. That account (and host administrators)
 // remains trusted; this is not a sandbox against processes running as the owner.
@@ -62,8 +63,24 @@ export function writePrivate(target: string, value: string | Buffer, fresh = tru
 }
 
 export function readPrivate(target: string, maxBytes: number) {
+  return readPrivateSnapshot(target, maxBytes).text;
+}
+
+export function readPrivateSnapshot(target: string, maxBytes: number) {
   assertPrivate(target);
-  const stat = fs.statSync(target);
-  if (!stat.isFile() || stat.size > maxBytes || stat.nlink !== 1) throw new Error("Invalid private file");
-  return fs.readFileSync(target, "utf8");
+  const identity = (s: fs.BigIntStats) => [s.dev, s.ino, s.size, s.mtimeNs, s.ctimeNs].join(":");
+  const before = fs.lstatSync(target, { bigint: true });
+  const fd = fs.openSync(target, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  try {
+    const stat = fs.fstatSync(fd, { bigint: true });
+    if (!stat.isFile() || stat.size > BigInt(maxBytes) || stat.nlink !== 1n || identity(before) !== identity(stat)) throw new Error("Invalid private file");
+    const buffer = Buffer.alloc(maxBytes + 1);
+    let length = 0, bytes: number;
+    while (length < buffer.length && (bytes = fs.readSync(fd, buffer, length, buffer.length - length, null)) > 0) length += bytes;
+    if (length > maxBytes || identity(stat) !== identity(fs.fstatSync(fd, { bigint: true }))
+      || identity(stat) !== identity(fs.lstatSync(target, { bigint: true }))) throw new Error("Private file changed during read");
+    assertPrivate(target);
+    const data = buffer.subarray(0, length);
+    return { text: data.toString("utf8"), identity: identity(stat), digest: createHash("sha256").update(data).digest("hex") };
+  } finally { fs.closeSync(fd); }
 }

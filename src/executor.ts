@@ -17,6 +17,7 @@ import { readingCursor } from "./reading.js";
 import { activityReceipt } from "./receipt.js";
 import { delayObservation, type ObservationDelay } from "./observation-delay.js";
 import { boundResultImages, DEFAULT_IMAGE_EDGE } from "./image-delivery.js";
+import { canonicalArguments, isPowerKey, actionBinding } from "./operation.js";
 
 const json = (value: any): CallToolResult => ({ content: [{ type: "text", text: JSON.stringify(value) }] });
 const failure = (code: string): CallToolResult => ({ isError: true, content: [{ type: "text", text: code }] });
@@ -45,6 +46,7 @@ export class Executor {
     try {
       boundedValue(all);
       if (!this.validators.get(name)?.(all).valid) return Promise.resolve(failure("INVALID_ARGUMENTS"));
+      all = { ...canonicalArguments(name, all), ...(all.approval ? { approval: all.approval } : {}) };
       if (this.queued >= LIMITS.queue) return Promise.resolve(failure("QUEUE_FULL: no input attempted"));
     } catch (error) { return Promise.resolve(failure(safeError(error))); }
     const receivedAt = Date.now();
@@ -72,17 +74,17 @@ export class Executor {
     const status = name === "android_device_info" || name === "android_power_status";
     const input = this.security.isInput(name, all);
     const textInput = name === "android_set_text" || name === "android_type_text";
-    const powerKey = name === "android_press_key" && /^(?:KEYCODE_)?(?:SLEEP|223|POWER|26|WAKEUP|224)$/i.test(String(all.key));
+    const powerKey = name === "android_press_key" && isPowerKey(all.key);
     const { context = {}, requestId, approval, expectedPackage, expectedUrl, wake, observeAfterMs, imageMaxEdge, imageMode, ...args } = all;
-    if (!history && requestId) {
+    if (input && requestId) {
       const prior = this.journal.findRequest(requestId);
-      if (prior) return { isError: true, content: [{ type: "text", text: "REQUEST_ALREADY_RECORDED: no new input attempted; do not bypass recovery with a new ID" },
+      if (prior) return { isError: true, content: [{ type: "text", text: prior.requestBinding?.argsDigest === actionBinding(name, all).argsDigest ? "REQUEST_ALREADY_RECORDED: no new input attempted; do not bypass recovery with a new ID" : "REQUEST_BINDING_MISMATCH_OR_UNKNOWN: no new input attempted; inspect original request" },
         { type: "text", text: JSON.stringify({ phoneReceipt: this.receipt(prior) }) }] };
     }
     try { this.security.authorize(name, all); }
     catch (error) { return failure(safeError(error)); }
     let eventId: number;
-    try { eventId = this.journal.begin(name, all, context, history ? "history" : status && !wake ? "status" : "phone", history ? undefined : requestId); }
+    try { eventId = this.journal.begin(name, all, context, history ? "history" : status && !wake ? "status" : "phone", input ? requestId : undefined); }
     catch {
       // Storage pressure must not prevent recovery of an already executed action.
       if (history) eventId = 0;
@@ -90,6 +92,7 @@ export class Executor {
     }
     let result: CallToolResult = failure("OPERATION_FAILED"), observation: any = null, preparation: any = null;
     let imageEventId = eventId;
+    let policyDrift = false;
     let delay: ObservationDelay | undefined = observeAfterMs === undefined ? undefined : { requestedMs: observeAfterMs, elapsedMs: 0, status: "action_failed" };
     try {
       if (history) {
@@ -102,6 +105,8 @@ export class Executor {
           if ((args.eventId !== undefined) === (requestId !== undefined)) deny("PROVIDE_ONE_RECORD_ID");
           const entry = requestId ? this.journal.findRequest(requestId) : this.journal.open(args.eventId);
           if (!entry) deny("RECORD_NOT_FOUND: execution is unknown; do not replay automatically");
+          if ((args.expectedTool !== undefined || args.expectedArgsDigest !== undefined)
+            && (entry.requestBinding?.tool !== args.expectedTool || entry.requestBinding?.argsDigest !== args.expectedArgsDigest)) deny("REQUEST_BINDING_MISMATCH_OR_UNKNOWN");
           imageEventId = entry.id;
           result = json(args.receiptOnly ? { phoneReceipt: this.receipt(entry) } : { ...entry, phoneReceipt: this.receipt(entry) });
           if (args.includeScreenshot) this.savedImage(entry, result);
@@ -134,6 +139,7 @@ export class Executor {
             const target = name === "android_open_url" ? this.security.config.browserPackage : args.packageName;
             this.security.package(target);
             if (target !== expectedPackage) deny("TARGET_PACKAGE_MISMATCH");
+            if (name === "android_launch_app" && target === this.security.config.browserPackage) deny("CHROME_REQUIRES_OPEN_URL");
             if (name === "android_open_url") this.security.url(args.url);
           }
           let pkg = launching ? expectedPackage : this.guard(expectedPackage);
@@ -155,12 +161,12 @@ export class Executor {
           if (input && !result.isError) result = json({ acknowledged: true, ...(name === "android_gesture" ? { pointerReleased: true } : {}),
             ...(textInput ? { inputCharacters: String(args.text).length } : {}) });
           // Never copy an input field or its screenshot into the action response/log.
-          if (textInput) observation = { at: new Date().toISOString(), uiOmitted: "text input; use a separate authorized observation" };
-          else {
+          {
             try {
               pkg = this.guard(expectedPackage);
               await this.browserGuard(pkg, launching && name === "android_open_url" ? args.url : expectedUrl);
-              if (name === "android_chrome_read" && !result.isError) {
+              if (textInput) observation = { at: new Date().toISOString(), metadataVerified: true, uiOmitted: "text input; use a separate authorized observation" };
+              else if (name === "android_chrome_read" && !result.isError) {
                 const snapshot = JSON.parse((result.content[0] as { text: string }).text);
                 observation = { at: snapshot.captureFinishedAt, foregroundApp: snapshot.foregroundApp, uiOmitted: "Chrome supplied observation",
                   elements: this.security.config.retainObservationText && !context.private ? [{ type: "ChromePageText", text: snapshot.text }] : "[observation text retention disabled]" };
@@ -173,19 +179,20 @@ export class Executor {
                   () => { this.guard(expectedPackage); }, this.security.config.retainObservationText);
               }
               await this.browserGuard(this.guard(expectedPackage), launching && name === "android_open_url" ? args.url : expectedUrl);
-              if (!input && observation?.uiOmitted === "UI policy or lock state changed") deny("OBSERVATION_DISCARDED");
+              if (observation?.uiOmitted === "UI policy or lock state changed") deny("OBSERVATION_DISCARDED");
               if (name === "android_list_apps" && !result.isError) {
                 const listed = JSON.parse((result.content[0] as { text: string }).text);
                 result = json({ apps: (listed.apps || []).filter((p: string) => this.security.config.allowedApps.includes(p)).slice(0, 64) });
               }
             } catch {
               observation = { at: new Date().toISOString(), uiOmitted: "UI policy or foreground changed", screenshotOmitted: "UI policy or foreground changed" };
-              result = input && !result.isError ? json({ acknowledged: true }) : failure("OBSERVATION_DISCARDED: UI policy or foreground changed");
+              policyDrift = true;
+              result = failure("POSTCONDITION_FAILED: UI policy, focus, lock or URL changed or could not be verified; inspect execution receipt before retrying");
             }
           }
         }
         if (!result.isError) this.journal.recordExecution(eventId, "acknowledged");
-        else result = failure("OPERATION_FAILED: inspect the receipt before retrying");
+        else if (!policyDrift) result = failure("OPERATION_FAILED: inspect the receipt before retrying");
       }
     } catch (error) { result = failure(safeError(error)); }
     // No failure path performs a fallback UI read or repeats an input.
@@ -195,10 +202,10 @@ export class Executor {
     if (observation?.screenshot) observation.screenshot.returnedInline = inline;
     if (!history) result.content.push({ type: "text", text: JSON.stringify({ phoneObservation: {
       at: observation.at, preparation, errors: observation.errors, uiOmitted: observation.uiOmitted,
-      screenshot: observation.screenshot, screenshotOmitted: observation.screenshotOmitted, delay: observation.delay,
+      screenshot: observation.screenshot, screenshotOmitted: observation.screenshotOmitted, delay: observation.delay, metadataVerified: observation.metadataVerified,
     } }) });
     try {
-      if (eventId) this.journal.finish(eventId, result.isError ? "error" : "completed", { result: { isError: !!result.isError, ...(history ? { historyRead: true } : {}) }, preparation, observation });
+      if (eventId) this.journal.finish(eventId, policyDrift ? "policy_drift" : result.isError ? "error" : "completed", { result: { isError: !!result.isError, ...(history ? { historyRead: true } : {}) }, preparation, observation });
       if (!history && !status) this.summarizer.schedule();
       result.content.push({ type: "text", text: JSON.stringify({ phoneActivity: { eventId: eventId || null, ...(!eventId ? { historyReadNotRecorded: true } : {}), ...(name === "android_activity_open" && args.receiptOnly ? {} : this.journal.context()) },
         ...(history ? {} : { phoneReceipt: this.receipt(this.journal.open(eventId)) }) }) });

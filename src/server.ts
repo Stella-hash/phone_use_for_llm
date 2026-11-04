@@ -15,27 +15,7 @@ const ALLOWED_SCREENSHOT_EXTENSIONS = [".png"];
 const ALLOWED_RECORDING_EXTENSIONS = [".mp4"];
 const MAX_RECORDING_SECONDS = 180; // hard limit of android screenrecord
 
-const KEYCODE_ALIASES: Record<string, string> = {
-	BACK: "KEYCODE_BACK",
-	HOME: "KEYCODE_HOME",
-	MENU: "KEYCODE_MENU",
-	ENTER: "KEYCODE_ENTER",
-	DELETE: "KEYCODE_DEL",
-	DEL: "KEYCODE_DEL",
-	TAB: "KEYCODE_TAB",
-	SPACE: "KEYCODE_SPACE",
-	ESCAPE: "KEYCODE_ESCAPE",
-	POWER: "KEYCODE_POWER",
-	APP_SWITCH: "KEYCODE_APP_SWITCH",
-	VOLUME_UP: "KEYCODE_VOLUME_UP",
-	VOLUME_DOWN: "KEYCODE_VOLUME_DOWN",
-	VOLUME_MUTE: "KEYCODE_VOLUME_MUTE",
-	DPAD_UP: "KEYCODE_DPAD_UP",
-	DPAD_DOWN: "KEYCODE_DPAD_DOWN",
-	DPAD_LEFT: "KEYCODE_DPAD_LEFT",
-	DPAD_RIGHT: "KEYCODE_DPAD_RIGHT",
-	DPAD_CENTER: "KEYCODE_DPAD_CENTER",
-};
+import { normalizeKey } from "./operation.js";
 
 interface ActiveRecording {
 	process: ChildProcess;
@@ -614,15 +594,7 @@ export const createServer = (): McpServer => {
 		{},
 		async ({ device, key }) => {
 			const id = adb.resolveDevice(device);
-			const upper = key.trim().toUpperCase();
-			let keycode: string;
-			if (/^\d+$/.test(upper)) {
-				keycode = upper;
-			} else if (!/^[A-Z0-9_]+$/.test(upper)) {
-				throw new ActionableError(`Invalid key "${key}". Use a KEYCODE_* name or a numeric keycode.`);
-			} else {
-				keycode = KEYCODE_ALIASES[upper] ?? (upper.startsWith("KEYCODE_") ? upper : `KEYCODE_${upper}`);
-			}
+			const keycode = normalizeKey(key);
 			adb.shell(id, "input", "keyevent", keycode);
 			return `Pressed key: ${keycode}`;
 		}

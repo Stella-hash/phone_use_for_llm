@@ -16,6 +16,10 @@ this saved-text cursor. If it is disabled, report unavailable saved text; do not
 change the configuration or imply that no text exists. Live UI reads require an
 awake, known-unlocked phone and allowed app. Scrolls/clicks require independent
 owner approval or a matching configured grant; the skill grants no authority.
+For moomoo and similar financial apps, use logged-out articles or an unfunded
+disposable/test read-only account without trading/payment authority. Real account
+operations remain prohibited even with approval; see the public service's
+`AGENT-SAFETY.md`. This constraint does not select the operator's reading interests.
 
 Start with the phone's shared activity context and a current observation before
 acting. After opening a post or performing an operator-chosen scroll, use the

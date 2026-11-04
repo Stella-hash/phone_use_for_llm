@@ -31,7 +31,8 @@
     "automation",
     "modelcontextprotocol"
   ],
-  "author": "Alvin Ahmad (https://github.com/qalvinahmad)",
+  "author": "Stella-hash and contributors (https://github.com/Stella-hash)",
+  "contributors": ["Alvin Ahmad (upstream; https://github.com/qalvinahmad)"],
   "license": "MIT",
   "repository": {
     "type": "git",

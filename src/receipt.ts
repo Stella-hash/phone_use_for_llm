@@ -3,6 +3,7 @@ export function activityReceipt(event: any) {
   if (!event) throw new Error("Activity record not found");
   return {
     eventId: event.id, requestId: event.requestId ?? null, tool: event.tool,
+    requestBinding: event.requestBinding ?? null,
     callOutcome: event.outcome,
     execution: event.execution ?? "unknown_legacy",
     executionRecordedAt: event.executionRecordedAt ?? null,

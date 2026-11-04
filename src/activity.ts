@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import { privateDirectory, noLinks } from "./private-files.js";
 import { LIMITS } from "./limits.js";
 import { readJsonResponse } from "./response.js";
+import { isInputOperation, actionBinding } from "./operation.js";
 
 // Incoming strings are never an archival format. Keep only shapes and numerical
 // control parameters; observation text is a separate, explicit owner opt-in.
@@ -48,6 +49,16 @@ export class ActivityJournal {
     const columns = this.db.prepare("PRAGMA table_info(events)").all() as any[];
     if (!columns.some(column => column.name === "request_id")) this.db.exec("ALTER TABLE events ADD COLUMN request_id TEXT");
     this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS events_request_id ON events(request_id) WHERE request_id IS NOT NULL");
+    const ledgerColumns = this.db.prepare("PRAGMA table_info(used_requests)").all() as any[];
+    if (!ledgerColumns.some(column => column.name === "binding")) this.db.exec("ALTER TABLE used_requests ADD COLUMN binding TEXT");
+    // Release only proven passive legacy reservations. Expired/unknown records
+    // remain tombstones: absence of evidence must never permit replay.
+    for (const row of this.db.prepare("SELECT id,tool,payload,request_id FROM events WHERE request_id IS NOT NULL").all() as any[]) {
+      if (!isInputOperation(row.tool, JSON.parse(row.payload).arguments || {})) {
+        this.db.prepare("DELETE FROM used_requests WHERE digest=?").run(this.requestDigest(row.request_id));
+        this.db.prepare("UPDATE events SET request_id=NULL WHERE id=?").run(row.id);
+      }
+    }
   }
   private requestDigest(requestId: string) { return createHash("sha256").update(requestId).digest("hex"); }
   maintain() {
@@ -67,12 +78,14 @@ export class ActivityJournal {
     if (size > LIMITS.databaseBytes - 2 * LIMITS.payloadBytes) throw new Error("Journal storage limit");
   }
   begin(tool: string, args: any, context: any, kind: string, requestId?: string): number {
+    if (requestId && !isInputOperation(tool, args)) throw new Error("Request IDs are for inputs only");
+    const binding = requestId ? actionBinding(tool, args) : undefined;
     this.capacity(requestId);
     this.db.exec("BEGIN IMMEDIATE");
     try {
-    if (requestId) this.db.prepare("INSERT INTO used_requests(digest,event_id) VALUES(?,-1)").run(this.requestDigest(requestId));
+    if (requestId) this.db.prepare("INSERT INTO used_requests(digest,event_id,binding) VALUES(?,-1,?)").run(this.requestDigest(requestId), JSON.stringify(binding));
     const result = this.db.prepare("INSERT INTO events(started_at,tool,kind,outcome,payload,request_id) VALUES(?,?,?,'running',?,?)")
-      .run(new Date().toISOString(), tool, kind, JSON.stringify({ arguments: inputMetadata(args),
+      .run(new Date().toISOString(), tool, kind, JSON.stringify({ arguments: inputMetadata(args), ...(binding ? { requestBinding: binding } : {}),
         callerClaim: context ? { private: context.private === true } : null,
         ...(kind === "history" ? {} : { execution: "not_started" }) }), requestId ?? null);
     const id = Number(result.lastInsertRowid);
@@ -102,8 +115,9 @@ export class ActivityJournal {
   findRequest(requestId: string) {
     const entry = this.decode(this.db.prepare("SELECT * FROM events WHERE request_id=?").get(requestId));
     if (entry) return entry;
-    const tombstone = this.db.prepare("SELECT event_id FROM used_requests WHERE digest=?").get(this.requestDigest(requestId)) as any;
+    const tombstone = this.db.prepare("SELECT event_id,binding FROM used_requests WHERE digest=?").get(this.requestDigest(requestId)) as any;
     return tombstone ? { id: tombstone.event_id, requestId, kind: "phone", outcome: "expired", execution: "unknown_expired",
+      requestBinding: tombstone.binding ? JSON.parse(tombstone.binding) : null, tool: tombstone.binding ? JSON.parse(tombstone.binding).tool : null,
       observation: { uiOmitted: "retention expired; replay remains blocked" } } : null;
   }
   history(limit = 10, before = Number.MAX_SAFE_INTEGER, phoneOnly = false): any[] {

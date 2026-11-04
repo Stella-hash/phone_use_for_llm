@@ -24,17 +24,22 @@ AdbClient.prototype.shell = function (device, ...args) {
   if (args.join(' ') === 'dumpsys thermalservice') return 'Thermal Status: 0\nIsStatusOverride: false';
   if (args.join(' ') === 'dumpsys window policy') return process.env.PHONE_TEST_LOCK === 'unknown' ? '' : `showing=${process.env.PHONE_TEST_LOCK === 'locked' || (inputCompleted && process.env.PHONE_TEST_LOCK_AFTER_INPUT === '1')}\nsecure=false`;
   if (args[0] === 'input') {
-    if (args[1] === 'text') throw new Error('synthetic raw input failure ' + args[2]);
+    if (args[1] === 'text' && process.env.PHONE_TEST_TEXT_SUCCESS !== '1') throw new Error('synthetic raw input failure ' + args[2]);
     if (args[1] === 'tap') invalidCapture = String(args[2]) === '88';
     if (args[1] === 'tap' && String(args[2]) === '99') throw new Error('Synthetic input failure');
     inputCompleted = true;
     if (args[2] === 'KEYCODE_WAKEUP') awake = true;
-    if (args[2] === 'KEYCODE_SLEEP') awake = false;
+    if (['KEYCODE_SLEEP', 'KEYCODE_SOFT_SLEEP'].includes(args[2])) awake = false;
     return '';
   }
   if (args[0] === 'mkdir' || args[0] === 'screencap' || (args[0] === 'am' && args[1] === 'broadcast')) return '';
   if (args[0] === 'content' && args[1] === 'query') return args.at(-1);
   if (args[0] === 'wm') return '';
+  if (args[0] === 'am' && args.at(-1) === 'dev.gc.agentphone.helper/.UnicodeInstrumentation') {
+    inputCompleted = true;
+    return 'phone_result_b64=' + Buffer.from(JSON.stringify({ ok: true })).toString('base64');
+  }
+  if (args[0] === 'am' && args[1] === 'start') { inputCompleted = true; return ''; }
   if (args[0] === 'am' && args.at(-1) === 'dev.gc.agentphone.helper/.GestureInstrumentation')
     return 'phone_result_b64=' + Buffer.from(JSON.stringify({ ok:true, pointerReleased:true, terminalAction:'up', acceptedMoves:4 })).toString('base64');
   throw new Error('Unexpected fake shell command');
@@ -47,5 +52,5 @@ AdbClient.prototype.getProp = () => 'test-device';
 AdbClient.prototype.getOrientation = () => 'portrait';
 const realFetch=globalThis.fetch;
 globalThis.fetch=(url,...args)=>String(url)==='http://127.0.0.1:31337/json/list'
-  ? Promise.resolve(new Response(JSON.stringify([{id:'fixture',type:'page',url:'https://fixture.example/page'}]))) : realFetch(url,...args);
+  ? Promise.resolve(new Response(JSON.stringify([{id:'fixture',type:'page',url:inputCompleted && process.env.PHONE_TEST_URL_AFTER_INPUT || 'https://fixture.example/page'}]))) : realFetch(url,...args);
 ChromeConnection.connect=async()=>({close:()=>record('cdp',['close']),call:async(method,params)=>{record('cdp',[method]);return fixtureRpc(method,params);}});

@@ -1,0 +1,7 @@
+phone-use for LLMs
+Current maintainer: Stella-hash (https://github.com/Stella-hash)
+New implementation copyright (c) 2026 Stella-hash and contributors; MIT licensed.
+
+Derived from android-mcp by Alvin Ahmad (https://github.com/qalvinahmad).
+Upstream source revision: 04f3bf02096e4e0a9809edf3a57c213a94cb1d8b.
+The upstream MIT copyright notice and license are preserved in LICENSE.

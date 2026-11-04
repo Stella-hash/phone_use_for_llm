@@ -29,7 +29,7 @@ test('HTTP adapter keeps both status paths asleep; explicit wake and sleep prese
   const endpoint = `http://127.0.0.1:${port}`;
   for (let attempt = 0; ; attempt++) {
     try { const response = await fetch(endpoint + '/healthz', {headers: owner.headers}); assert(response.ok); break; }
-    catch { if (attempt > 100 || child.exitCode !== null) throw new Error(stderr); await new Promise(resolve => setTimeout(resolve, 50)); }
+    catch { if (attempt > 400 || child.exitCode !== null) throw new Error('Fixture startup failed or exceeded 20 seconds: ' + stderr); await new Promise(resolve => setTimeout(resolve, 50)); }
   }
   await client.connect(new StreamableHTTPClientTransport(new URL(endpoint + '/mcp'), {requestInit: {headers: owner.headers}}));
   owner.wrap(client);

@@ -30,7 +30,8 @@ core service and the two bundled [skills](skills/) need no model API key.
 
 Requirements: Node.js 24 or newer, pnpm 11.25.0, and Android platform-tools for
 actual device use. Windows and POSIX permission handling differ; see validation
-limits in [docs/VALIDATION.md](docs/VALIDATION.md). The synthetic check needs no SDK.
+limits in [docs/VALIDATION.md](docs/VALIDATION.md). Tests also need Python 3.11+
+for synthetic helper packaging checks; no SDK is needed.
 
 ```sh
 pnpm install --frozen-lockfile
@@ -74,6 +75,10 @@ Enable `retainObservationText` explicitly to use the saved-text reading cursor.
 Allowed Chrome pages require `com.android.chrome`, an exact HTTPS domain, and
 `expectedUrl` matching the focused visible tab. Other browser engines are not
 supported by the Chrome observation adapter.
+Use `android_open_url` with an exact allowed HTTPS `url` to start Chrome;
+`android_launch_app` cannot start Chrome. All key inputs require separate owner
+approval, including in an expert sandbox. Key aliases are normalized before
+signing, authorization, execution and receipt hashing.
 
 Copy `.env.example` to a local `.env`, set `PHONE_SECURITY_FILE` and the dedicated
 USB serial in `PHONE_DEVICE`, then run `pnpm start`. The listener binds only to
@@ -117,6 +122,10 @@ node scripts/owner-approve.mjs /absolute/service-directory/security.json /absolu
 node --env-file=.env scripts/call.mjs /absolute/private-approved.json
 ```
 
+The utility creates a normalized read-only review copy in the owner's signing
+directory. Review that copy at the printed path; duplicate JSON keys are rejected.
+It checks the original and review copy again after confirmation and refuses a
+changed file. The signer account and its directory must remain trusted.
 The utility asks for confirmation bound to the request digest. A grant lasts two
 minutes and binds the owner, tool and **all** arguments, including request ID. It
 is not available over MCP. Changing the request invalidates the grant. An agent
@@ -137,6 +146,21 @@ Never bypass recovery by replaying under a new ID. `includeScreenshot=true` read
 the retained original from host storage without contacting the phone. An absent
 image leaves the text receipt available. `phoneImage` gives source/preview sizes
 and coordinate scaling; Chrome bounds instead use CSS pixels.
+
+Receipts include `requestBinding.tool` and `requestBinding.argsDigest`. Verify both
+against `actionBinding(name, arguments)` from `dist/operation.js` before using a
+recovered receipt. `android_activity_open` accepts `expectedTool` and
+`expectedArgsDigest` for that check. The local client does it automatically:
+
+```sh
+node --env-file=.env scripts/call.mjs --recover /absolute/private-approved.json
+```
+
+Read operations cannot reserve IDs. Legacy expired receipts without a binding
+remain unknown and replay-blocked. `callOutcome=policy_drift` is an error even
+when `execution=acknowledged`: the input was sent, but a later lock/focus/URL check
+failed or could not verify state. Text inputs run metadata-only post-checks;
+they do not return a new UI dump or screenshot of the entered text.
 
 ## Explicit game grants
 
@@ -187,11 +211,11 @@ data or reject admission; it never authorizes a repeated action.
 exports a SQLite snapshot with receipts/replay ledger, excluding images. Exports
 and client-saved images require separate owner retention and protection.
 
-Unicode input and continuous gestures need the optional Android helper. Build it
-locally with JDK 17 and Android SDK build-tools 34 using
-`python scripts/build-android-helper.py --jdk JDK_DIR --platform PLATFORM_DIR --build-tools BUILD_TOOLS_DIR`.
-The APK and local development signing key stay under ignored `.runtime/`. Installing
-that APK on a dedicated phone is a separate owner action, not part of tests.
+Unicode input and continuous gestures need the optional Android helper. Its
+[source build instructions](docs/HELPER-BUILD.md) require a fresh compilation and
+an explicit signing mode. No prebuilt APK or actual SDK/device acceptance is
+included in this candidate. Installing a locally built APK is a separate owner
+action, not part of tests.
 
 Model summaries require both `allowModelSummary=true` and a credential; they send
 retained excerpts to the configured summary provider (currently OpenAI Responses).
@@ -208,7 +232,7 @@ The recommended starting point remains the strict configuration above.
 
 The 26-tool catalog covers status, apps, native and Chrome observations, all the
 touch/gesture/text/key/orientation controls, and four activity/reading endpoints.
-The owner can grant any exposed input tool for exact allowed packages through
+The owner can grant exposed input tools except `android_press_key` for exact allowed packages through
 `expertSandbox.grants`, for example:
 
 ```json
@@ -228,10 +252,11 @@ The owner can grant any exposed input tool for exact allowed packages through
 
 This can make a sandbox freely usable within the owner's explicit scope. It does
 not disable authentication, allowlists, lock/foreground checks, receipts or quotas.
-Power transitions always require separate approval. Package changes are checked,
+All key inputs and explicit wake require separate approval. Package changes are checked,
 but a coordinate tap cannot reveal whether a button buys, publishes or walks;
-never attach real accounts or money to a broadly delegated sandbox. Use separate
-approval for sensitive workflows. HTTPS checks are not a firewall for native apps
+never attach real accounts or money to a broadly delegated sandbox. Real banking,
+trading, payments, identity, health, work and account-security operations are
+unsupported and prohibited in every profile, even with approval. HTTPS checks are not a firewall for native apps
 or redirects already followed by the browser; isolate the device network too.
 
 The project is provided under the [MIT License](LICENSE), including its warranty

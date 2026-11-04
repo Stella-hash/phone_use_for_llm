@@ -1,5 +1,6 @@
 import type { IncomingMessage } from "node:http";
 import { deny } from "./security.js";
+import { strictJson } from "./json.js";
 
 export const LIMITS = Object.freeze({ bodyBytes: 65536, jsonDepth: 12, jsonNodes: 4096, arrayItems: 512,
   stringLength: 8192, fields: 64, httpConnections: 16, queue: 8, payloadBytes: 256 * 1024,
@@ -33,7 +34,7 @@ export async function readRequest(req: IncomingMessage) {
       chunks.push(chunk);
     }
   } finally { clearTimeout(timer); }
-  const body = JSON.parse(Buffer.concat(chunks).toString());
+  const body = strictJson(Buffer.concat(chunks).toString());
   if (Array.isArray(body)) deny("BATCH_DISABLED");
   boundedValue(body);
   return body;
