@@ -240,6 +240,10 @@ test(`${tool} post-check ${label} verifies metadata without reading typed conten
 });
 
 test('strict JSON and local transport validation reject ambiguity without any device discovery', () => {
+  const marker = 'SYNTHETIC_PRIVATE_SENTINEL';
+  for (const input of [marker, '{"text":' + marker + '}']) {
+    assert.throws(() => strictJson(input), error => error.message === 'Invalid JSON document' && !String(error).includes(marker));
+  }
   for (const input of ['{"x":1,"x":2}', '{"x":1,"\\u0078":2}', '{"a":[{"x":1,"x":2}]}']) assert.throws(() => strictJson(input), /Duplicate/);
   assert.deepEqual(strictJson('{"x":{"a":1},"y":{"a":2},"z":["x",{"a":3}]}'), { x: { a: 1 }, y: { a: 2 }, z: ['x', { a: 3 }] });
   for (const serial of ['192.0.2.1:5555', 'adb-example-guid._adb-tls-connect._tcp', 'adb-example-guid._adb-tls-pairing._tcp', 'device._adb._tcp', 'device._adb_secure._tcp']) assert.throws(() => localDeviceSerial(serial), /wireless/);

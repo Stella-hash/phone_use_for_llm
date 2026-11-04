@@ -1,7 +1,9 @@
 /** Parse one bounded JSON document, rejecting ambiguous duplicate object keys. */
 export function strictJson(text: string): any {
   if (Buffer.byteLength(text) > 65536) throw new Error("JSON size limit");
-  const value = JSON.parse(text);
+  let value: any;
+  try { value = JSON.parse(text); }
+  catch { throw new Error("Invalid JSON document"); } // SyntaxError can quote input.
   const stack: { object: boolean; key: boolean; keys: Set<string> }[] = [];
   const tokens = text.matchAll(/"(?:[^"\\]|\\[\s\S])*"|[{}\[\],:]|[^{}\[\],:\s]+/g);
   for (const [token] of tokens) {
