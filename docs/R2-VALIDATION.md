@@ -86,4 +86,7 @@ while the private candidate lacks GitHub Code Security. No CodeQL result is clai
 
 Recommended next decisive action: independent targeted review of the final SHA,
 especially normalization, pre-launch validation and request binding. Keep private
-until that review and the publication gates are resolved.
+until that review and an explicit owner publication decision; follow the ordered
+[release checklist](RELEASE-PREPARATION.md#order-the-hosted-gates-explicitly) for
+controls that cannot be verified under the current private-repository access.
+No visibility change is part of this repair.

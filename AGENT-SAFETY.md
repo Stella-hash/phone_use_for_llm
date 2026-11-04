@@ -9,8 +9,9 @@
   synthesized unlock gestures. Status/history reads do not authorize UI access.
 - Supply `expectedPackage` and an opaque unique `requestId` before input. Chrome
   operations also need the exact allowed `expectedUrl`. Do not put private text
-  in recovery IDs. Use the owner signer or an already configured matching grant;
-  never read the signing key, invoke the human approval utility, or edit policy.
+  in recovery IDs. Ask the owner for an exact-request approval, or use an already
+  configured matching grant; never read the signing key, invoke the human
+  approval utility, or edit policy.
 - Coordinate clients sharing the owner's screen. A tool-level queue does not
   grant exclusive possession of a multi-step task or exclude human touches.
 - If transport fails, query `android_activity_open(requestId, receiptOnly=true)`.
@@ -35,8 +36,9 @@
   article/picture sequence ended merely because text stopped changing.
 - Respect quotas/deadlines and policy failures. Do not retry around a denial,
   increase limits, switch endpoints or widen scope to make the call succeed.
-- External model egress requires explicit owner configuration/invocation. Read
-  source text and deterministic overlap directly when that is sufficient.
+- Optional service-side summaries and visual judging require explicit owner
+  configuration/invocation before model egress. Read source text and deterministic
+  overlap directly when that is sufficient.
 
 This contract complements technical enforcement. It does not claim that a prompt
 can replace the security boundary described in [SAFETY.md](SAFETY.md).
