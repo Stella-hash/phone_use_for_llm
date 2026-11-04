@@ -46,18 +46,28 @@ backups or future independent observations. `context.private` is an archival
 choice, not authentication or a general incognito detector. Password masking
 catches known password controls, not arbitrary secret-looking content.
 
-New screenshots live only in owner-protected host storage. Data, SQLite sidecars
-and images have size/count/retention limits. Automatic expiry runs while the
+The service's retained original screenshots are stored in owner-protected host
+storage. Data, SQLite sidecars and images have size/count/retention limits.
+Automatic expiry runs while the
 service is running; exports, client image copies, filesystem snapshots and
 backups need owner retention. Secure deletion is best effort and does not prove
 erasure from SSDs or backups. The replay ledger deliberately retains request
 hashes after source expiry, then stops new ID-bearing operations at capacity.
 History is operational evidence, not a tamper-proof audit log.
 
-Optional summaries and explicitly invoked visual judging send data to an external
-model provider. A key alone never enables background summaries. Review retained
-content and enable egress deliberately. Models cannot grant authority or resolve
-uncertain input execution by guessing.
+Ordinary observation text and image previews are returned to the connected MCP
+client, which may send them to its model provider and retain its own copies.
+Localhost binding and service retention limits do not govern that client's or
+provider's data handling. Review that path even when optional model features in
+this service are disabled.
+
+Optional summaries and explicitly invoked visual judging send additional data
+to an external model provider. A key alone never enables background summaries.
+Derived summary checkpoints have no seven-day age expiry: maintenance keeps the
+newest eight, and later summaries may carry older milestones forward. Turning
+summaries off stops generation but does not remove existing checkpoints. Review
+retained content and enable egress deliberately. Models cannot grant authority
+or resolve uncertain input execution by guessing.
 
 On a suspected boundary failure: stop the service, disconnect the device/ADB,
 preserve a minimal private record, and rotate exposed credentials as appropriate.

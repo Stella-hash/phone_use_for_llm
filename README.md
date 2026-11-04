@@ -1,14 +1,56 @@
 # phone-use for LLMs
 
-An Android MCP service for a dedicated phone: native accessibility text, bounded
-screenshots, continuous gestures, post-action observations, and durable action
-receipts. A dropped image response does not require repeating the touch.
+Give an LLM a phone, and leave room for something interesting to happen.
+
+Read an illustrated article together. Try a puzzle. Follow a detail neither of
+you planned to look for. A phone can be a place for a human and a language model
+to explore, not only a device on which to finish errands.
+
+**phone-use** connects a dedicated Android phone to your chosen MCP-capable
+client. It provides screen text, images and controls; the person and model using
+it choose what to do with them. Small pieces of infrastructure keep the mechanics
+from taking over: reuse text already obtained, look at a useful post-action
+frame, and recover a dropped response without repeating the touch.
+
+This is a self-hosted developer project, not a one-click companion app. You need
+a trusted computer, a USB-connected Android phone, and a client able to reach the
+computer's authenticated local MCP endpoint. It does not include a language
+model, a hosted connector, or an unattended controller.
 
 **0.9 is a release candidate awaiting independent review.** It defaults to one
-authenticated owner and per-input approval. Use a disposable device and isolated
-host/network. Read [SAFETY.md](SAFETY.md) and [AGENT-SAFETY.md](AGENT-SAFETY.md).
+authenticated owner and per-input approval, with explicit opt-in grants for
+appropriate games and empty sandboxes. Use a dedicated, resettable spare phone
+without real accounts or irreplaceable data, and an isolated host/network. Here,
+"disposable" describes the data and setup, not an invitation to discard hardware.
 This repository contains code and synthetic fixtures, with a fresh Git history;
 it does not import private device data, credentials or activity logs.
+
+## Find your way in
+
+- **Why give an LLM a phone?** Read [A small place to explore together](docs/WHY-A-PHONE.md)
+  or [中文：留一小块可以一起探索的地方](docs/WHY-A-PHONE.zh-CN.md).
+- **Ready to try it?** Start with [a first small outing](#a-first-small-outing),
+  then the [setup instructions](#install-and-configure-the-strict-default).
+- **Setting the boundaries?** [SAFETY.md](SAFETY.md) explains the deployment;
+  [AGENT-SAFETY.md](AGENT-SAFETY.md) is the contract for the model operating it.
+- **Reviewing this candidate?** See [R2 validation](docs/R2-VALIDATION.md) and
+  [release preparation](docs/RELEASE-PREPARATION.md). Synthetic checks are not
+  physical-phone acceptance or a security certification.
+
+## Choose a starting point
+
+All three choices need owner setup. Broader permissions are optional, not a
+requirement for a worthwhile first experience.
+
+| Start with | What this makes room for | What remains deliberate |
+| --- | --- | --- |
+| Look together | Manually open an allowed page and let the model observe and discuss it | The phone is awake and unlocked; inputs still need exact-request approval |
+| One offline game | Let the model try moves within a selected game using an [explicit game grant](#explicit-game-grants) | No real accounts, purchases or messages; only the selected touch tools are preapproved |
+| A wider empty sandbox | Give trusted operators more room within exact app/tool scope using [expert grants](#expert-sandbox-broader-owner-authorization) | Authentication, app checks, receipts and quotas stay; all keys and explicit wake still require separate approval |
+
+The strict starting point does not mean a human must sign every swipe forever.
+A grant is an owner's advance decision about a specific, suitable space, not
+permission for an agent to widen its own access.
 
 ## What it does
 
@@ -18,15 +60,47 @@ it does not import private device data, credentials or activity logs.
 | Act | Tap, double tap, long press, swipe, drag, continuous paths, ASCII/Unicode input, keys and orientation |
 | Wait | Optional 0–5000 ms delay before the post-action frame; elapsed time is never called completion |
 | Recover | Query a caller-chosen request ID after transport failure; a recorded ID never executes another input |
-| Read across screens | Deterministic text overlap and reading anchors; image index/total are a separate observed axis |
+| Keep a reading place | Saved-text overlap for Xiaohongshu post captions and moomoo CA articles; observed image index/total remain separate from text position |
 | Resume | Single-owner history and optional source-linked model summaries |
 | Monitor | Power, battery temperature and framework thermal status without waking or reading UI |
 
 Reading cursors do not choose interests, scroll automatically, or nag about unseen
 pictures. Games still need an operator to choose moves and judge outcomes. The
-core service and the two bundled [skills](skills/) need no model API key.
+core service and the two bundled [skills](skills/) need no additional model API
+key. Your chosen client's model access, costs and data handling are separate.
+Live native text, screenshots and Chrome reading are distinct from the
+app-specific saved-text cursor; the cursor is not universal OCR or image
+comprehension. Market reading is limited to the logged-out or disposable,
+unfunded read-only scope in [SAFETY.md](SAFETY.md).
+
+## A first small outing
+
+Once setup is complete, begin with something you would not mind resetting: one
+offline puzzle, or a public page in an allowed app or supported Chrome tab.
+
+1. Choose the space together. The owner configures the exact app/domain scope,
+   unlocks the phone and opens it manually. Leave optional summaries off for now;
+   the saved-text cursor also needs a separate retention choice if you want it.
+2. Start by looking. Ask the model what it can actually see and what catches its
+   attention. No input grant is needed for an allowed observation. A current view
+   matters more than an old screenshot or a guessed position.
+3. If you want to continue, approve one exact input, or configure a suitable
+   game grant before playing. Look at what happened afterward. If the response
+   disappears, recover its receipt rather than repeating an uncertain touch.
+4. Stop when you have had enough, and talk about what was interesting. The owner
+   can put the phone to sleep manually. An interesting question or a failed puzzle
+   is a perfectly reasonable thing to bring back.
+
+Ordinary screen text and images go to the connected MCP client and may then go
+to its model provider. Review that client's data settings before the outing;
+running this service on localhost does not make the whole interaction local.
 
 ## Install and configure the strict default
+
+Work from the reviewed candidate identified in [R2 validation](docs/R2-VALIDATION.md).
+During private review, the older default-branch baseline is not interchangeable
+with `gc/red-team-r2`. The owner will select the reviewed public entrypoint before
+release; the commands below assume you are already in that source checkout.
 
 Requirements: Node.js 24 or newer, pnpm 11.25.0, and Android platform-tools for
 actual device use. Windows and POSIX permission handling differ; see validation
@@ -46,7 +120,9 @@ fake device transport and newly generated credentials. It requires no existing
 
 Create two **empty** directories outside the checkout. The signing directory
 belongs to the human owner; do not mount it into the agent/client environment.
-Use absolute paths appropriate to your OS:
+The host and signing account must remain trusted: two folders alone do not
+isolate an unrestricted shell agent running as the same OS account. Use absolute
+paths appropriate to your OS:
 
 ```sh
 node scripts/owner-setup.mjs /absolute/service-directory /absolute/owner-signing-directory owner
@@ -186,6 +262,11 @@ accounts, commerce or communication features to the device.
 
 ## Data, bounds and optional components
 
+Live observations and returned image previews are delivered to your MCP client.
+That client may send them to a remote model provider and retain its own copies;
+consult its settings and terms. The service's local storage controls do not
+control client history, provider retention or the phone apps' own networking.
+
 Raw input strings and approval signatures are not journaled or echoed in tool
 errors. Text-input actions omit their follow-up text/image to avoid copying the
 input. Separately requested observations can still contain app text and secrets;
@@ -200,6 +281,12 @@ Request hashes remain in a separate 20,000-entry replay ledger after source expi
 when that ledger is full, new request-ID operations stop for owner maintenance.
 Do not erase that ledger while keeping the same authorization epoch: rotate the
 service token and signing key as part of a deliberate fresh installation.
+
+Optional derived summaries have a different lifetime: maintenance retains the
+newest eight checkpoints without a seven-day age cutoff, and newer summaries can
+carry earlier milestones forward. Disabling summary generation does not erase
+existing checkpoints. These are operational notes, not permanent model memory;
+source evidence they refer to may already have expired.
 
 The service accepts at most 64 KiB JSON bodies, no JSON-RPC batches, 16 connections,
 and eight queued/running tools. Fields, collections, XML depth, Chrome responses
