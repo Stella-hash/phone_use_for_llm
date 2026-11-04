@@ -1,0 +1,42 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Phone Use gesture check</title>
+<style>
+  body { margin:16px; font:16px sans-serif; color:#152b3b; background:#edf4f8; }
+  h1 { font-size:24px; } canvas { box-sizing:border-box; display:block; width:100%; height:300px; background:white; outline:2px solid #42647a; touch-action:none; }
+  button,textarea { margin-top:12px; font:18px sans-serif; padding:10px; } textarea { box-sizing:border-box; width:100%; }
+  pre { white-space:pre-wrap; }
+</style>
+<h1>Phone Use gesture check</h1>
+<p>A disposable touch surface. No accounts or saved game data.</p>
+<canvas id="gestureCanvas" role="img" aria-label="Gesture canvas"></canvas>
+<button id="resetTrace">Reset trace</button>
+<pre id="result" aria-live="polite">Waiting for one continuous touch.</pre>
+<textarea id="unicodeSmoke" aria-label="Unicode helper regression"></textarea>
+<script>
+const canvas=document.getElementById('gestureCanvas'), context=canvas.getContext('2d');
+canvas.width=canvas.clientWidth; canvas.height=canvas.clientHeight;
+let events=[], strokes=[];
+function report() {
+  document.getElementById('result').textContent=JSON.stringify({down:events.filter(e=>e.type==='pointerdown').length,up:events.filter(e=>e.type==='pointerup').length,move:events.filter(e=>e.type==='pointermove').length,cancel:events.filter(e=>e.type==='pointercancel').length});
+}
+document.getElementById('resetTrace').onclick=()=>{events=[];strokes=[];context.clearRect(0,0,canvas.width,canvas.height);report();};
+for(const type of ['pointerdown','pointermove','pointerup','pointercancel']) canvas.addEventListener(type,event=>{
+  if(type==='pointermove'&&!event.buttons)return;
+  if(type==='pointerdown'){events=[];canvas.setPointerCapture(event.pointerId);context.beginPath();}
+  const rect=canvas.getBoundingClientRect();
+  const samples=type==='pointermove'&&event.getCoalescedEvents?event.getCoalescedEvents():[event];
+  for(const e of samples.length?samples:[event]){
+    const point={type,pointerId:e.pointerId,pointerType:e.pointerType,trusted:e.isTrusted,dispatchTrusted:event.isTrusted,dispatchPointerType:event.pointerType,x:e.clientX-rect.left,y:e.clientY-rect.top,t:e.timeStamp};
+    events.push(point);
+    if(type==='pointerdown')context.moveTo(point.x,point.y);else context.lineTo(point.x,point.y);
+  }
+  context.strokeStyle='#176bca';context.lineWidth=3;context.stroke();report();
+  if(type==='pointerup'||type==='pointercancel'){
+    const record={events:[...events],width:rect.width,height:rect.height};strokes.push(record);
+    fetch(location.pathname+'/capture',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(record)});
+  }
+});
+window.gestureSnapshot=()=>({events,strokes,text:document.getElementById('result').textContent});
+</script>

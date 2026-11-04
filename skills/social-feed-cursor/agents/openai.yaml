@@ -1,0 +1,4 @@
+interface:
+  display_name: "Social Feed Cursor"
+  short_description: "Track social post text, overlap, and image position"
+  default_prompt: "Use $social-feed-cursor to continue reading this post with a text anchor."

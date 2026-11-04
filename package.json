@@ -1,0 +1,57 @@
+{
+  "name": "phone-use",
+  "version": "0.9.0",
+  "description": "Owner-authenticated Android MCP with bounded observations and durable action receipts",
+  "type": "module",
+  "main": "dist/phone.js",
+  "bin": {
+    "phone-use": "dist/phone.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "start": "node --env-file-if-exists=.env dist/phone.js",
+    "phone": "node --env-file-if-exists=.env dist/phone.js",
+    "doctor": "node --env-file-if-exists=.env scripts/doctor.mjs",
+    "test": "node --test scripts/*.test.mjs",
+    "owner:setup": "node scripts/owner-setup.mjs",
+    "owner:approve": "node scripts/owner-approve.mjs",
+    "verify:clean": "node scripts/verify-clean-start.mjs"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "keywords": [
+    "mcp",
+    "android",
+    "adb",
+    "automation",
+    "modelcontextprotocol"
+  ],
+  "author": "Alvin Ahmad (https://github.com/qalvinahmad)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Stella-hash/phone_use_for_llm.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Stella-hash/phone_use_for_llm/issues"
+  },
+  "homepage": "https://github.com/Stella-hash/phone_use_for_llm",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "fast-xml-parser": "^5.11.2",
+    "pngjs": "7.0.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "@types/pngjs": "6.0.5",
+    "typescript": "^5.9.3"
+  },
+  "private": true,
+  "packageManager": "pnpm@11.25.0"
+}

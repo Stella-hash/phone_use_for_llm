@@ -1,0 +1,4 @@
+interface:
+  display_name: "Game Action Observe"
+  short_description: "Return a later game frame after one bounded action"
+  default_prompt: "Use $game-action-observe to perform this move and return a later observation."

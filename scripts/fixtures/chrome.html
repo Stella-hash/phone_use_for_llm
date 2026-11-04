@@ -1,0 +1,28 @@
+<!doctype html>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Phone Use Chrome observation check</title>
+<style>
+body{font:16px sans-serif;margin:16px;background:#edf4f8;color:#173348}h1{font-size:23px}
+button,input{font:inherit;margin:6px 0;padding:8px}label{display:block}canvas{display:block;width:130px;height:45px;border:1px solid #567}
+iframe{width:160px;height:30px}#below{position:absolute;top:10000px}#hidden{display:none}
+</style>
+<h1>Chrome observation check</h1>
+<p id="story">可见测试文字：第一幕。</p>
+<button id="advance">继续</button><button id="disabled" disabled>Unavailable action</button><button id="scroll">Scroll fixture</button>
+<label>Blank input <input id="blank" aria-label="Blank input"></label>
+<label><input id="enabled" type="checkbox" checked>Enabled option</label>
+<label id="passwordRow">Password fixture <input id="password" type="password" value="SYNTHETIC_PASSWORD_MARKER"></label>
+<div id="shadow"></div>
+<canvas id="picture" role="img" aria-label="Blue test drawing"></canvas>
+<iframe id="child" title="Omitted child" srcdoc="<p>CHILD_CONTENT_MARKER</p>"></iframe>
+<p id="hidden">HIDDEN_CONTENT_MARKER</p><p id="below">OFFSCREEN_CONTENT_MARKER</p>
+<script>
+const drawing=document.getElementById('picture').getContext('2d');drawing.fillStyle='#176bca';drawing.fillRect(10,10,100,50);
+document.getElementById('shadow').attachShadow({mode:'open'}).innerHTML='<button id="shadowButton">Shadow action</button>';
+document.getElementById('advance').onclick=()=>{
+  document.getElementById('story').textContent='可见测试文字：第二幕。';
+  document.getElementById('enabled').checked=false;
+  document.getElementById('passwordRow').remove();
+};
+document.getElementById('scroll').onclick=()=>window.scrollTo(0,120);
+</script>

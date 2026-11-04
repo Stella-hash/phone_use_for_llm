@@ -1,0 +1,34 @@
+<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>Bounded drag fixture</title>
+<style>body{margin:0;background:#162031;color:white;font:18px sans-serif;touch-action:none}p{padding:18px;margin:0}canvas{display:block;margin:0 20px;background:#24374f;touch-action:none}</style>
+<p>Disposable drag fixture</p><canvas id="dragCanvas" aria-label="Drag test canvas"></canvas>
+<script>
+const canvas=document.querySelector('canvas');canvas.width=innerWidth-40;canvas.height=Math.min(innerHeight-140,650);
+const context=canvas.getContext('2d');let position=.25,dragging=false,pointer=null,trace=[],completed=[],lit=false,timer;
+const y=()=>canvas.height*.6, radius=()=>canvas.width*.09;
+function draw(){
+ context.clearRect(0,0,canvas.width,canvas.height);
+ context.lineWidth=10;context.strokeStyle='#8c9da8';context.beginPath();context.moveTo(canvas.width*.15,y());context.lineTo(canvas.width*.85,y());context.stroke();
+ context.strokeStyle='#fff';context.lineWidth=3;context.strokeRect(canvas.width*.75-radius(),y()-radius(),2*radius(),2*radius());
+ context.fillStyle='#f9c66b';context.fillRect(canvas.width*position-radius(),y()-radius(),2*radius(),2*radius());
+ context.fillStyle=lit?'#00ff65':'#452322';context.beginPath();context.arc(canvas.width*.5,canvas.height*.27,canvas.width*.14,0,2*Math.PI);context.fill();
+ context.strokeStyle=lit?'#b9ffd1':'#8c7775';context.lineWidth=5;context.stroke();
+}
+for(const type of ['pointerdown','pointermove','pointerup','pointercancel'])canvas.addEventListener(type,event=>{
+ const rect=canvas.getBoundingClientRect(),x=event.clientX-rect.left,localY=event.clientY-rect.top;
+ if(type==='pointerdown'){
+  if(Math.abs(x-position*canvas.width)>radius()*1.2||Math.abs(localY-y())>radius()*1.2)return;
+  clearTimeout(timer);dragging=true;pointer=event.pointerId;trace=[];canvas.setPointerCapture(pointer);
+ }
+ if(!dragging||event.pointerId!==pointer)return;
+ trace.push({type,trusted:event.isTrusted,pointerType:event.pointerType,x,y:localY});
+ position=Math.max(.15,Math.min(.85,x/canvas.width));lit=false;draw();
+ if(type==='pointerup'||type==='pointercancel'){
+  dragging=false;completed.push({events:trace,position});
+  if(type==='pointerup'&&position>=.72)timer=setTimeout(()=>{lit=true;draw();},350);
+ }
+});
+window.dragFixture=()=>({position,lit,completed,width:canvas.width,height:canvas.height});
+window.resetDragFixture=()=>{clearTimeout(timer);position=.25;lit=false;completed=[];draw();};
+draw();
+</script>

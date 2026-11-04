@@ -1,0 +1,27 @@
+// Local owner client. Request files keep text and approvals out of shell history.
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import path from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { clientConfig } from './client-config.mjs';
+import { readPrivate, privateDirectory, writePrivate } from '../dist/private-files.js';
+const config = clientConfig();
+const client = new Client({name:'phone-owner-client',version:'1'});
+try {
+  await client.connect(new StreamableHTTPClientTransport(config.url, {requestInit:{headers:config.headers}}));
+  if (process.argv[2] === 'list') console.log(JSON.stringify(await client.listTools()));
+  else {
+    if (!process.argv[2]) throw new Error('Usage: node scripts/call.mjs list|PRIVATE_REQUEST_FILE');
+    const request = JSON.parse(readPrivate(process.argv[2], 65536));
+    const result = await client.callTool(request);
+    for (const item of result.content || []) {
+      if (item.type === 'image') {
+        const directory = privateDirectory(path.resolve('.runtime/client-output'));
+        const file = path.join(directory, randomUUID() + '.png');
+        writePrivate(file, Buffer.from(item.data, 'base64'));
+        console.log(JSON.stringify({imagePath:file,retention:'Owner-managed local export; delete when no longer needed'}));
+      } else if (item.type === 'text') console.log(item.text);
+    }
+    if (result.isError) process.exitCode=1;
+  }
+} finally { await client.close(); }
