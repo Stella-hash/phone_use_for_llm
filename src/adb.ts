@@ -2,6 +2,7 @@ import path from "node:path";
 import { existsSync } from "node:fs";
 import { execFileSync, spawn, ChildProcess } from "node:child_process";
 import { DeadlineExceeded, remainingTime } from "./deadline.js";
+import { parseFocusIdentity, parseWindowOwner, sameFocus, uniqueOwnerPackage } from "./focus-identity.js";
 
 const EXEC_TIMEOUT = 30000;
 const MAX_BUFFER_SIZE = 1024 * 1024 * 16;
@@ -266,8 +267,14 @@ export class AdbClient {
 
 	/** Input scope follows the focused window, not a resumed app behind a dialog. */
 	public getFocusedPackage(deviceId: string): string {
-		const dump = this.shell(deviceId, "dumpsys", "window", "windows");
-		return dump.match(/mCurrentFocus=Window\{[^\n]*?\bu\d+\s+([A-Za-z0-9_.]+)\//)?.[1] || "unknown";
+		const snapshot = () => parseFocusIdentity(this.adb(deviceId, "exec-out", "dumpsys", "window", "--proto"));
+		const focus = snapshot();
+		if (!focus) return "unknown";
+		const owner = parseWindowOwner(this.shell(deviceId, "dumpsys", "window", focus.hash.toString(16)), focus);
+		if (!owner || !uniqueOwnerPackage(this.shell(deviceId, "cmd", "package", "list", "packages",
+			"--user", String(focus.userId), "--uid", String(owner.uid)), owner)) return "unknown";
+		// No cached identity and no resumed-app fallback. The sampled focus must remain stable.
+		return sameFocus(focus, snapshot()) ? owner.packageName : "unknown";
 	}
 
 	/** Escape text for `adb shell input text` and other single-token shell args. */

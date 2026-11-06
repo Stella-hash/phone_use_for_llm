@@ -152,6 +152,11 @@ Edit the generated `security.json` as the owner:
 
 This is a **partial example**: preserve the generated owner, token, key and data
 fields. Entries are exact package/domain names; there are no wildcard grants.
+
+Live UI access requires an unambiguous focused-window owner on a single default
+display (display 0). Multi-display setups, shared UIDs with multiple packages and
+unsupported WindowManager metadata formats are rejected. See [focus identity
+limits](SAFETY.md) before using a different Android/vendor build.
 Enable `retainObservationText` explicitly to use the saved-text reading cursor.
 Allowed Chrome pages require `com.android.chrome`, an exact HTTPS domain, and
 `expectedUrl` matching the focused visible tab. Other browser engines are not

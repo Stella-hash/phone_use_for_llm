@@ -33,7 +33,17 @@ the owner, OS, app and UI. The service stops when lock, focus or Chrome identity
 cannot be established. It never dismisses a keyguard. The owner enters credentials
 directly with the service/ADB disconnected when appropriate.
 
-App allowlists restrict live UI operations to the focused package. Chrome URL
+App allowlists restrict live UI operations to the focused window's owning package.
+The resolver binds typed WindowManager focus identity to a selected window's owner
+UID and PackageManager's unique UID-to-package mapping. Window titles and package
+attributes alone do not grant access. The supported scope is one default display
+(display 0); multiple displays, shared UIDs with several packages, conflicting or
+missing metadata and unsupported dump formats fail closed. The implementation
+uses Android 14's WindowManager protobuf schema; other OS/vendor builds need a
+compatible schema and owner metadata. Focus is checked again after resolution,
+but these sampled checks are not atomic with a subsequent input or capture.
+
+Chrome URL
 checks restrict returned observations and explicit opens to configured HTTPS
 domains and expected URLs. They do not control native app networking, embedded
 WebViews, browser redirects already followed, DNS, installed app behavior or
