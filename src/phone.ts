@@ -12,7 +12,7 @@ import { LIMITS, readRequest } from "./limits.js";
 import { DEFAULT_IMAGE_EDGE } from "./image-delivery.js";
 import { descriptions } from "./tool-descriptions.js";
 import { localDeviceSerial } from "./device.js";
-import { expertGrantableTools } from "./operation.js";
+import { expertGrantableTools, hostStorageTools } from "./operation.js";
 
 // Validate security before constructing transports, storage or any device executor.
 const security = new OwnerSecurity(process.env.PHONE_SECURITY_FILE);
@@ -48,6 +48,12 @@ for (const tool of catalog) {
 }
 const upstreamReadOnly = new Set(catalog.filter(tool => tool.annotations?.readOnlyHint === true).map(tool => tool.name));
 const custom: Tool[] = [
+  { name: "android_screenshot_keep", title: "Keep an Existing Screenshot", description: descriptions["android_screenshot_keep"],
+    inputSchema: { type: "object", properties: { eventId: { type: "integer", minimum: 1 }, title: { type: "string", minLength: 1, maxLength: 160 },
+      note: { type: "string", maxLength: 4096 } }, required: ["eventId", "title"], additionalProperties: false }, annotations: { readOnlyHint: false, destructiveHint: false } },
+  { name: "android_screenshot_keepsakes", title: "Browse Screenshot Keepsakes", description: descriptions["android_screenshot_keepsakes"],
+    inputSchema: { type: "object", properties: { id: { type: "string", pattern: "^[a-f0-9]{64}$" }, limit: { type: "integer", minimum: 1, maximum: 30, default: 10 },
+      before: { type: "string", pattern: "^[a-f0-9]{64}$" }, includeScreenshot: { type: "boolean", default: false } }, additionalProperties: false }, annotations: { readOnlyHint: true } },
   { name: "android_activity_reading", title: "Read Social Post Text and Cursor", description: descriptions["android_activity_reading"],
     inputSchema: { type: "object", properties: { eventId: { type: "integer", minimum: 1 }, previousEventId: { type: "integer", minimum: 1 } }, required: ["eventId"], additionalProperties: false }, annotations: { readOnlyHint: true } },
   { name: "android_chrome_read", title: "Read Current Chrome Page", description: descriptions["android_chrome_read"],
@@ -79,8 +85,9 @@ for (const name of expertGrantableTools) {
 const delayedObservationTools = new Set(["android_tap", "android_tap_element", "android_double_tap",
   "android_long_press", "android_swipe", "android_drag", "android_gesture"]);
 const actionImageTools = new Set(catalog.filter(tool => !tool.name.startsWith("android_activity_")
+  && !hostStorageTools.has(tool.name)
   && !upstreamReadOnly.has(tool.name) && !["android_power_status", "android_chrome_read"].includes(tool.name)).map(tool => tool.name));
-const imageTools = new Set([...actionImageTools, "android_take_screenshot", "android_activity_open", "android_activity_reading"]);
+const imageTools = new Set([...actionImageTools, "android_take_screenshot", "android_activity_open", "android_activity_reading", "android_screenshot_keepsakes"]);
 for (const tool of catalog) {
   allowed.add(tool.name);
   if (!readTools.has(tool.name) || tool.name === "android_device_info") tool.inputSchema.properties!.requestId = { type: "string", minLength: 8, maxLength: 128,
@@ -102,13 +109,13 @@ for (const tool of catalog) {
 
 
 for (const tool of catalog) {
-  const passive = passiveTools.has(tool.name);
+  const passive = passiveTools.has(tool.name) || hostStorageTools.has(tool.name);
   const props = tool.inputSchema.properties!;
   if (!passive) {
     props.expectedPackage = { type: "string", maxLength: 200, pattern: "^[A-Za-z][A-Za-z0-9_]*(?:\\.[A-Za-z0-9_]+)+$", description: "Bind input to this allowed app; checked before and after the action." };
     props.expectedUrl = { type: "string", maxLength: 4096, description: "Exact current allowed HTTPS URL; required for Chrome observations and input." };
   }
-  if (!readTools.has(tool.name) || tool.name === "android_device_info") {
+  if ((!readTools.has(tool.name) || tool.name === "android_device_info") && !hostStorageTools.has(tool.name)) {
     props.approval = { type: "object", additionalProperties: false, required: ["expiresAt", "signature"], properties: {
       expiresAt: { type: "integer" }, signature: { type: "string", minLength: 86, maxLength: 86 } } };
   }
@@ -129,13 +136,14 @@ for (const tool of catalog) {
   tool.annotations = { ...tool.annotations, readOnlyHint: readTools.has(tool.name) && tool.name !== "android_device_info", openWorldHint: true };
   tool.description = descriptions[tool.name] || tool.title || tool.name;
   tool.description += " Owner-authenticated single-owner service. No automatic wake.";
+  if (hostStorageTools.has(tool.name)) { tool.annotations.openWorldHint = false; continue; }
   if (expertGrantableTools.has(tool.name)) tool.description += " Input requires requestId and independent approval or an explicit local owner grant.";
   else if (!readTools.has(tool.name) || tool.name === "android_device_info") tool.description += " Input requires requestId and independent owner approval every time; it cannot be pregranted.";
   tool.description += " Live UI reads/inputs require known-unlocked, awake state and configured apps; Chrome also requires an exact allowed expectedUrl. Receipt acknowledgement does not establish app completion.";
 }
 const executor = new Executor(security, device, client, catalog);
 function makeServer() {
-  const server = new Server({ name: "phone-use", version: "0.9.0" }, { capabilities: { tools: {} }, instructions: instructions + " " + recoveryInstructions });
+  const server = new Server({ name: "phone-use", version: "0.10.0" }, { capabilities: { tools: {} }, instructions: instructions + " " + recoveryInstructions });
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: catalog }));
   server.setRequestHandler(CallToolRequestSchema, async request => executor.call(request.params.name, request.params.arguments || {}));
   return server;
@@ -151,7 +159,7 @@ const listener = http.createServer({ maxHeaderSize: 8192, requestTimeout: 10000,
   const release = () => { if (!released) { released = true; active--; } };
   res.on("close", release); res.on("finish", release);
   if (req.url === "/healthz" && req.method === "GET") {
-    res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ service: "phone-use", version: "0.9.0", tools: catalog.length, summary: executor.journal.meta("summaryStatus") })); return;
+    res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ service: "phone-use", version: "0.10.0", tools: catalog.length, summary: executor.journal.meta("summaryStatus") })); return;
   }
   if (req.url !== "/mcp") { res.writeHead(404).end(); return; }
   if (req.method !== "POST") { res.writeHead(405, { Allow: "POST" }).end(); return; }

@@ -15,6 +15,7 @@ export function createOwnerSetup(directory: string, signerDirectory: string, own
   writePrivate(path.join(signer, "approval.key"), pair.privateKey.export({ type: "pkcs8", format: "pem" }));
   writePrivate(path.join(root, "security.json"), JSON.stringify({ version: 1, ownerId, tokenFile: "token.key", dataDirectory: "data",
     approvalPublicKey: pair.publicKey.export({ type: "spki", format: "pem" }), allowedApps: [], allowedDomains: [],
-    retainObservationText: false, allowModelSummary: false, gameGrants: [] }, null, 2) + "\n");
+    retainObservationText: false, allowModelSummary: false, gameGrants: [],
+    screenshotKeepsakes: { enabled: false, maxBytes: 256 * 1024 * 1024, maxCount: 1000 } }, null, 2) + "\n");
   return { securityFile: path.join(root, "security.json"), approvalKeyFile: path.join(signer, "approval.key") };
 }

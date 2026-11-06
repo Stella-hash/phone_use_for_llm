@@ -1,6 +1,6 @@
 {
   "name": "phone-use",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "Owner-authenticated Android MCP with bounded observations and durable action receipts",
   "type": "module",
   "main": "dist/phone.js",

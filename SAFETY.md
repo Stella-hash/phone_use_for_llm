@@ -47,7 +47,15 @@ choice, not authentication or a general incognito detector. Password masking
 catches known password controls, not arbitrary secret-looking content.
 
 The service's retained original screenshots are stored in owner-protected host
-storage. Data, SQLite sidecars and images have size/count/retention limits.
+storage, without creating phone-gallery files. Data, SQLite sidecars and cached
+images have size/count/retention limits. Optional screenshot keepsakes are off
+by default and have a separate owner-configured byte/count budget. Opting in
+authorizes permanent host archival of existing non-private event images, not
+phone input. Keepsakes preserve title/note/provenance and original images beyond
+source expiry; they never auto-expire or evict, and disabling the feature does
+not erase them. All authenticated clients share the owner's collection. Export
+and quota maintenance are explicit owner operations with no MCP path/deletion
+capability.
 Automatic expiry runs while the
 service is running; exports, client image copies, filesystem snapshots and
 backups need owner retention. Secure deletion is best effort and does not prove

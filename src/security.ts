@@ -5,6 +5,7 @@ import { isIP } from "node:net";
 import { z } from "zod";
 import { privateDirectory, readPrivate, writePrivate } from "./private-files.js";
 import { strictJson } from "./json.js";
+import { DEFAULT_KEEPSAKE_BYTES, DEFAULT_KEEPSAKE_COUNT } from "./keepsakes.js";
 import { canonical, canonicalArguments, touchTools, expertGrantableTools, passiveTools, readTools, isInputOperation, isPowerKey } from "./operation.js";
 export { canonical, touchTools, passiveTools, readTools } from "./operation.js";
 
@@ -23,6 +24,10 @@ const configSchema = z.object({
   browserPackage: z.literal("com.android.chrome").default("com.android.chrome"),
   retainObservationText: z.boolean().default(false),
   allowModelSummary: z.boolean().default(false),
+  screenshotKeepsakes: z.object({ enabled: z.boolean().default(false),
+    maxBytes: z.number().int().min(1).max(16 * 1024 * 1024 * 1024).default(DEFAULT_KEEPSAKE_BYTES),
+    maxCount: z.number().int().min(1).max(10000).default(DEFAULT_KEEPSAKE_COUNT),
+  }).strict().default({ enabled: false, maxBytes: DEFAULT_KEEPSAKE_BYTES, maxCount: DEFAULT_KEEPSAKE_COUNT }),
   gameGrants: z.array(z.object({ package: packageName, tools: z.array(toolName).max(7),
     disposableOfflineGame: z.literal(true) }).strict()).max(16).default([]),
   expertSandbox: z.object({
@@ -85,6 +90,14 @@ export class OwnerSecurity {
     return url.href;
   }
   authorize(name: string, args: Record<string, unknown>) {
+    if (name === "android_screenshot_keep" || name === "android_screenshot_keepsakes") {
+      if (!this.config.screenshotKeepsakes.enabled) deny("KEEPSAKES_DISABLED");
+      if (name === "android_screenshot_keep") {
+        if ((args.context as any)?.private === true) deny("PRIVATE_CALL_CANNOT_SAVE_KEEPSAKE");
+        if (typeof args.requestId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/.test(args.requestId)) deny("REQUEST_ID_REQUIRED");
+      } else if (args.requestId !== undefined) deny("REQUEST_ID_INPUT_ONLY");
+      return; // Local owner opt-in grants host archival only, never phone input.
+    }
     if (!this.isInput(name, args)) {
       if (!name.startsWith("android_activity_") && args.requestId !== undefined) deny("REQUEST_ID_INPUT_ONLY");
       return;
