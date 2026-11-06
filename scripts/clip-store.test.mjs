@@ -13,7 +13,9 @@ import { PNG } from 'pngjs';
 const ffmpeg=process.env.PHONE_FFMPEG||'ffmpeg', ffprobe=process.env.PHONE_FFPROBE||'ffprobe';
 const available=command=>{try{execFileSync(command,['-version'],{stdio:'ignore',windowsHide:true,timeout:3000});return true;}catch{return false;}};
 const mediaAvailable=available(ffmpeg)&&available(ffprobe);
-const directory=()=>fs.mkdtempSync(path.join(os.tmpdir(),'phone-clips-'));
+// macOS may expose its temp root through /var -> /private/var. Resolve the
+// fixture root; production storage must still reject links supplied by callers.
+const directory=()=>fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()),'phone-clips-'));
 const probe=times=>({streams:[{codec_type:'video',codec_name:'h264',width:320,height:180}],
   frames:times.map(pts_time=>({pts_time,width:320,height:180})),format:{duration:'1.000000'}});
 const digest=value=>createHash('sha256').update(value).digest('hex');
