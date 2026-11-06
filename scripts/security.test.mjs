@@ -14,7 +14,7 @@ import { ActivityJournal } from '../dist/activity.js';
 import { ImageStore } from '../dist/image-store.js';
 import { LIMITS, boundedValue } from '../dist/limits.js';
 import { UiInspector } from '../dist/ui.js';
-import { assertPrivate } from '../dist/private-files.js';
+import { assertPrivate, writePrivate } from '../dist/private-files.js';
 import { Executor } from '../dist/executor.js';
 import { normalizeKey, actionBinding, expertGrantableTools } from '../dist/operation.js';
 import { localDeviceSerial } from '../dist/device.js';
@@ -126,7 +126,7 @@ test('authentication, field/body/batch caps and legacy filtering reject requests
   for (const body of [JSON.stringify([{ jsonrpc: '2.0', id: 1, method: 'tools/list' }]), JSON.stringify({ text: 'x'.repeat(65536) })])
     assert.equal((await fetch(f.endpoint + '/mcp', { method: 'POST', headers, body })).status, 413);
   const catalog = (await f.client.listTools()).tools;
-  assert.equal(catalog.length, 26);
+  assert.equal(catalog.length, 28);
   for (const name of expertGrantableTools) assert.match(catalog.find(tool => tool.name === name)?.description || '', /explicit local owner grant/);
   for (const name of ['android_press_key', 'android_device_info']) assert.match(catalog.find(tool => tool.name === name).description, /cannot be pregranted/);
   for (const name of ['android_install_app', 'android_list_devices', 'android_connect_wifi', 'android_save_screenshot']) {
@@ -282,5 +282,90 @@ test('journal admission failure does not prevent an authenticated saved-receipt 
     const result = await executor.call('android_activity_open', { requestId: 'capacity-recovery-001', receiptOnly: true });
     assert(!result.isError); assert.equal(texts(result)[0].phoneReceipt.execution, 'acknowledged');
     assert.equal(texts(result).find(x => x.phoneActivity).phoneActivity.historyReadNotRecorded, true);
+  } finally { await executor.close(); }
+});
+
+test('keepsakes are owner opt-in, honest host mutations with request bindings, and never contact ADB even while asleep', async t => {
+  const f = await fixtureServer(t, { PHONE_TEST_AWAKE: '0', PHONE_TEST_LOCK: 'locked' }, {
+    screenshotKeepsakes: { enabled: true, maxCount: 2, maxBytes: 1024 * 1024 },
+  });
+  const catalog = (await f.client.listTools()).tools;
+  const keep = catalog.find(tool => tool.name === 'android_screenshot_keep'), collection = catalog.find(tool => tool.name === 'android_screenshot_keepsakes');
+  assert.equal(keep.annotations.readOnlyHint, false); assert.equal(collection.annotations.readOnlyHint, true);
+  assert.equal(keep.inputSchema.properties.expectedPackage, undefined); assert.equal(keep.inputSchema.properties.approval, undefined);
+  assert(keep.inputSchema.required.includes('requestId')); assert.equal(keep.inputSchema.properties.imageMode, undefined);
+  const journalDirectory = path.join(f.dir, 'journal');
+  const journal = new ActivityJournal(journalDirectory), images = new ImageStore(journalDirectory);
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jC4sAAAAASUVORK5CYII=', 'base64');
+  const seed = (privateCall = false) => {
+    const eventId = journal.begin('android_take_screenshot', {}, { private: privateCall }, 'phone');
+    const screenshot = { ...images.save(eventId, png), captureFinishedAt: new Date().toISOString() };
+    journal.finish(eventId, 'completed', { observation: { at: new Date().toISOString(), screenshot } });
+    return { eventId, screenshot };
+  };
+  const source = seed(), secret = seed(true);
+  journal.close();
+  const args = { eventId: source.eventId, title: 'Synthetic memory', note: 'Kept without phone access', requestId: 'keepsake-save-001' };
+  const saved = await f.client.callTool({ name: keep.name, arguments: args });
+  assert(!saved.isError, JSON.stringify(saved));
+  const kept = texts(saved).find(value => value.record); assert.equal(kept.created, true); assert.equal(kept.status.count, 1);
+  assert.equal(kept.record.origin.capturedAt, source.screenshot.captureFinishedAt); assert.equal(kept.record.origin.capturedAtSource, 'capture-finished');
+  const receipt = texts(saved).find(value => value.phoneReceipt).phoneReceipt;
+  assert.equal(receipt.effectScope, 'owner-host-storage'); assert.equal(receipt.phoneContacted, false);
+  assert.equal(receipt.requestBinding.argsDigest, actionBinding(keep.name, args).argsDigest);
+  const retry = await f.client.callTool({ name: keep.name, arguments: args }); assert(retry.isError); assert.match(JSON.stringify(retry), /ALREADY_RECORDED/);
+  const changed = await f.client.callTool({ name: keep.name, arguments: { ...args, title: 'Different intent' } });
+  assert(changed.isError); assert.match(JSON.stringify(changed), /BINDING_MISMATCH/);
+  const duplicate = await f.client.callTool({ name: keep.name, arguments: { ...args, requestId: 'keepsake-dedup-002', title: 'No overwrite' } });
+  assert(!duplicate.isError); assert.equal(texts(duplicate).find(value => value.record).created, false);
+  for (const privateArgs of [{ ...args, context: { private: true }, requestId: 'keepsake-private-call' },
+    { ...args, eventId: secret.eventId, requestId: 'keepsake-private-source' }]) {
+    const rejected = await f.client.callTool({ name: keep.name, arguments: privateArgs });
+    assert(rejected.isError); assert.match(JSON.stringify(rejected), /PRIVATE/);
+  }
+  const invalid = await f.client.callTool({ name: collection.name, arguments: { id: '../token.key' } }); assert(invalid.isError);
+  const missing = await f.client.callTool({ name: keep.name, arguments: { ...args, eventId: 999999, requestId: 'keepsake-missing-source' } }); assert(missing.isError);
+  // Expire both the source cache and event database, then reopen through the independent collection.
+  fs.utimesSync(path.join(images.directory, source.screenshot.filename), new Date(0), new Date(0)); images.prune();
+  const expired = new ActivityJournal(journalDirectory, { ...LIMITS, events: LIMITS.events, requestIds: LIMITS.requestIds, retentionMs: 0 });
+  expired.maintain(); assert.equal(expired.open(source.eventId), null); expired.close();
+  const opened = await f.client.callTool({ name: collection.name, arguments: { id: kept.record.id, includeScreenshot: true } });
+  assert(!opened.isError, JSON.stringify(opened)); assert(opened.content.some(item => item.type === 'image'));
+  assert.equal(texts(opened).find(value => value.record).record.title, 'Synthetic memory');
+  const listed = await f.client.callTool({ name: collection.name, arguments: {} });
+  assert(!listed.isError); assert.equal(texts(listed).find(value => value.records).records.length, 1);
+  assert.deepEqual(f.rows(), []);
+});
+
+test('keepsakes default off and invalid config or caller claims cannot enable archival', async t => {
+  const f = await fixtureServer(t);
+  for (const request of [{ name: 'android_screenshot_keepsakes', arguments: {} },
+    { name: 'android_screenshot_keep', arguments: { eventId: 1, title: 'Rejected', requestId: 'keepsake-disabled-001', context: { actor: 'owner' } } }]) {
+    const result = await f.client.callTool(request); assert(result.isError); assert.match(JSON.stringify(result), /KEEPSAKES_DISABLED/);
+  }
+  assert(!fs.existsSync(path.join(f.dir, 'journal', 'keepsakes'))); assert.deepEqual(f.rows(), []);
+  const owner = fixtureOwner(fresh('keepsake-invalid-config'), { screenshotKeepsakes: { enabled: true, maxBytes: null } });
+  assert.throws(() => new OwnerSecurity(owner.file), /Invalid owner/);
+});
+
+test('keepsake reads survive journal admission pressure, and corrupt storage errors still finalize their records', async () => {
+  const owner = fixtureOwner(fresh('keepsake-full-journal'), { screenshotKeepsakes: { enabled: true } });
+  const security = new OwnerSecurity(owner.file);
+  const executor = new Executor(security, 'synthetic-device', { callTool: () => { throw Error('No device work allowed'); } }, [{
+    name: 'android_screenshot_keepsakes', inputSchema: { type: 'object', properties: {} },
+  }]);
+  try {
+    const begin = executor.journal.begin.bind(executor.journal);
+    executor.journal.begin = () => { throw Error('synthetic capacity limit'); };
+    const result = await executor.call('android_screenshot_keepsakes', {});
+    assert(!result.isError, JSON.stringify(result)); assert(!JSON.stringify(result).includes('FINALIZATION_FAILED'));
+    assert.equal(texts(result).find(value => value.phoneActivity).phoneActivity.storageReadNotRecorded, true);
+    executor.journal.begin = begin;
+    writePrivate(path.join(security.directory, 'keepsakes', 'unexpected-file'), 'synthetic-corruption');
+    const corrupt = await executor.call('android_screenshot_keepsakes', {});
+    assert(corrupt.isError); assert.equal(texts(corrupt).find(value => value.error).error, 'KEEPSAKE_INVALID_STORAGE');
+    assert.equal(texts(corrupt).find(value => value.error).status.status, 'unavailable');
+    assert.equal(texts(corrupt).find(value => value.phoneReceipt).phoneReceipt.callOutcome, 'error');
+    assert(!executor.journal.history().some(event => event.outcome === 'running'));
   } finally { await executor.close(); }
 });

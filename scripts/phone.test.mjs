@@ -39,7 +39,7 @@ test('HTTP adapter keeps both status paths asleep; explicit wake and sleep prese
     return result.content.filter(item => item.type === 'text').map(item => { try { return JSON.parse(item.text); } catch { return item.text; } });
   };
   const catalog = (await client.listTools()).tools;
-  assert.equal(catalog.length, 26);
+  assert.equal(catalog.length, 28);
   assert.equal(catalog.find(tool => tool.name === 'android_activity_reading').annotations.readOnlyHint, true);
   assert.equal(catalog.find(tool => tool.name === 'android_chrome_read').annotations.readOnlyHint, true);
   assert.equal(catalog.find(tool => tool.name === 'android_power_status').annotations.readOnlyHint, true);

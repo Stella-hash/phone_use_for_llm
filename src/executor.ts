@@ -5,6 +5,7 @@ import { AdbClient } from "./adb.js";
 import { UiInspector } from "./ui.js";
 import { ActivityJournal, ActivitySummarizer } from "./activity.js";
 import { ImageStore } from "./image-store.js";
+import { KeepsakeStore, KeepsakeError } from "./keepsakes.js";
 import { OwnerSecurity, PolicyError, deny, passiveTools } from "./security.js";
 import { boundedValue, LIMITS } from "./limits.js";
 import { readPowerStatus } from "./power.js";
@@ -17,7 +18,7 @@ import { readingCursor } from "./reading.js";
 import { activityReceipt } from "./receipt.js";
 import { delayObservation, type ObservationDelay } from "./observation-delay.js";
 import { boundResultImages, DEFAULT_IMAGE_EDGE } from "./image-delivery.js";
-import { canonicalArguments, isPowerKey, actionBinding } from "./operation.js";
+import { canonicalArguments, isPowerKey, actionBinding, hostStorageTools } from "./operation.js";
 
 const json = (value: any): CallToolResult => ({ content: [{ type: "text", text: JSON.stringify(value) }] });
 const failure = (code: string): CallToolResult => ({ isError: true, content: [{ type: "text", text: code }] });
@@ -30,12 +31,14 @@ export class Executor {
   private ui = new UiInspector(this.adb, 1);
   readonly journal: ActivityJournal;
   private images: ImageStore;
+  private keepsakes?: KeepsakeStore;
   private summarizer: ActivitySummarizer;
   private validators;
   private maintenance: ReturnType<typeof setInterval>;
   constructor(private security: OwnerSecurity, private device: string, private client: Client, catalog: Tool[]) {
     this.journal = new ActivityJournal(security.directory);
     this.images = new ImageStore(security.directory);
+    if (security.config.screenshotKeepsakes.enabled) this.keepsakes = new KeepsakeStore(security.directory, security.config.screenshotKeepsakes);
     this.summarizer = new ActivitySummarizer(this.journal, security.config.allowModelSummary);
     const provider = new AjvJsonSchemaValidator();
     this.validators = new Map(catalog.map(tool => [tool.name, provider.getValidator(tool.inputSchema)]));
@@ -71,6 +74,7 @@ export class Executor {
   private async execute(name: string, all: Record<string, any>): Promise<CallToolResult> {
     remainingTime();
     const history = name.startsWith("android_activity_");
+    const archive = hostStorageTools.has(name);
     const status = name === "android_device_info" || name === "android_power_status";
     const input = this.security.isInput(name, all);
     const textInput = name === "android_set_text" || name === "android_type_text";
@@ -82,20 +86,50 @@ export class Executor {
         { type: "text", text: JSON.stringify({ phoneReceipt: this.receipt(prior) }) }] };
     }
     try { this.security.authorize(name, all); }
-    catch (error) { return failure(safeError(error)); }
+    catch (error) {
+      if (archive && !this.security.config.screenshotKeepsakes.enabled) return { isError: true, ...json({ error: safeError(error),
+        status: { enabled: false, maxBytes: this.security.config.screenshotKeepsakes.maxBytes, maxCount: this.security.config.screenshotKeepsakes.maxCount, usedBytes: null, count: null } }) };
+      return failure(safeError(error));
+    }
     let eventId: number;
-    try { eventId = this.journal.begin(name, all, context, history ? "history" : status && !wake ? "status" : "phone", input ? requestId : undefined); }
+    try { eventId = this.journal.begin(name, all, context, archive ? "host-storage" : history ? "history" : status && !wake ? "status" : "phone", input ? requestId : undefined); }
     catch {
       // Storage pressure must not prevent recovery of an already executed action.
-      if (history) eventId = 0;
+      if (history || (archive && !input)) eventId = 0;
       else return failure("JOURNAL_UNAVAILABLE: no input attempted");
     }
     let result: CallToolResult = failure("OPERATION_FAILED"), observation: any = null, preparation: any = null;
+    let hostStorage: any;
     let imageEventId = eventId;
     let policyDrift = false;
     let delay: ObservationDelay | undefined = observeAfterMs === undefined ? undefined : { requestedMs: observeAfterMs, elapsedMs: 0, status: "action_failed" };
     try {
-      if (history) {
+      if (archive) {
+        const keepsakes = this.keepsakes;
+        if (!keepsakes) throw new PolicyError("KEEPSAKES_DISABLED");
+        if (name === "android_screenshot_keep") {
+          const source = this.journal.open(args.eventId);
+          if (!source) deny("RECORD_NOT_FOUND");
+          if (source.callerClaim?.private) deny("PRIVATE_EVENT_CANNOT_SAVE_KEEPSAKE");
+          let png: Buffer;
+          try { png = this.images.open(source.observation?.screenshot); } catch { return this.finishArchiveFailure(eventId, "SOURCE_IMAGE_UNAVAILABLE", this.keepsakeStatus()); }
+          this.journal.recordExecution(eventId, "unconfirmed");
+          const capturedAt = source.observation?.screenshot?.captureFinishedAt || source.observation?.at || source.startedAt;
+          const saved = keepsakes.save({ eventId: source.id, tool: source.tool, capturedAt,
+            capturedAtSource: source.observation?.screenshot?.captureFinishedAt ? "capture-finished" : source.observation?.at ? "observation" : "event-start" }, png, { title: args.title, note: args.note });
+          hostStorage = { mutation: "keep-existing-screenshot", phoneContacted: false, keepsakeId: saved.record.id, created: saved.created };
+          this.journal.recordExecution(eventId, "acknowledged");
+          result = json({ ...saved, hostStorage });
+        } else {
+          if (args.id !== undefined && (args.before !== undefined || args.limit !== undefined)) deny("PROVIDE_ID_OR_LIST_OPTIONS");
+          if (args.id === undefined && args.includeScreenshot) deny("SCREENSHOT_REQUIRES_KEEPSAKE_ID");
+          if (args.id !== undefined) {
+            const opened = keepsakes.open(args.id); imageEventId = opened.record.origin.eventId;
+            result = json({ record: opened.record, status: opened.status, historicalImage: true, phoneContacted: false });
+            if (args.includeScreenshot) result.content.push({ type: "image", mimeType: "image/png", data: opened.png.toString("base64") });
+          } else result = json({ ...keepsakes.list({ limit: args.limit, before: args.before }), phoneContacted: false });
+        }
+      } else if (history) {
         if (name === "android_activity_context") result = json(this.journal.context(8, true));
         if (name === "android_activity_history") {
           const entries = this.journal.history(args.limit || 10, args.before);
@@ -194,21 +228,23 @@ export class Executor {
         if (!result.isError) this.journal.recordExecution(eventId, "acknowledged");
         else if (!policyDrift) result = failure("OPERATION_FAILED: inspect the receipt before retrying");
       }
-    } catch (error) { result = failure(safeError(error)); }
+    } catch (error) {
+      result = error instanceof KeepsakeError ? { isError: true, ...json({ error: error.code, status: error.storageStatus || this.keepsakeStatus() }) } : failure(safeError(error));
+    }
     // No failure path performs a fallback UI read or repeats an input.
-    if (!history && !observation) observation = { at: new Date().toISOString(), uiOmitted: "operation stopped; no fallback UI read" };
+    if (!history && !archive && !observation) observation = { at: new Date().toISOString(), uiOmitted: "operation stopped; no fallback UI read" };
     if (observation && delay) observation.delay = delay;
     const inline = boundResultImages(result, imageEventId, imageMaxEdge || DEFAULT_IMAGE_EDGE, imageMode === "deferred");
     if (observation?.screenshot) observation.screenshot.returnedInline = inline;
-    if (!history) result.content.push({ type: "text", text: JSON.stringify({ phoneObservation: {
+    if (!history && !archive) result.content.push({ type: "text", text: JSON.stringify({ phoneObservation: {
       at: observation.at, preparation, errors: observation.errors, uiOmitted: observation.uiOmitted,
       screenshot: observation.screenshot, screenshotOmitted: observation.screenshotOmitted, delay: observation.delay, metadataVerified: observation.metadataVerified,
     } }) });
     try {
-      if (eventId) this.journal.finish(eventId, policyDrift ? "policy_drift" : result.isError ? "error" : "completed", { result: { isError: !!result.isError, ...(history ? { historyRead: true } : {}) }, preparation, observation });
-      if (!history && !status) this.summarizer.schedule();
-      result.content.push({ type: "text", text: JSON.stringify({ phoneActivity: { eventId: eventId || null, ...(!eventId ? { historyReadNotRecorded: true } : {}), ...(name === "android_activity_open" && args.receiptOnly ? {} : this.journal.context()) },
-        ...(history ? {} : { phoneReceipt: this.receipt(this.journal.open(eventId)) }) }) });
+      if (eventId) this.journal.finish(eventId, policyDrift ? "policy_drift" : result.isError ? "error" : "completed", { result: { isError: !!result.isError, ...(history ? { historyRead: true } : {}) }, preparation, observation, ...(hostStorage ? { hostStorage } : {}) });
+      if (!history && !archive && !status) this.summarizer.schedule();
+      result.content.push({ type: "text", text: JSON.stringify({ phoneActivity: { eventId: eventId || null, ...(!eventId ? archive ? { storageReadNotRecorded: true } : { historyReadNotRecorded: true } : {}), ...(name === "android_activity_open" && args.receiptOnly ? {} : this.journal.context()) },
+        ...(history || !eventId ? {} : { phoneReceipt: this.receipt(this.journal.open(eventId)) }) }) });
     } catch { result.content.push({ type: "text", text: "RECORD_FINALIZATION_FAILED: action may have run; do not replay" }); }
     return result;
   }
@@ -219,7 +255,17 @@ export class Executor {
     } catch { result.content.push({ type: "text", text: JSON.stringify({ phoneImage: { status: "unavailable", sourceEventId: entry.id, error: "Saved image unavailable; receipt retained" } }) }); }
   }
   private receipt(entry: any) {
-    return { ...activityReceipt(entry), screenshotAvailable: !entry.callerClaim?.private && this.images.available(entry.observation?.screenshot) };
+    return { ...activityReceipt(entry), ...(hostStorageTools.has(entry.tool) ? { effectScope: "owner-host-storage", phoneContacted: false, hostStorage: entry.hostStorage || null } : {}),
+      screenshotAvailable: !entry.callerClaim?.private && this.images.available(entry.observation?.screenshot) };
+  }
+  private finishArchiveFailure(eventId: number, code: string, status: any) {
+    this.journal.finish(eventId, "error", { result: { isError: true }, hostStorage: { phoneContacted: false, error: code } });
+    return { isError: true, ...json({ error: code, status, phoneReceipt: this.receipt(this.journal.open(eventId)) }) };
+  }
+  private keepsakeStatus() {
+    try { return this.keepsakes?.status(); }
+    catch { return { storage: "owner-host", status: "unavailable", usedBytes: null, count: null,
+      maxBytes: this.security.config.screenshotKeepsakes.maxBytes, maxCount: this.security.config.screenshotKeepsakes.maxCount }; }
   }
   async close() { clearInterval(this.maintenance); await this.queue; this.summarizer.stop(); this.journal.close(); }
 }

@@ -5,6 +5,8 @@ export const descriptions: Record<string, string> = {
   android_launch_app: "Launch the allowed packageName. expectedPackage must equal the target. No screen wake.",
   android_terminate_app: "Force-stop the allowed packageName, bound to expectedPackage.",
   android_take_screenshot: "Return a bounded screenshot preview when UI privacy and scope checks pass. Original is retained in owner-only host storage, subject to quotas and retention.",
+  android_screenshot_keep: "Save an existing event screenshot as a permanent owner-host keepsake with a title and optional note. Mutates host storage; requires owner-enabled screenshotKeepsakes and requestId. No capture or phone contact. Private calls/events cannot be saved. Same source image deduplicates without changing its original title/note. Separate byte/count limits reject new saves; old keepsakes are never automatically deleted.",
+  android_screenshot_keepsakes: "List permanent owner-host keepsakes with budget/migration status, or reopen one by id and optionally include its saved screenshot. Independent of event/cache expiry. Does not contact the phone, save a new keepsake, delete files or accept filesystem paths. Requires owner-enabled screenshotKeepsakes.",
   android_list_elements: "Read native accessibility elements, including empty editable controls. These are live observations and may contain private app text.",
   android_wait_for_element: "Wait within the call deadline for a matching accessibility element. Does not tap.",
   android_tap: "Tap a native screen-pixel position. Optional observeAfterMs delays the one returned observation by 0–5000 ms.",

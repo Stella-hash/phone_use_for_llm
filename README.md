@@ -17,7 +17,7 @@ a trusted computer, a USB-connected Android phone, and a client able to reach th
 computer's authenticated local MCP endpoint. It does not include a language
 model, a hosted connector, or an unattended controller.
 
-**0.9 remains a release candidate.** The R2 repair has received independent
+**0.10 remains a release candidate.** The R2 repair has received independent
 review; final integration and hosted publication gates remain tracked in
 [release preparation](docs/RELEASE-PREPARATION.md). It defaults to one
 authenticated owner and per-input approval, with explicit opt-in grants for
@@ -64,6 +64,7 @@ permission for an agent to widen its own access.
 | Recover | Query a caller-chosen request ID after transport failure; a recorded ID never executes another input |
 | Keep a reading place | Saved-text overlap for Xiaohongshu post captions and moomoo CA articles; observed image index/total remain separate from text position |
 | Resume | Single-owner history and optional source-linked model summaries |
+| Keep a moment | Optional named screenshot keepsakes in host storage, with a separate budget and owner export |
 | Monitor | Power, battery temperature and framework thermal status without waking or reading UI |
 
 Reading cursors do not choose interests, scroll automatically, or nag about unseen
@@ -282,7 +283,9 @@ arguments can compare guesses for short, predictable text, including OTPs. The
 digest survives source-record expiry and `context.private`; protect receipts and
 exports as sensitive metadata, and keep real secrets out of this dedicated phone.
 
-History and images are bound to one owner directory. An existing unbound or
+History and images are bound to one owner directory. Screenshots stream directly
+from Android to that host; this service does not create phone-gallery files.
+An existing unbound or
 different-owner directory is rejected. Source records expire after seven days or
 at 2,000 events; images also have 200-file / 64 MiB limits (16 MiB per image).
 Cleanup runs at admission and every minute while the process runs. SQLite and WAL
@@ -308,6 +311,63 @@ data or reject admission; it never authorizes a repeated action.
 exports a SQLite snapshot with receipts/replay ledger, excluding images. Exports
 and client-saved images require separate owner retention and protection.
 
+### Optional screenshot keepsakes
+
+Keepsakes are **off by default**. The owner can opt in through `security.json`,
+then restart the service:
+
+```json
+"screenshotKeepsakes": {
+  "enabled": true,
+  "maxBytes": 268435456,
+  "maxCount": 1000
+}
+```
+
+This grants authenticated clients permission to preserve an **existing** retained
+event image with `android_screenshot_keep({eventId, title, note?, requestId})`.
+It changes host storage and uses the same bound-request/recovery ledger as other
+mutations; it does not capture a new image, contact the phone or grant phone-input
+authority. `context.private=true` calls and private source events cannot be saved.
+If the source image has expired, saving fails without recapturing it.
+
+`android_screenshot_keepsakes({limit?, before?})` lists saved moments;
+`android_screenshot_keepsakes({id, includeScreenshot:true})` reopens one after its
+source event/cache expires. These reads work while the phone is disconnected.
+Titles are limited to 160 characters, notes to 4,096; each original PNG is at most
+16 MiB. Immutable records retain the event/tool, capture-time provenance, save
+time and image SHA-256. Saving the same source image again returns its existing
+record, preserving its original title/note.
+
+The separate budget counts PNG and metadata bytes. Keep/list responses report
+usage and recommend migration at 80% of either the byte or count limit. A new
+save that would exceed either limit is refused. Keepsakes never expire and are
+never automatically deleted, including when the feature is later disabled.
+All clients of the same owner can read that owner's enabled keepsake collection.
+
+For an owner-operated, checksum-verified export to a **new** private directory:
+
+```sh
+node --env-file=.env scripts/export-keepsakes.mjs /absolute/new-private-directory
+```
+
+The utility copies original PNGs and provenance and writes `manifest.json` only
+after verification. It never deletes the source; an incomplete export without
+that manifest is not a verified migration. Export also works with the feature
+disabled. Stop the service before a final migration so no saves occur afterward.
+To free the active quota without deleting memories, first verify the export,
+then move the **whole** `dataDirectory/keepsakes` directory to a separate private
+archive outside the active data directory using the owner's filesystem tools.
+Restarting creates a new empty active collection. Preserve the journal/replay
+ledger and the archived collection; older keepsakes remain in that archive and
+export, not in the new active list. No agent tool accepts arbitrary paths or
+deletes/moves keepsakes. Exports and archives need their own owner retention and
+backup policy.
+
+A crashed writer can leave `.write.lock` or `.pending-*` entries. Pending files
+reserve quota and produce an inspection warning; they are never silently erased.
+Stop the service and preserve/inspect these entries before owner maintenance.
+
 Unicode input and continuous gestures need the optional Android helper. Its
 [source build instructions](docs/HELPER-BUILD.md) require a fresh compilation and
 an explicit signing mode. No prebuilt APK or actual SDK/device acceptance is
@@ -327,7 +387,7 @@ This optional interface is for people who trust the operators, use an empty
 disposable phone, understand the ADB/host/network boundary, and accept the risk.
 The recommended starting point remains the strict configuration above.
 
-The 26-tool catalog covers status, apps, native and Chrome observations, all the
+The 28-tool catalog covers status, apps, native and Chrome observations, all the
 touch/gesture/text/key/orientation controls, and four activity/reading endpoints.
 The owner can grant exposed input tools except `android_press_key` for exact allowed packages through
 `expertSandbox.grants`, for example:
