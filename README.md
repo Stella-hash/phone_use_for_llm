@@ -65,6 +65,7 @@ permission for an agent to widen its own access.
 | Keep a reading place | Saved-text overlap for Xiaohongshu post captions and moomoo CA articles; observed image index/total remain separate from text position |
 | Resume | Single-owner history and optional source-linked model summaries |
 | Keep a moment | Optional named screenshot keepsakes in host storage, with a separate budget and owner export |
+| Inspect an animation | Optional 1–5 second silent clips, actual frame timestamps and copied clip/frame keepsakes |
 | Monitor | Power, battery temperature and framework thermal status without waking or reading UI |
 
 Reading cursors do not choose interests, scroll automatically, or nag about unseen
@@ -226,6 +227,12 @@ the retained original from host storage without contacting the phone. An absent
 image leaves the text receipt available. `phoneImage` gives source/preview sizes
 and coordinate scaling; Chrome bounds instead use CSS pixels.
 
+If a preview appears black, an optional first recovery is reopening the same
+archived event with `android_activity_open({eventId, includeScreenshot:true,
+imageMaxEdge:768})`, trying a different preview size before navigating the app.
+This reads the saved image without phone contact. It is not a guaranteed fix:
+the cause can be in capture or downstream presentation and may remain unknown.
+
 Receipts include `requestBinding.tool` and `requestBinding.argsDigest`. Verify both
 against `actionBinding(name, arguments)` from `dist/operation.js` before using a
 recovered receipt. `android_activity_open` accepts `expectedTool` and
@@ -262,6 +269,11 @@ checks and all bounds still apply. Text entry, app launch and power transitions
 remain separately approved unless explicitly supported by the expert profile.
 Restart the service after an owner changes policy. Revoke a grant before adding
 accounts, commerce or communication features to the device.
+
+`android_capture_clip` can also be granted for an explicitly enabled clip app.
+Its optional tap needs that exact tool grant or a signed request; an
+`android_tap` grant alone does not authorize it. Recording without a tap needs
+owner clip opt-in and a recovery ID, but grants no phone input.
 
 ## Data, bounds and optional components
 
@@ -368,6 +380,26 @@ A crashed writer can leave `.write.lock` or `.pending-*` entries. Pending files
 reserve quota and produce an inspection warning; they are never silently erased.
 Stop the service and preserve/inspect these entries before owner maintenance.
 
+### Optional short clips and frames
+
+`android_capture_clip` records a bounded silent clip, optionally with one tap;
+`android_clip_open` lists clips or opens selected zero-based frames;
+`android_clip_keep` copies an entire clip or one frame into permanent keepsakes.
+The feature is off by default. Linux capture needs owner-installed scrcpy,
+Python 3, FFmpeg and ffprobe. Reading saved media does not contact the phone.
+
+The public cache defaults to seven days, 256 MiB and 32 clips, with a 64 MiB
+per-clip ceiling. Old verified cache entries can be evicted sooner for capacity.
+Clip keepsakes are separately off by default and have their own byte/count
+budget, a migration warning at 80%, and no automatic deletion. Kept media and
+provenance are copied, so source-cache expiry does not erase a kept moment.
+
+Enable only suitable non-browser apps. Endpoint checks cannot inspect every
+video frame: notifications, overlays or a temporary app change may be recorded.
+Owner setup requires explicit acceptance of this interval. A browser cannot be
+enabled for clips, since a full-screen stream cannot enforce the service's exact
+URL boundary throughout a recording. See [short-clip setup, usage and retention](docs/SHORT-CLIPS.md).
+
 Unicode input and continuous gestures need the optional Android helper. Its
 [source build instructions](docs/HELPER-BUILD.md) require a fresh compilation and
 an explicit signing mode. No prebuilt APK or actual SDK/device acceptance is
@@ -387,7 +419,7 @@ This optional interface is for people who trust the operators, use an empty
 disposable phone, understand the ADB/host/network boundary, and accept the risk.
 The recommended starting point remains the strict configuration above.
 
-The 28-tool catalog covers status, apps, native and Chrome observations, all the
+The 31-tool catalog covers status, apps, native and Chrome observations, all the
 touch/gesture/text/key/orientation controls, and four activity/reading endpoints.
 The owner can grant exposed input tools except `android_press_key` for exact allowed packages through
 `expertSandbox.grants`, for example:

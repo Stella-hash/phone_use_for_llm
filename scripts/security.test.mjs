@@ -90,6 +90,7 @@ test('small defensive limit fixtures reject deep/long collections and bound XML 
 
 test('expert grants reject unknown, legacy, read and key tools before service construction', () => {
   const owner = fixtureOwner(fresh('exact-grants'), {
+    shortClips: { enabled: true, allowedApps: ['org.example.game'], acceptsTransientScreenContent: true, recorderPath: process.execPath },
     expertSandbox: { trustedOperators: true, disposablePhone: true, isolatedEnvironment: true, acceptsRisk: true,
       grants: [{ package: 'org.example.game', tools: [...expertGrantableTools] }] },
   });
@@ -126,9 +127,24 @@ test('authentication, field/body/batch caps and legacy filtering reject requests
   for (const body of [JSON.stringify([{ jsonrpc: '2.0', id: 1, method: 'tools/list' }]), JSON.stringify({ text: 'x'.repeat(65536) })])
     assert.equal((await fetch(f.endpoint + '/mcp', { method: 'POST', headers, body })).status, 413);
   const catalog = (await f.client.listTools()).tools;
-  assert.equal(catalog.length, 28);
-  for (const name of expertGrantableTools) assert.match(catalog.find(tool => tool.name === name)?.description || '', /explicit local owner grant/);
+  assert.equal(catalog.length, 31);
+  for (const name of expertGrantableTools) assert.match(catalog.find(tool => tool.name === name)?.description || '', /explicit (?:local owner|app) grant/);
   for (const name of ['android_press_key', 'android_device_info']) assert.match(catalog.find(tool => tool.name === name).description, /cannot be pregranted/);
+  const clipCapture = catalog.find(tool => tool.name === 'android_capture_clip');
+  assert(clipCapture.inputSchema.required.includes('requestId'));
+  assert(clipCapture.inputSchema.required.includes('expectedDisplay'));
+  assert.equal(clipCapture.inputSchema.properties.imageMode, undefined);
+  assert.equal(clipCapture.inputSchema.properties.expectedUrl, undefined);
+  for (const name of ['android_clip_open', 'android_clip_keep']) {
+    const tool = catalog.find(tool => tool.name === name);
+    assert.equal(tool.annotations.openWorldHint, false);
+    assert.equal(tool.inputSchema.properties.expectedPackage, undefined);
+    assert.equal(tool.inputSchema.properties.approval, undefined);
+  }
+  for (const request of [{ name: 'android_capture_clip', arguments: { expectedPackage: 'org.example.game', expectedDisplay: { width: 100, height: 200 }, requestId: 'disabled-clip-001' } },
+    { name: 'android_clip_open', arguments: {} }, { name: 'android_clip_keep', arguments: { id: 'unused', title: 'moment', requestId: 'disabled-keep-001' } }]) {
+    const result = await f.client.callTool(request); assert(result.isError); assert.match(JSON.stringify(result), /CLIPS_DISABLED/);
+  }
   for (const name of ['android_install_app', 'android_list_devices', 'android_connect_wifi', 'android_save_screenshot']) {
     assert(!catalog.some(t => t.name === name));
     assert((await f.client.callTool({ name, arguments: {} })).isError);

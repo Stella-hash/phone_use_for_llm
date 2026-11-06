@@ -19,6 +19,9 @@ import { activityReceipt } from "./receipt.js";
 import { delayObservation, type ObservationDelay } from "./observation-delay.js";
 import { boundResultImages, DEFAULT_IMAGE_EDGE } from "./image-delivery.js";
 import { canonicalArguments, isPowerKey, actionBinding, hostStorageTools } from "./operation.js";
+import { ClipStore, ClipStoreError } from "./clip-store.js";
+import { captureShortClip, ClipCaptureError } from "./clip-capture.js";
+import { openClip, clipKeepSchema } from "./clip-tools.js";
 
 const json = (value: any): CallToolResult => ({ content: [{ type: "text", text: JSON.stringify(value) }] });
 const failure = (code: string): CallToolResult => ({ isError: true, content: [{ type: "text", text: code }] });
@@ -32,6 +35,8 @@ export class Executor {
   readonly journal: ActivityJournal;
   private images: ImageStore;
   private keepsakes?: KeepsakeStore;
+  private clips?: ClipStore;
+  private captureClip = captureShortClip;
   private summarizer: ActivitySummarizer;
   private validators;
   private maintenance: ReturnType<typeof setInterval>;
@@ -39,10 +44,15 @@ export class Executor {
     this.journal = new ActivityJournal(security.directory);
     this.images = new ImageStore(security.directory);
     if (security.config.screenshotKeepsakes.enabled) this.keepsakes = new KeepsakeStore(security.directory, security.config.screenshotKeepsakes);
+    const clips = security.config.shortClips;
+    if (clips.enabled) this.clips = new ClipStore(security.directory, {
+      cacheMaxAgeMs: clips.cache.maxAgeMs, cacheMaxBytes: clips.cache.maxBytes, cacheMaxCount: clips.cache.maxCount,
+      keepsakesEnabled: clips.keepsakes.enabled, keepsakeMaxBytes: clips.keepsakes.maxBytes, keepsakeMaxCount: clips.keepsakes.maxCount,
+    });
     this.summarizer = new ActivitySummarizer(this.journal, security.config.allowModelSummary);
     const provider = new AjvJsonSchemaValidator();
     this.validators = new Map(catalog.map(tool => [tool.name, provider.getValidator(tool.inputSchema)]));
-    this.maintenance = setInterval(() => { try { this.journal.maintain(); this.images.prune(); } catch { /* next admission fails closed */ } }, 60000);
+    this.maintenance = setInterval(() => { try { this.journal.maintain(); this.images.prune(); this.clips?.prune(); } catch { /* next admission fails closed */ } }, 60000);
     this.maintenance.unref();
   }
   call(name: string, all: Record<string, any>): Promise<CallToolResult> {
@@ -75,6 +85,7 @@ export class Executor {
     remainingTime();
     const history = name.startsWith("android_activity_");
     const archive = hostStorageTools.has(name);
+    const clipTool = name === "android_capture_clip" || name === "android_clip_open" || name === "android_clip_keep";
     const status = name === "android_device_info" || name === "android_power_status";
     const input = this.security.isInput(name, all);
     const textInput = name === "android_set_text" || name === "android_type_text";
@@ -87,6 +98,7 @@ export class Executor {
     }
     try { this.security.authorize(name, all); }
     catch (error) {
+      if (clipTool) return { isError: true, ...json({ error: safeError(error), status: this.clipStatus() }) };
       if (archive && !this.security.config.screenshotKeepsakes.enabled) return { isError: true, ...json({ error: safeError(error),
         status: { enabled: false, maxBytes: this.security.config.screenshotKeepsakes.maxBytes, maxCount: this.security.config.screenshotKeepsakes.maxCount, usedBytes: null, count: null } }) };
       return failure(safeError(error));
@@ -104,7 +116,18 @@ export class Executor {
     let policyDrift = false;
     let delay: ObservationDelay | undefined = observeAfterMs === undefined ? undefined : { requestedMs: observeAfterMs, elapsedMs: 0, status: "action_failed" };
     try {
-      if (archive) {
+      if (archive && clipTool) {
+        const clips = this.clips;
+        if (!clips) throw new PolicyError("CLIPS_DISABLED");
+        if (name === "android_clip_keep") {
+          const query = clipKeepSchema.parse(args);
+          this.journal.recordExecution(eventId, "unconfirmed");
+          const saved = clips.keep(query.id, query.title, query.note, query.frameIndex);
+          hostStorage = { mutation: "keep-existing-clip-media", phoneContacted: false, keepsakeId: saved.record.id, created: saved.created };
+          this.journal.recordExecution(eventId, "acknowledged");
+          result = json({ ...saved, hostStorage });
+        } else result = openClip(clips, args, imageMaxEdge);
+      } else if (archive) {
         const keepsakes = this.keepsakes;
         if (!keepsakes) throw new PolicyError("KEEPSAKES_DISABLED");
         if (name === "android_screenshot_keep") {
@@ -152,6 +175,15 @@ export class Executor {
           const reading = readingCursor(entry, previous); result = json(reading); imageEventId = entry.id;
           if (reading.needs_review && reading.evidence_available) this.savedImage(entry, result);
         }
+      } else if (name === "android_capture_clip") {
+        const clips = this.clips;
+        if (!clips) throw new PolicyError("CLIPS_DISABLED");
+        const record = await this.captureClip(this.adb, this.ui, this.device, clips, eventId,
+          { ...args, expectedPackage }, state => this.journal.recordExecution(eventId, state), this.security);
+        observation = { at: new Date().toISOString(), uiOmitted: "short clip supplied observation; no extra screenshot",
+          clip: { id: record.id, status: "complete", expiresAt: record.expiresAt, frameCount: record.frames.length,
+            tapRequested: args.tap !== undefined, tapState: args.tap ? "acknowledged" : "not_requested" } };
+        result = json({ phoneClip: record, status: this.clipStatus(), nativeTapCoordinates: false });
       } else {
         if (this.adb.adb(this.device, "get-state").toString().trim() !== "device") deny("PHONE_UNAVAILABLE");
         if (status) {
@@ -229,12 +261,16 @@ export class Executor {
         else if (!policyDrift) result = failure("OPERATION_FAILED: inspect the receipt before retrying");
       }
     } catch (error) {
-      result = error instanceof KeepsakeError ? { isError: true, ...json({ error: error.code, status: error.storageStatus || this.keepsakeStatus() }) } : failure(safeError(error));
+      if (error instanceof ClipCaptureError) {
+        observation = { at: new Date().toISOString(), uiOmitted: "capture stopped; no fallback UI read", clip: { ...error.capture, status: error.capture.mediaStatus } };
+        result = { isError: true, ...json({ error: error.code, phoneClipCapture: error.capture, status: this.clipStatus() }) };
+      } else result = error instanceof ClipStoreError ? { isError: true, ...json({ error: error.code, status: error.storageStatus || this.clipStatus() }) }
+        : error instanceof KeepsakeError ? { isError: true, ...json({ error: error.code, status: error.storageStatus || this.keepsakeStatus() }) } : failure(safeError(error));
     }
     // No failure path performs a fallback UI read or repeats an input.
     if (!history && !archive && !observation) observation = { at: new Date().toISOString(), uiOmitted: "operation stopped; no fallback UI read" };
     if (observation && delay) observation.delay = delay;
-    const inline = boundResultImages(result, imageEventId, imageMaxEdge || DEFAULT_IMAGE_EDGE, imageMode === "deferred");
+    const inline = clipTool ? false : boundResultImages(result, imageEventId, imageMaxEdge || DEFAULT_IMAGE_EDGE, imageMode === "deferred");
     if (observation?.screenshot) observation.screenshot.returnedInline = inline;
     if (!history && !archive) result.content.push({ type: "text", text: JSON.stringify({ phoneObservation: {
       at: observation.at, preparation, errors: observation.errors, uiOmitted: observation.uiOmitted,
@@ -242,7 +278,7 @@ export class Executor {
     } }) });
     try {
       if (eventId) this.journal.finish(eventId, policyDrift ? "policy_drift" : result.isError ? "error" : "completed", { result: { isError: !!result.isError, ...(history ? { historyRead: true } : {}) }, preparation, observation, ...(hostStorage ? { hostStorage } : {}) });
-      if (!history && !archive && !status) this.summarizer.schedule();
+      if (!history && !archive && !status && !clipTool) this.summarizer.schedule();
       result.content.push({ type: "text", text: JSON.stringify({ phoneActivity: { eventId: eventId || null, ...(!eventId ? archive ? { storageReadNotRecorded: true } : { historyReadNotRecorded: true } : {}), ...(name === "android_activity_open" && args.receiptOnly ? {} : this.journal.context()) },
         ...(history || !eventId ? {} : { phoneReceipt: this.receipt(this.journal.open(eventId)) }) }) });
     } catch { result.content.push({ type: "text", text: "RECORD_FINALIZATION_FAILED: action may have run; do not replay" }); }
@@ -256,6 +292,7 @@ export class Executor {
   }
   private receipt(entry: any) {
     return { ...activityReceipt(entry), ...(hostStorageTools.has(entry.tool) ? { effectScope: "owner-host-storage", phoneContacted: false, hostStorage: entry.hostStorage || null } : {}),
+      ...(entry.tool === "android_capture_clip" ? { effectScope: "host-video-and-optional-phone-tap", clip: entry.observation?.clip ?? null } : {}),
       screenshotAvailable: !entry.callerClaim?.private && this.images.available(entry.observation?.screenshot) };
   }
   private finishArchiveFailure(eventId: number, code: string, status: any) {
@@ -266,6 +303,12 @@ export class Executor {
     try { return this.keepsakes?.status(); }
     catch { return { storage: "owner-host", status: "unavailable", usedBytes: null, count: null,
       maxBytes: this.security.config.screenshotKeepsakes.maxBytes, maxCount: this.security.config.screenshotKeepsakes.maxCount }; }
+  }
+  private clipStatus() {
+    const config = this.security.config.shortClips;
+    try { if (this.clips) return this.clips.status(); } catch { /* Return configured bounds, never invented usage. */ }
+    return { enabled: config.enabled, storage: "owner-host", status: config.enabled ? "unavailable" : "disabled",
+      cache: { ...config.cache, usedBytes: null, count: null }, keepsakes: { ...config.keepsakes, usedBytes: null, count: null } };
   }
   async close() { clearInterval(this.maintenance); await this.queue; this.summarizer.stop(); this.journal.close(); }
 }

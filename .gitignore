@@ -27,6 +27,7 @@ adbkey*
 *.png
 *.jpg
 *.mp4
+*.mkv
 *.zip
 __pycache__/
 *.pyc

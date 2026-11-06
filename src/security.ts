@@ -6,7 +6,7 @@ import { z } from "zod";
 import { privateDirectory, readPrivate, writePrivate } from "./private-files.js";
 import { strictJson } from "./json.js";
 import { DEFAULT_KEEPSAKE_BYTES, DEFAULT_KEEPSAKE_COUNT } from "./keepsakes.js";
-import { canonical, canonicalArguments, touchTools, expertGrantableTools, passiveTools, readTools, isInputOperation, isPowerKey } from "./operation.js";
+import { canonical, canonicalArguments, gameGrantableTools, expertGrantableTools, passiveTools, readTools, isInputOperation, isPowerKey } from "./operation.js";
 export { canonical, touchTools, passiveTools, readTools } from "./operation.js";
 
 export class PolicyError extends Error {
@@ -28,7 +28,20 @@ const configSchema = z.object({
     maxBytes: z.number().int().min(1).max(16 * 1024 * 1024 * 1024).default(DEFAULT_KEEPSAKE_BYTES),
     maxCount: z.number().int().min(1).max(10000).default(DEFAULT_KEEPSAKE_COUNT),
   }).strict().default({ enabled: false, maxBytes: DEFAULT_KEEPSAKE_BYTES, maxCount: DEFAULT_KEEPSAKE_COUNT }),
-  gameGrants: z.array(z.object({ package: packageName, tools: z.array(toolName).max(7),
+  shortClips: z.object({
+    enabled: z.boolean().default(false), allowedApps: z.array(packageName).max(16).default([]),
+    acceptsTransientScreenContent: z.boolean().default(false), recorderPath: z.string().max(1024).optional(),
+    cache: z.object({
+      maxAgeMs: z.number().int().min(1000).max(30 * 24 * 3600000).default(7 * 24 * 3600000),
+      maxBytes: z.number().int().min(65 * 1024 * 1024).max(4 * 1024 * 1024 * 1024).default(256 * 1024 * 1024),
+      maxCount: z.number().int().min(1).max(1024).default(32),
+    }).strict().default({ maxAgeMs: 7 * 24 * 3600000, maxBytes: 256 * 1024 * 1024, maxCount: 32 }),
+    keepsakes: z.object({ enabled: z.boolean().default(false),
+      maxBytes: z.number().int().min(1).max(64 * 1024 * 1024 * 1024).default(256 * 1024 * 1024),
+      maxCount: z.number().int().min(1).max(100000).default(1000),
+    }).strict().default({ enabled: false, maxBytes: 256 * 1024 * 1024, maxCount: 1000 }),
+  }).strict().prefault({}),
+  gameGrants: z.array(z.object({ package: packageName, tools: z.array(toolName).max(8),
     disposableOfflineGame: z.literal(true) }).strict()).max(16).default([]),
   expertSandbox: z.object({
     trustedOperators: z.literal(true), disposablePhone: z.literal(true), isolatedEnvironment: z.literal(true),
@@ -60,8 +73,11 @@ export class OwnerSecurity {
       this.tokenHash = createHash("sha256").update(token).digest();
       this.approvalKey = createPublicKey(this.config.approvalPublicKey);
       if (this.approvalKey.asymmetricKeyType !== "ed25519") throw new Error();
+      const clips = this.config.shortClips;
+      if (clips.allowedApps.some(pkg => !this.config.allowedApps.includes(pkg) || pkg === this.config.browserPackage)) throw new Error();
+      if (clips.enabled && (!clips.acceptsTransientScreenContent || !clips.recorderPath || !path.isAbsolute(clips.recorderPath))) throw new Error();
       for (const grant of this.config.gameGrants) {
-        if (!this.config.allowedApps.includes(grant.package) || grant.package === this.config.browserPackage || grant.tools.some(t => !touchTools.has(t))) throw new Error();
+        if (!this.config.allowedApps.includes(grant.package) || grant.package === this.config.browserPackage || grant.tools.some(t => !gameGrantableTools.has(t))) throw new Error();
       }
       for (const grant of this.config.expertSandbox?.grants || []) {
         if (!this.config.allowedApps.includes(grant.package) || grant.tools.some(t => !expertGrantableTools.has(t))) throw new Error();
@@ -90,6 +106,25 @@ export class OwnerSecurity {
     return url.href;
   }
   authorize(name: string, args: Record<string, unknown>) {
+    if (["android_capture_clip", "android_clip_open", "android_clip_keep"].includes(name)) {
+      const clips = this.config.shortClips;
+      if (!clips.enabled) deny("CLIPS_DISABLED");
+      if (name === "android_clip_open") {
+        if (args.requestId !== undefined) deny("REQUEST_ID_INPUT_ONLY");
+        if ((args.collection === "keepsakes" || args.keepsakeId !== undefined) && !clips.keepsakes.enabled) deny("CLIP_KEEPSAKES_DISABLED");
+        return;
+      }
+      if ((args.context as any)?.private === true) deny("PRIVATE_CALL_CANNOT_SAVE_CLIP");
+      if (typeof args.requestId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/.test(args.requestId)) deny("REQUEST_ID_REQUIRED");
+      if (name === "android_clip_keep") {
+        if (!clips.keepsakes.enabled) deny("CLIP_KEEPSAKES_DISABLED");
+        return; // Host archival opt-in never grants a phone action.
+      }
+      this.package(args.expectedPackage);
+      if (args.expectedPackage === this.config.browserPackage || !clips.allowedApps.includes(String(args.expectedPackage))) deny("CLIP_APP_NOT_ALLOWED");
+      if (args.tap === undefined) return; // Explicit video opt-in; no phone input is granted.
+      // The optional tap still needs this exact tool's app grant or signed request.
+    }
     if (name === "android_screenshot_keep" || name === "android_screenshot_keepsakes") {
       if (!this.config.screenshotKeepsakes.enabled) deny("KEEPSAKES_DISABLED");
       if (name === "android_screenshot_keep") {
