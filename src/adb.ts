@@ -266,7 +266,9 @@ export class AdbClient {
 
 	/** Input scope follows the focused window, not a resumed app behind a dialog. */
 	public getFocusedPackage(deviceId: string): string {
-		const dump = this.shell(deviceId, "dumpsys", "window", "windows");
+		// The windows subcommand can omit global focus (including on Android 14).
+		// Read the full window dump; never substitute a resumed app behind an overlay.
+		const dump = this.shell(deviceId, "dumpsys", "window");
 		return dump.match(/mCurrentFocus=Window\{[^\n]*?\bu\d+\s+([A-Za-z0-9_.]+)\//)?.[1] || "unknown";
 	}
 
