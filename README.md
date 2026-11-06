@@ -17,9 +17,9 @@ a trusted computer, a USB-connected Android phone, and a client able to reach th
 computer's authenticated local MCP endpoint. It does not include a language
 model, a hosted connector, or an unattended controller.
 
-**0.10 remains a release candidate.** The R2 repair has received independent
-review; final integration and hosted publication gates remain tracked in
-[release preparation](docs/RELEASE-PREPARATION.md). It defaults to one
+**0.11 is available as public GitHub source.** Check the
+[validation runs](https://github.com/Stella-hash/phone_use_for_llm/actions)
+attached to the exact commit you deploy. It defaults to one
 authenticated owner and per-input approval, with explicit opt-in grants for
 appropriate games and empty sandboxes. Use a dedicated, resettable spare phone
 without real accounts or irreplaceable data, and an isolated host/network. Here,
@@ -35,8 +35,9 @@ it does not import private device data, credentials or activity logs.
   then the [setup instructions](#install-and-configure-the-strict-default).
 - **Setting the boundaries?** [SAFETY.md](SAFETY.md) explains the deployment;
   [AGENT-SAFETY.md](AGENT-SAFETY.md) is the contract for the model operating it.
-- **Reviewing this candidate?** See [R2 validation](docs/R2-VALIDATION.md) and
-  [release preparation](docs/RELEASE-PREPARATION.md). Synthetic checks are not
+- **Reviewing the code?** See the current commit's checks and the historical
+  [R2 validation](docs/R2-VALIDATION.md) and
+  [release preparation](docs/RELEASE-PREPARATION.md) records. Synthetic checks are not
   physical-phone acceptance or a security certification.
 
 ## Choose a starting point
@@ -101,8 +102,8 @@ running this service on localhost does not make the whole interaction local.
 
 ## Install and configure the strict default
 
-Use `main` for the integrated source. Review scope and validation limits are
-recorded in [release preparation](docs/RELEASE-PREPARATION.md) and
+Use `main` for the integrated source. Historical review scope and validation
+limits are recorded in [release preparation](docs/RELEASE-PREPARATION.md) and
 [R2 validation](docs/R2-VALIDATION.md); use the checks attached to the exact commit
 you deploy. The commands below assume you are already in that source checkout.
 

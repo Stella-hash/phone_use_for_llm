@@ -1,7 +1,10 @@
 # Second review repairs — 2026-11-04
 
-Status: private candidate; local builder verification passed. Independent review
-of the final commit is required before public release. Baseline:
+Historical snapshot: a private candidate after local builder verification, before
+independent review and publication. The repository is now public; use `main` and
+its [commit-bound checks](https://github.com/Stella-hash/phone_use_for_llm/actions)
+for current validation. The results and pending gates below describe this earlier
+repair only. Baseline:
 `e600879c80284496c9aa837519f8e3648e818613`; repair branch: `gc/red-team-r2`.
 This record documents defensive changes and synthetic evidence, not a private
 review report, device history or exploit reproduction.
