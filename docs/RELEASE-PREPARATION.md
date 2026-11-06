@@ -1,7 +1,13 @@
 # Public release preparation
 
-Status: private integration into `main`; no public release approval. Project: phone-use for LLMs.
+Historical snapshot: private integration into `main` on 2026-11-04, before publication.
+Project: phone-use for LLMs.
 Maintainer: the repository owner, public handle `Stella-hash`.
+
+The repository is now public. This page preserves the preparation decisions and
+then-pending gates; it is not the current release status. Use `main`, its
+[commit-bound checks](https://github.com/Stella-hash/phone_use_for_llm/actions),
+and [SECURITY.md](../SECURITY.md) for the current source and reporting route.
 
 ## Owner decision: license for new work
 

@@ -1,13 +1,14 @@
 import { createHash } from "node:crypto";
 
 export const touchTools = new Set(["android_tap", "android_tap_element", "android_double_tap", "android_long_press", "android_swipe", "android_drag", "android_gesture"]);
+export const gameGrantableTools = new Set([...touchTools, "android_capture_clip"]);
 // Opt in each grantable capability; unknown/legacy/future tool names are invalid.
 // The public catalog and authorization checks share this exact list.
-export const expertGrantableTools = new Set([...touchTools, "android_launch_app", "android_terminate_app",
+export const expertGrantableTools = new Set([...gameGrantableTools, "android_launch_app", "android_terminate_app",
   "android_type_text", "android_set_text", "android_open_url", "android_open_notifications", "android_set_orientation"]);
-export const hostStorageTools = new Set(["android_screenshot_keep", "android_screenshot_keepsakes"]);
+export const hostStorageTools = new Set(["android_screenshot_keep", "android_screenshot_keepsakes", "android_clip_open", "android_clip_keep"]);
 export const passiveTools = new Set(["android_device_info", "android_power_status", "android_activity_context", "android_activity_history", "android_activity_open", "android_activity_reading", "android_screenshot_keepsakes"]);
-export const readTools = new Set([...passiveTools, "android_list_apps", "android_take_screenshot", "android_list_elements", "android_wait_for_element", "android_chrome_read"]);
+export const readTools = new Set([...passiveTools, "android_list_apps", "android_take_screenshot", "android_list_elements", "android_wait_for_element", "android_chrome_read", "android_clip_open"]);
 export const isInputOperation = (name: string, args: Record<string, unknown>) => !readTools.has(name) || (name === "android_device_info" && args.wake === true);
 
 // Android KeyEvent names/codes share one representation at every layer.

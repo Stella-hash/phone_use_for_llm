@@ -25,6 +25,9 @@ jobs:
         with:
           python-version: '3.12'
       - run: npm install --global pnpm@11.25.0
+      - name: Install clip decoding tools for Linux media regressions
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
       - run: pnpm test

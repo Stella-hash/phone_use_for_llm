@@ -1,7 +1,9 @@
 # Baseline release candidate validation — 2026-11-04
 
 Historical scope: baseline `e600879c80284496c9aa837519f8e3648e818613` before the
-second review repair. Current status is in [R2 validation](R2-VALIDATION.md).
+second review repair. The later repair record is in [R2 validation](R2-VALIDATION.md);
+use `main` and its [commit-bound checks](https://github.com/Stella-hash/phone_use_for_llm/actions)
+for current validation.
 This baseline record contains no
 real device observations, private configurations, raw activity logs or red-team
 report material.
