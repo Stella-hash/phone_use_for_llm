@@ -425,7 +425,7 @@ This optional interface is for people who trust the operators, use an empty
 disposable phone, understand the ADB/host/network boundary, and accept the risk.
 The recommended starting point remains the strict configuration above.
 
-The 31-tool catalog covers status, apps, native and Chrome observations, all the
+The 32-tool catalog covers status, apps, native and Chrome observations, all the
 touch/gesture/text/key/orientation controls, and four activity/reading endpoints.
 The owner can grant exposed input tools except `android_press_key` for exact allowed packages through
 `expertSandbox.grants`, for example:

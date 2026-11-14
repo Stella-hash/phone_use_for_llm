@@ -14,6 +14,7 @@ import { descriptions } from "./tool-descriptions.js";
 import { localDeviceSerial } from "./device.js";
 import { expertGrantableTools, hostStorageTools } from "./operation.js";
 import { clipTools } from "./clip-tools.js";
+import { latencyTool } from "./latency.js";
 
 // Validate security before constructing transports, storage or any device executor.
 const security = new OwnerSecurity(process.env.PHONE_SECURITY_FILE);
@@ -49,6 +50,7 @@ for (const tool of catalog) {
 }
 const upstreamReadOnly = new Set(catalog.filter(tool => tool.annotations?.readOnlyHint === true).map(tool => tool.name));
 const custom: Tool[] = [
+  latencyTool,
   ...clipTools,
   { name: "android_screenshot_keep", title: "Keep an Existing Screenshot", description: descriptions["android_screenshot_keep"],
     inputSchema: { type: "object", properties: { eventId: { type: "integer", minimum: 1 }, title: { type: "string", minLength: 1, maxLength: 160 },

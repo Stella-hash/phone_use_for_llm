@@ -22,6 +22,7 @@ import { canonicalArguments, isPowerKey, actionBinding, hostStorageTools } from 
 import { ClipStore, ClipStoreError } from "./clip-store.js";
 import { captureShortClip, ClipCaptureError } from "./clip-capture.js";
 import { openClip, clipKeepSchema } from "./clip-tools.js";
+import { LatencyProfiles, latencySchema } from "./latency.js";
 
 const json = (value: any): CallToolResult => ({ content: [{ type: "text", text: JSON.stringify(value) }] });
 const failure = (code: string): CallToolResult => ({ isError: true, content: [{ type: "text", text: code }] });
@@ -39,9 +40,11 @@ export class Executor {
   private captureClip = captureShortClip;
   private summarizer: ActivitySummarizer;
   private validators;
+  private latency: LatencyProfiles;
   private maintenance: ReturnType<typeof setInterval>;
   constructor(private security: OwnerSecurity, private device: string, private client: Client, catalog: Tool[]) {
     this.journal = new ActivityJournal(security.directory);
+    this.latency = new LatencyProfiles(this.journal, device);
     this.images = new ImageStore(security.directory);
     if (security.config.screenshotKeepsakes.enabled) this.keepsakes = new KeepsakeStore(security.directory, security.config.screenshotKeepsakes);
     const clips = security.config.shortClips;
@@ -52,7 +55,10 @@ export class Executor {
     this.summarizer = new ActivitySummarizer(this.journal, security.config.allowModelSummary);
     const provider = new AjvJsonSchemaValidator();
     this.validators = new Map(catalog.map(tool => [tool.name, provider.getValidator(tool.inputSchema)]));
-    this.maintenance = setInterval(() => { try { this.journal.maintain(); this.images.prune(); this.clips?.prune(); } catch { /* next admission fails closed */ } }, 60000);
+    this.maintenance = setInterval(() => {
+      try { this.journal.maintain(); this.images.prune(); this.clips?.prune(); } catch { /* next admission fails closed */ }
+      try { this.latency.prune(); } catch { /* optional derived cache */ }
+    }, 60000);
     this.maintenance.unref();
   }
   call(name: string, all: Record<string, any>): Promise<CallToolResult> {
@@ -60,11 +66,17 @@ export class Executor {
       boundedValue(all);
       if (!this.validators.get(name)?.(all).valid) return Promise.resolve(failure("INVALID_ARGUMENTS"));
       all = { ...canonicalArguments(name, all), ...(all.approval ? { approval: all.approval } : {}) };
+      if (name === "android_latency_profile") {
+        this.security.authorize(name, all);
+        const { context: ignored, ...query } = all;
+        const parsed = latencySchema.parse(query);
+        return Promise.resolve(json({ phoneLatency: this.latency.read(parsed.app, parsed.detail) }));
+      }
       if (this.queued >= LIMITS.queue) return Promise.resolve(failure("QUEUE_FULL: no input attempted"));
     } catch (error) { return Promise.resolve(failure(safeError(error))); }
     const receivedAt = Date.now();
     this.queued++;
-    const run = () => withDeadline(Math.max(0, 25000 - (Date.now() - receivedAt)), () => this.execute(name, all));
+    const run = () => withDeadline(Math.max(0, 25000 - (Date.now() - receivedAt)), () => this.execute(name, all, Date.now() - receivedAt));
     const result = this.queue.then(run, run).catch(error => failure(safeError(error)));
     this.queue = result.finally(() => { this.queued--; });
     return result;
@@ -81,7 +93,8 @@ export class Executor {
     this.security.url(expectedUrl);
     await captureChromePage(this.adb, this.device, { expectedUrl }, undefined, { url: value => this.security.url(value), verifyOnly: true });
   }
-  private async execute(name: string, all: Record<string, any>): Promise<CallToolResult> {
+  private async execute(name: string, all: Record<string, any>, queueMs = 0): Promise<CallToolResult> {
+    const workStart = performance.now();
     remainingTime();
     const history = name.startsWith("android_activity_");
     const archive = hostStorageTools.has(name);
@@ -270,11 +283,13 @@ export class Executor {
     // No failure path performs a fallback UI read or repeats an input.
     if (!history && !archive && !observation) observation = { at: new Date().toISOString(), uiOmitted: "operation stopped; no fallback UI read" };
     if (observation && delay) observation.delay = delay;
+    if (observation) observation.preparation = preparation ?? { wakeRequested: false };
     const inline = clipTool ? false : boundResultImages(result, imageEventId, imageMaxEdge || DEFAULT_IMAGE_EDGE, imageMode === "deferred");
     if (observation?.screenshot) observation.screenshot.returnedInline = inline;
     if (!history && !archive) result.content.push({ type: "text", text: JSON.stringify({ phoneObservation: {
       at: observation.at, preparation, errors: observation.errors, uiOmitted: observation.uiOmitted,
       screenshot: observation.screenshot, screenshotOmitted: observation.screenshotOmitted, delay: observation.delay, metadataVerified: observation.metadataVerified,
+      timing: observation.timing, uiCapture: observation.uiCapture,
     } }) });
     try {
       if (eventId) this.journal.finish(eventId, policyDrift ? "policy_drift" : result.isError ? "error" : "completed", { result: { isError: !!result.isError, ...(history ? { historyRead: true } : {}) }, preparation, observation, ...(hostStorage ? { hostStorage } : {}) });
@@ -282,6 +297,11 @@ export class Executor {
       result.content.push({ type: "text", text: JSON.stringify({ phoneActivity: { eventId: eventId || null, ...(!eventId ? archive ? { storageReadNotRecorded: true } : { historyReadNotRecorded: true } : {}), ...(name === "android_activity_open" && args.receiptOnly ? {} : this.journal.context()) },
         ...(history || !eventId ? {} : { phoneReceipt: this.receipt(this.journal.open(eventId)) }) }) });
     } catch { result.content.push({ type: "text", text: "RECORD_FINALIZATION_FAILED: action may have run; do not replay" }); }
+    if (!history && !archive && !context.private) try {
+      this.latency.record({ eventId, at: observation.at, tool: name, observation, queueMs, workMs: performance.now() - workStart, failed: !!result.isError });
+      const notice = observation?.timing && this.latency.notice(observation.foregroundApp?.packageName, context);
+      if (notice) result.content.push({ type: "text", text: JSON.stringify({ phoneLatency: notice }) });
+    } catch { /* An auxiliary profile cannot change the action or its receipt. */ }
     return result;
   }
   private savedImage(entry: any, result: CallToolResult) {
