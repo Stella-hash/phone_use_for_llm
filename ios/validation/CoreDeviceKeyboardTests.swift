@@ -27,10 +27,6 @@ import Testing
                 "ensure_chinese_ime": true], directKeyboardConfigured: true)
         }
         #expect(throws: (any Error).self) {
-            try MCPKeyboardSequence.actions(arguments: ["steps": [["key": "a"], ["text": long, "use_clipboard": false]]],
-                directKeyboardConfigured: true)
-        }
-        #expect(throws: (any Error).self) {
             try ActRequest(["steps": [["type": "key", "key": "a"], ["type": "type", "text": long, "use_clipboard": false]]],
                 directKeyboardConfigured: true)
         }

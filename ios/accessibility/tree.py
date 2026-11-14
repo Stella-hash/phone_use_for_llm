@@ -491,7 +491,7 @@ class Runtime:
 def base_result(scope="app"):
     return {"schema_version": 1, "source": "ios-native-ax", "status": "unavailable", "scope": scope,
             "coordinate_space": "device-logical-points", "center_coordinate_space": "normalized-0-1000",
-            "center_semantics": "Geometric frame centre only; use tap(normalized:true). Hittability is not checked.",
+            "center_semantics": "Geometric AX frame centre for reading only, not a touch target. Touch requires a fresh screenshot's frame.id passed as frame_id with that image's pixel coordinates. Hittability is not checked.",
             "atomic": False, "limits": {"native_nodes": MAX_NODES, "native_depth": MAX_DEPTH,
                                          "text_characters_per_field": MAX_TEXT, "json_bytes": MAX_OUTPUT_BYTES}}
 

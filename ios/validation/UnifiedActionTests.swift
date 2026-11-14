@@ -89,24 +89,25 @@ import Testing
         reject { _ = try ActRequest(["steps": [["type": "tap_text", "text": "owned"]]], requireFrameTouch: true) }
     }
 
-    @Test func hiddenTouchAliasesCanonicalizePixelsAndRejectMissingFrameOrNormalization() throws {
-        let cases: [(String, [String: Any], String)] = [
-            ("tap", ["x": 1, "y": 2], "tap"),
-            ("long_press", ["x": 1, "y": 2, "seconds": 0.2], "tap"),
-            ("swipe", ["points": [["x": 1, "y": 2], ["x": 3, "y": 4]], "duration": 0.1], "swipe"),
-            ("touch_sequence", ["samples": [["at_ms": 0, "contacts": [["id": 0, "x": 1, "y": 2]]], ["at_ms": 10, "contacts": []]]], "touch"),
+    @Test func mcpTouchStepsRetainPixelsAndRejectMissingFrameOrNormalization() throws {
+        let cases: [[String: Any]] = [
+            ["type": "tap", "x": 1, "y": 2],
+            ["type": "tap", "x": 1, "y": 2, "hold": 0.2],
+            ["type": "swipe", "points": [["x": 1, "y": 2], ["x": 3, "y": 4]], "duration": 0.1],
+            ["type": "touch", "samples": [["at_ms": 0, "contacts": [["id": 0, "x": 1, "y": 2]]], ["at_ms": 10, "contacts": []]]],
         ]
-        for (name, body, type) in cases {
-            reject { _ = try MCPToolRequest.action(named: name, arguments: body, longEdge: 1000) }
+        for body in cases {
+            reject { _ = try MCPToolRequest.action(named: "act", arguments: ["steps": [body]], longEdge: 1000) }
             var bound = body; bound["frame_id"] = frame
-            if name != "touch_sequence" { bound["normalized"] = false }
-            let request = try #require(try MCPToolRequest.action(named: name, arguments: bound, longEdge: 1000))
+            let request = try #require(try MCPToolRequest.action(named: "act", arguments: ["steps": [bound]], longEdge: 1000))
             let step = try #require((request.body["steps"] as? [[String: Any]])?.first)
-            #expect(request.path == "/act" && step["type"] as? String == type)
+            #expect(request.path == "/act" && step["type"] as? String == body["type"] as? String)
             #expect(step["frame_id"] as? String == frame)
             #expect(step["normalized"] == nil && step["fraction"] == nil)
-            bound["normalized"] = true
-            reject { _ = try MCPToolRequest.action(named: name, arguments: bound, longEdge: 1000) }
+            for normalized in [false, true] {
+                var malformed = bound; malformed["normalized"] = normalized
+                reject { _ = try MCPToolRequest.action(named: "act", arguments: ["steps": [malformed]], longEdge: 1000) }
+            }
         }
     }
 

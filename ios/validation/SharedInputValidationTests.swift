@@ -16,7 +16,8 @@ import Testing
     private let frame = "00000000-0000-4000-8000-000000000001"
 
     @Test func retiredPointerToolsHaveNeitherCatalogNorDispatch() throws {
-        let retired = ["move_pointer", "adjust_pointer", "click_pointer"]
+        let retired = ["move_pointer", "adjust_pointer", "click_pointer", "tap", "long_press", "swipe",
+                       "touch_sequence", "type_text", "press_key", "home", "keyboard_sequence", "tap_text"]
         for language in [AppLanguage.en, .zh] {
             let catalog = MCPToolCatalog.tools(for: language)
             let names = catalog.compactMap { $0["name"] as? String }
@@ -32,6 +33,8 @@ import Testing
         let json = Data(#"{"tool":"move_pointer","x":12,"y":34,"coordinates":"image-pixels"}"#.utf8)
         let old = try JSONDecoder().decode(MCPContextStore.Action.self, from: json)
         #expect(old.tool == "move_pointer" && old.x == 12 && old.y == 34)
+        let saved = try JSONDecoder().decode(MCPContextStore.Action.self, from: JSONEncoder().encode(old))
+        #expect(saved.tool == old.tool && saved.x == old.x && saved.y == old.y && saved.coordinates == old.coordinates)
     }
 
     private func reject(_ action: () throws -> Void) {
@@ -50,7 +53,7 @@ import Testing
             reportReadiness: { [unowned self] report, _, _ in self.ready.contains(report) })
     }
 
-    @Test func malformedKeyAndModifiersAreRejectedAcrossAllFourParsers() {
+    @Test func malformedKeyAndModifiersAreRejectedAcrossCurrentParsers() {
         let bad: [[String: Any]] = [
             ["key": "not-a-key"], ["key": ""], ["key": true],
             ["key": "a", "modifiers": "command"], ["key": "a", "modifiers": [1]],
@@ -58,27 +61,22 @@ import Testing
         ]
         for body in bad {
             reject { try ControlAPI.validateLeaf(path: "/key", body: body, screenSize: size) }
-            reject { _ = try MCPToolRequest.action(named: "press_key", arguments: body, longEdge: 1000) }
-            reject { _ = try MCPKeyboardSequence.actions(arguments: ["steps": [body]]) }
+            reject { _ = try MCPToolRequest.action(named: "act",
+                arguments: ["steps": [body.merging(["type": "key"]) { _, v in v }]], longEdge: 1000) }
             reject { _ = try ActRequest(["steps": [body.merging(["type": "key"]) { _, v in v }]], screenSize: size, requireGeometry: true) }
         }
     }
 
-    @Test func validKeysKeepNamesAndModifiersAcrossAllFourParsers() throws {
+    @Test func validKeysKeepNamesAndModifiersAcrossCurrentParsers() throws {
         let body: [String: Any] = ["key": "RETURN", "modifiers": ["CMD", "shift"]]
         try ControlAPI.validateLeaf(path: "/key", body: body, screenSize: nil)
-        let translated = try MCPToolRequest.action(named: "press_key", arguments: body, longEdge: 1000)
+        let translated = try MCPToolRequest.action(named: "act",
+            arguments: ["steps": [body.merging(["type": "key"]) { _, v in v }]], longEdge: 1000)
         let mcp = try #require(translated)
         #expect(mcp.path == "/act")
         let step = try #require((mcp.body["steps"] as? [[String: Any]])?.first)
         #expect(step["key"] as? String == "RETURN")
         #expect(step["modifiers"] as? [String] == ["CMD", "shift"])
-        let sequence = try MCPKeyboardSequence.actions(arguments: ["steps": [body]])
-        #expect(sequence.count == 1)
-        if case .request(let action) = sequence[0] {
-            #expect(action.body["key"] as? String == "RETURN")
-            #expect(action.body["modifiers"] as? [String] == ["CMD", "shift"])
-        } else { Issue.record("Expected key request") }
         _ = try ActRequest(["steps": [body.merging(["type": "key"]) { _, v in v }]], requireGeometry: true)
     }
 
@@ -91,7 +89,8 @@ import Testing
     @Test func malformedHoldRejectedAtHTTPMCPAndActBeforeInput() {
         for hold: Any in [true, "1", NSNull(), Double.nan, Double.infinity, -1, 61] {
             reject { try ControlAPI.validateLeaf(path: "/tap", body: ["x": 10, "y": 20, "hold": hold], screenSize: size) }
-            reject { _ = try MCPToolRequest.action(named: "long_press", arguments: ["frame_id": frame, "x": 10, "y": 20, "seconds": hold], longEdge: 1000) }
+            reject { _ = try MCPToolRequest.action(named: "act",
+                arguments: ["steps": [["type": "tap", "frame_id": frame, "x": 10, "y": 20, "hold": hold]]], longEdge: 1000) }
             reject { _ = try ActRequest(["steps": [["type": "tap", "x": 10, "y": 20, "hold": hold]]], screenSize: size, requireGeometry: true) }
             reject { _ = try TextTapRequest(["text": "synthetic", "hold": hold]) }
         }
@@ -115,9 +114,8 @@ import Testing
             for path in ["/tap", "/move"] {
                 reject { try ControlAPI.validateLeaf(path: path, body: ["x": value, "y": 0], screenSize: size) }
             }
-            for name in ["tap", "long_press"] {
-                reject { _ = try MCPToolRequest.action(named: name, arguments: ["frame_id": frame, "x": value, "y": 0], longEdge: 1000) }
-            }
+            reject { _ = try MCPToolRequest.action(named: "act",
+                arguments: ["steps": [["type": "tap", "frame_id": frame, "x": value, "y": 0]]], longEdge: 1000) }
         }
         for body: [String: Any] in [
             ["x": 100, "y": 0], ["x": 0, "y": 200], ["x": 0, "y": 0, "width": 0],
@@ -133,9 +131,10 @@ import Testing
         try ControlAPI.validateLeaf(path: "/tap", body: body, screenSize: nil)
         let point = try CoordinateRequest(body).point(screenSize: nil)
         #expect(point.0 == 0.25 && point.1 == 1)
-        for name in ["tap", "long_press"] {
-            reject { _ = try MCPToolRequest.action(named: name,
-                arguments: ["frame_id": frame, "x": 250, "y": 1000, "normalized": true], longEdge: 1000) }
+        for unsupported in ["normalized", "fraction"] {
+            reject { _ = try MCPToolRequest.action(named: "act",
+                arguments: ["steps": [["type": "tap", "frame_id": frame, "x": 250, "y": 800, unsupported: true]]],
+                longEdge: 1000) }
         }
     }
 

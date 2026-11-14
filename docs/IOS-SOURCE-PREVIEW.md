@@ -6,7 +6,7 @@ Initial review base: `41651b77369033958d551a73d43f571fcd92cfb8`; updated by a
 normal merge from `main@169cbb79ee4fdef54852c766f9179f4927b9e53c` after Android
 PR #13 landed. The iOS source recipe is unchanged by that merge.
 Native input: `YueChen-C/iPhone-use@577d5f2d0ec5831ed6e3e5d9c3ae482ee1dc4f5c`
-plus ordered patches 0001–0039. The PR head identifies the integration revision.
+plus ordered patches 0001–0040. The PR head identifies the integration revision.
 This page adds iOS evidence; it does not supersede the Android validation records.
 
 ## What is included
@@ -15,7 +15,10 @@ The independent [`ios/` entry](../ios/README.md) provides a managed USB launcher
 pinned native source recipe, deterministic AX reading, touch/keyboard helpers,
 synthetic tests and upstream notices. The MCP catalog has seven tools and one
 input tool, `act`. Managed configuration rejects Bluetooth selection and disabled
-USB input routes; legacy native MCP input aliases are inaccessible in that mode.
+USB input routes. Legacy MCP tool names and their compatibility executor have
+been removed; all native modes reject those names before device access. Existing
+callers use the seven-tool catalog and `act.steps`; archived journal data stays
+readable.
 
 The default AX result has one full reading payload in `content[0].text` and small
 status/archive metadata in `structuredContent`. Original source IDs, native parent
@@ -32,8 +35,11 @@ Android authorization and owner-signing claims do not cover this host.
 
 The source recipe was assembled independently in the public checkout and built
 successfully on the development Mac. Its native Git tree was
-`5dbbfab6f3b7c46421c8ccff252fb33ea2501282`. Patches 0038–0039 change native tests only;
-the device-tested runtime source is unchanged from the 0037 recipe.
+`5f77b233ee0083e5a7120ec534446f4b97e01ad7`. Patch 0040 removes unused MCP
+compatibility handlers and migrates protocol/driver assertions to `act.steps`.
+Both checkouts built this recipe. The 115-test native overlay and 116-test release
+protocol suite passed on the same production source; the final recipe additionally
+corrects a test-only numeric cast and the architecture file inventory.
 
 | Check | Observed result |
 | --- | --- |
@@ -47,9 +53,12 @@ the device-tested runtime source is unchanged from the 0037 recipe.
 | Android clean-start verification | Owner setup/approval, 36 authenticated tools, delegation disabled by default, passive latency, receipt recovery and private export passed with synthetic transport |
 | Android/Node production dependencies (`pnpm audit --prod`) | No known vulnerabilities reported with `fast-xml-parser` 5.12.0 (also supplied by current main); Python dependencies were not audited |
 
-The isolated native check replaces the test directory with the selected production
-source acceptance suites because the local CLT does not provide XCTest. It is
-not a full native suite result. The [iOS workflow](../.github/workflows/ios.yml)
+**Migration trap:** the isolated native check replaces the test directory with
+selected production-source suites because the local CLT does not provide XCTest.
+Its pass proves neither full-suite compilation nor full-suite success. Historical
+patches and tests can describe retired APIs; do not restore an unused runtime
+interface to make them pass. Preserve meaningful validation and failure tests on
+the current contract. Journal decoding is separate from executable-tool support. The [iOS workflow](../.github/workflows/ios.yml)
 runs full `swift test` as well as release protocol checks on a hosted Mac.
 Read hosted results at the exact PR head; local success is not a hosted pass.
 The first hosted full-suite compilation exposed stale localization tests that
@@ -60,6 +69,13 @@ runtime interface or test skip. The following full run exposed three remaining
 legacy routing assertions; 0039 tests frame-bound MCP → JSON HTTP → USB contact
 program behavior and rejection of normalized/unbound input. The old pointer
 driver's continuous-drag regression remains a separate driver-level test.
+The next run reached 541 XCTest cases with nine failures in one newly migrated
+assertion: contact IDs generated alongside coordinates were `Double(0)`, not
+Swift `Int`. Patch 0040 compares the exact numeric value and retains contact
+count, endpoints and final all-up checks. It also migrates all successful Python
+protocol inputs to explicit `act.steps`; the generic test exchange is unchanged.
+Valid old-tool payloads are rejected in both USB and non-USB modes with zero
+HTTP requests and a not-sent receipt. No tests are skipped to retire these APIs.
 
 The actual loopback listener accepted passive status and the same-origin viewer.
 It rejected foreign Host, cross-origin input, cross-site screenshot and non-JSON
@@ -76,7 +92,7 @@ native AX field readback. A same-snapshot archived detail read also succeeded.
 Those observations are device acceptance, not a complete OS/hardware matrix.
 Real screenshots, raw AX and identifiers remain private.
 
-With the final 0037 recipe, the independently built public host returned a fresh
+With the 0037 recipe, the independently built public host returned a fresh
 Home screenshot with matching client/host executable identities, and USB Home
 input plus its following image succeeded. A Home AX read returned an explicit
 timeout/unavailable result. The private development host initially had empty
@@ -86,6 +102,16 @@ repair for intermittent capture startup, and no speculative recovery was added.
 Final private-host Settings navigation and AX reading also succeeded with 0037:
 12 reading nodes, one text payload, and metadata without duplicated nodes. The
 phone was returned to Home after verification.
+
+The 0040 recipe also completed a fresh managed-client check: client and host
+native identities matched; USB touch plus Unicode clipboard input in one `act`
+batch produced the visible Settings search result. A frame-bound tap opened
+Settings, then AX returned status `ok`, 12 reading nodes, one text payload and
+metadata without duplicate nodes. An old `home` tool call returned not-sent with
+zero requests started/acknowledged; current `act` Home visibly returned to Home.
+Startup again temporarily reported empty capture
+inventory. After managed stop/discovery/start and a bounded recheck, capture
+returned. This observation does not identify or repair that intermittent cause.
 
 Configuration-free discovery returned one USB/capture candidate matching the
 existing local configuration without input, Bluetooth, pairing or a config write.

@@ -7,7 +7,8 @@ and per-input approvals are not implemented by the native iOS host.
 
 The managed launcher binds input to explicit capture and physical USB identifiers,
 enables both USB input routes, and disables Bluetooth lifecycle. It exposes seven
-MCP tools; hidden legacy input aliases are rejected in managed USB mode. It does
+MCP tools; removed legacy input names are rejected before device access in all
+native modes. It does
 not pair a new device, choose another phone on failure, silently fall back to
 another input transport, or replay uncertain input.
 

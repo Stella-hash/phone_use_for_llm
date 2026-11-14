@@ -75,6 +75,12 @@ the native executable; an already running client keeps its loaded code. Do not
 register the dependency checkout's raw binary or upstream installer as another
 entry point. The assembled skill and recovery script use the managed launcher.
 
+The catalog is also the callable MCP allowlist in every native mode. The old
+`tap`, `long_press`, `swipe`, `touch_sequence`, `type_text`, `press_key`, `home`,
+`keyboard_sequence` and `tap_text` tools and their compatibility executor have
+been removed. Use the corresponding `act.steps` types; legacy names fail before
+device access. Existing journal entries remain readable.
+
 ## Observe and act
 
 Read `session_context` on resume, then inspect a fresh `screenshot`.
@@ -169,8 +175,12 @@ IPHONE_USE_TEST_CONFIG=release python3 -B -m unittest discover -s Tests/PythonTe
 python3 -B scripts/check-mcp.py -- build/iPhoneUse.app/Contents/MacOS/iphone-use mcp
 ```
 
-The isolated Swift Testing check is useful on CLT installations without XCTest;
-it does not replace full `swift test`. The [iOS workflow](../.github/workflows/ios.yml)
+The isolated Swift Testing check **replaces the native test directory** with
+selected suites; a pass does not establish that the full XCTest suite compiles
+or passes. Do not restore retired runtime interfaces to satisfy historical test
+assertions. Migrate each assertion to the current contract, retaining meaningful
+validation and failure coverage. Run both this check and full `swift test`.
+The [iOS workflow](../.github/workflows/ios.yml)
 runs source, build and protocol checks. Device acceptance remains separate from
 synthetic tests and hosted CI. See [preview validation](../docs/IOS-SOURCE-PREVIEW.md)
 for the exact scope and current limits.

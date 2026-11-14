@@ -1,0 +1,1691 @@
+diff --git a/Sources/iPhoneUse/Input/CoreDeviceKeyboard.swift b/Sources/iPhoneUse/Input/CoreDeviceKeyboard.swift
+index f3d0e01..4652da6 100644
+--- a/Sources/iPhoneUse/Input/CoreDeviceKeyboard.swift
++++ b/Sources/iPhoneUse/Input/CoreDeviceKeyboard.swift
+@@ -262,7 +262,7 @@ enum CoreDeviceKeyboard {
+             body["error"] = receipt["reason"] ?? "USB keyboard input was not confirmed; inspect before retrying"
+             body["input_sent"] = receipt["input_status"] as? String == "not_sent" ? false : nil
+         }
+-        // Non-200 stops both HTTP act and MCP keyboard_sequence immediately.
++        // Non-200 stops the current act batch immediately.
+         return .json(body, status: ok ? 200 : 409)
+     }
+ }
+diff --git a/Sources/iPhoneUse/Localization/StringsMCP.swift b/Sources/iPhoneUse/Localization/StringsMCP.swift
+index 3dfe09b..f345527 100644
+--- a/Sources/iPhoneUse/Localization/StringsMCP.swift
++++ b/Sources/iPhoneUse/Localization/StringsMCP.swift
+@@ -17,22 +17,13 @@ struct StringsMCP: LocalizedTable {
+     let toolTypeText: String
+     let toolPressKey: String
+ 
+-    // MCPToolRequest / MCPKeyboardSequence validation
++    // Current MCP validation and shared text-option wording
+     let unknownTool: (String) -> String
+-    let parameterRequired: (String) -> String
+-    let keyboardSequenceRange: String
+-    let kbStepLabel: (Int) -> String
+-    let kbAscii: (String) -> String
+-    let kbExpected: (String) -> String
+-    let kbDelay: (String) -> String
+     let booleanRequired: (String) -> String
+-    let typeAscii: String
+-    let kbUnknownModifier: (String) -> String
+ 
+     // MCPServer
+     let invalidDeviceList: String
+     let expectedOneMatch: (Int) -> String
+-    let keyboardStopped: (Int, Int, String) -> String
+     let actStopped: String
+     let screenshotCaption: (String, String, String) -> String
+     let noResponse: String
+@@ -54,24 +45,13 @@ struct StringsMCP: LocalizedTable {
+         toolOCRScreen: "识别屏幕文字，仅返回文字与左上角原点像素坐标，不含图片。maxEdge 默认为 1000。",
+         includeImage: "是否返回图片（默认 true；false 仅返回文字与 OCR）",
+         toolTypeText:
+-            "directKeyboard 配置开启时，按键与粘贴快捷键使用 USB，否则使用 BLE。USB HID 单次最多 6 秒；较长文字使用默认剪贴板。配置 USB 剪贴板后，默认将原样 Unicode（中文、emoji 等）写入指定手机剪贴板再按 Cmd+V；use_clipboard=false 显式选择 HID。未配置时默认 HID，true 使用 Mac 剪贴板。会覆盖所用剪贴板，不读取旧内容。clear_before 先清空；commit_ime 发送空格以确认拼音候选，原样粘贴时应省略；press_enter 最后按回车；请检查字段结果，剪贴板送达不代表字段验证。HID 中文转拼音选首词；ensure_chinese_ime=false 保持当前输入法，拼音可能消费数字/回车；可 Ctrl+Space 切换后观察。",
++            "通过已配置的 USB 手机键盘输入。默认将原样 Unicode 写入手机剪贴板并按 Cmd+V；use_clipboard=false 选择 USB HID，单次 HID 计划最多 6 秒。会覆盖手机剪贴板，不读取旧内容。clear_before 先尝试清空；commit_ime 发送空格以确认拼音候选，原样粘贴时应省略；press_enter 最后按回车。检查字段结果：发送成功不代表插入成功。HID 中文转拼音；ensure_chinese_ime=false 保持当前输入法，拼音可能消费数字或回车。",
+         toolPressKey:
+-            "按下按键，可带修饰键。directKeyboard 配置开启时使用指定手机的 USB 键盘，否则使用 BLE；失败不回退或重放。按键：enter、escape、backspace、tab、space、up、down、left、right 或单个字符。修饰键：cmd、shift、alt、ctrl。cmd+space 打开聚焦搜索。",
++            "通过已配置手机的 USB 键盘按键，可带修饰键；失败不重放。按键：enter、escape、backspace、tab、space、up、down、left、right 或单个字符。修饰键：cmd、shift、alt、ctrl。",
+         unknownTool: { "未知工具 \($0)" },
+-        parameterRequired: { "缺少 \($0)" },
+-        keyboardSequenceRange: "keyboard_sequence 需要 1...16 个 steps/actions 步骤和可选的 device/device_id；同时提供的步骤数组必须相同",
+-        kbStepLabel: { "keyboard_sequence 第 \($0) 步" },
+-        kbAscii: { "\($0)：文字不能为空；文字总量上限 256" },
+-        kbExpected: { "\($0)：需要文字、受支持的按键（可带修饰键）或 delay/wait 延时" },
+-        kbDelay: { "\($0)：延时必须是 0...5 秒内的非布尔有限数值" },
+         booleanRequired: { "\($0) 必须是布尔值" },
+-        typeAscii: "文字必须可转换为美式 ASCII 按键或中文拼音",
+-        kbUnknownModifier: { "\($0)：未知的修饰键" },
+         invalidDeviceList: "应用返回的设备列表无效",
+         expectedOneMatch: { "期望匹配到一台 iPhone，实际 \($0) 台。请调用 list_devices 并传入完整 device ID。" },
+-        keyboardStopped: { step, count, error in
+-            "键盘序列在第 \(step)/\(count) 步停止：\(error)。之前的输入可能已执行；继续前请重新截图。"
+-        },
+         actStopped: "之前的输入可能已执行，请勿重放；失败步骤可能部分执行，继续前请重新观察。",
+         screenshotCaption: { "\($0) 的截图，\($1)x\($2) 像素。触控使用这张截图的 frame.id 与像素坐标，作为 act 的第一步。" },
+         noResponse: "无响应",
+@@ -94,27 +74,15 @@ struct StringsMCP: LocalizedTable {
+             "Recognize screen text with top-left pixel coordinates; returns text only, no image. maxEdge defaults to 1000.",
+         includeImage: "Return the image (default true; false returns text and OCR only)",
+         toolTypeText:
+-            "With directKeyboard configured, keys and paste chords use USB; otherwise BLE. USB HID requests are bounded to 6 seconds; use the default clipboard for longer text. With USB clipboard configured, default pastes literal Unicode (Chinese, emoji, etc.) through the selected phone clipboard and Cmd+V; use_clipboard=false explicitly selects HID. Otherwise default is HID and true uses the Mac clipboard. Overwrites that clipboard without reading its old content. clear_before clears first; commit_ime sends Space to commit a pinyin candidate, so omit it for literal paste; press_enter sends Enter last. Inspect the field: clipboard delivery is not field verification. HID turns Hanzi into pinyin; ensure_chinese_ime=false preserves the active IME. Pinyin may consume digits/Enter; cycle with Ctrl+Space then inspect.",
++            "Type through the configured USB phone keyboard. Default copies literal Unicode to the phone clipboard and sends Cmd+V; use_clipboard=false selects USB HID with a six-second programmed limit. Overwrites the phone clipboard without reading its old content. clear_before attempts to clear first; commit_ime sends Space to confirm a pinyin candidate, so omit it for literal paste; press_enter sends Enter last. Inspect the field: a successful send is not verified insertion. HID converts Hanzi to pinyin; ensure_chinese_ime=false preserves the active IME, which may consume digits or Enter.",
+         toolPressKey:
+-            "Press a key, optionally with modifiers. With directKeyboard configured, uses the exact selected USB phone; otherwise BLE. No fallback or replay on failure. Keys: enter, escape, backspace, tab, space, up, down, left, right, or a character. Modifiers: cmd, shift, alt, ctrl. cmd+space opens Spotlight.",
++            "Press a key through the configured phone USB keyboard, optionally with modifiers; never replay on failure. Keys: enter, escape, backspace, tab, space, up, down, left, right, or a character. Modifiers: cmd, shift, alt, ctrl.",
+         unknownTool: { "unknown tool \($0)" },
+-        parameterRequired: { "\($0) is required" },
+-        keyboardSequenceRange:
+-            "keyboard_sequence requires 1...16 steps/actions and optional device/device_id; both arrays must match when supplied",
+-        kbStepLabel: { "keyboard_sequence step \($0)" },
+-        kbAscii: { "\($0): text must be nonempty; total text limit is 256" },
+-        kbExpected: { "\($0): expected text, a supported key with optional modifiers, or delay/wait" },
+-        kbDelay: { "\($0): delay must be a finite, non-boolean number in 0...5 seconds" },
+         booleanRequired: { "\($0) must be a boolean" },
+-        typeAscii: "Text must be representable as US ASCII keys or Chinese pinyin",
+-        kbUnknownModifier: { "\($0): unknown keyboard modifier" },
+         invalidDeviceList: "Invalid device list from the app",
+         expectedOneMatch: {
+             "Expected one matching iPhone, found \($0). Call list_devices and pass its full device ID."
+         },
+-        keyboardStopped: { step, count, error in
+-            "Keyboard sequence stopped at step \(step)/\(count): \(error). Earlier input may have executed; take a fresh screenshot before continuing."
+-        },
+         actStopped:
+             "Earlier input may have executed; do not replay it. The failed step may have partially executed; observe again before continuing.",
+         screenshotCaption: {
+diff --git a/Sources/iPhoneUse/MCP/MCPContextStore.swift b/Sources/iPhoneUse/MCP/MCPContextStore.swift
+index 56ebe5d..4246009 100644
+--- a/Sources/iPhoneUse/MCP/MCPContextStore.swift
++++ b/Sources/iPhoneUse/MCP/MCPContextStore.swift
+@@ -18,43 +18,18 @@ final class MCPContextStore {
+         var step_kinds: [String]?
+         var coordinates: String?
+ 
++        // Keep the optional fields above Codable for existing journal entries.
++        // New MCP input records describe only the canonical act batch.
+         init(tool: String, arguments: [String: Any]) {
+             self.tool = tool
+-            if ["tap", "long_press"].contains(tool) {
+-                x = Self.number(arguments["x"])
+-                y = Self.number(arguments["y"])
+-            }
+-            if ["tap", "long_press", "swipe"].contains(tool) {
+-                coordinates = arguments["normalized"] as? Bool == true ? "per-axis-0...1000" : "image-pixels"
+-            }
+-            if tool == "swipe", let points = arguments["points"] as? [[String: Any]] {
+-                point_count = points.count
+-                x = Self.number(points.first?["x"])
+-                y = Self.number(points.first?["y"])
+-                end_x = Self.number(points.last?["x"])
+-                end_y = Self.number(points.last?["y"])
+-            }
+-            if ["swipe", "long_press"].contains(tool) {
+-                duration = Self.number(arguments[tool == "swipe" ? "duration" : "seconds"])
+-            }
+-            if tool == "act" || tool == "keyboard_sequence",
+-                let steps = (arguments["steps"] ?? arguments["actions"]) as? [[String: Any]]
+-            {
+-                let allowed = ["tap", "tap_text", "swipe", "touch", "type", "key", "home", "delay", "wait_text"]
++            if tool == "act", let steps = arguments["steps"] as? [[String: Any]] {
++                let allowed = ["tap", "swipe", "touch", "type", "key", "home", "delay", "wait_text"]
+                 step_kinds = steps.prefix(16).map { step in
+-                    if let type = step["type"] as? String, allowed.contains(type) { return type }
+-                    if step["text"] != nil { return "type" }
+-                    if step["key"] != nil { return "key" }
+-                    return "delay"
++                    guard let type = step["type"] as? String, allowed.contains(type) else { return "unknown" }
++                    return type
+                 }
+             }
+         }
+-
+-        private static func number(_ value: Any?) -> Double? {
+-            guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+-                number.doubleValue.isFinite else { return nil }
+-            return number.doubleValue
+-        }
+     }
+ 
+     struct Observation: Codable {
+diff --git a/Sources/iPhoneUse/MCP/MCPKeyboardSequence.swift b/Sources/iPhoneUse/MCP/MCPKeyboardSequence.swift
+deleted file mode 100644
+index b4466c3..0000000
+--- a/Sources/iPhoneUse/MCP/MCPKeyboardSequence.swift
++++ /dev/null
+@@ -1,112 +0,0 @@
+-import CoreFoundation
+-import Foundation
+-
+-enum MCPKeyboardAction {
+-    case request(MCPToolRequest)
+-    case delay(TimeInterval)
+-}
+-
+-/// Validate the complete sequence before the server acquires locks or sends input.
+-enum MCPKeyboardSequence {
+-    static let textOptions = TextEntry.textOptions
+-
+-    static let schema: [String: Any] = {
+-        let seconds: [String: Any] = ["type": "number", "minimum": 0, "maximum": 5]
+-        var text: [String: Any] = [
+-            "type": ["enum": ["text"]],
+-            "text": ["type": "string", "minLength": 1, "maxLength": 256],
+-        ]
+-        for option in textOptions { text[option] = ["type": "boolean"] }
+-        func step(_ properties: [String: Any], _ required: [String]) -> [String: Any] {
+-            ["type": "object", "additionalProperties": false, "properties": properties, "required": required]
+-        }
+-        return [
+-            "type": "array", "minItems": 1, "maxItems": 16,
+-            "items": [
+-                "oneOf": [
+-                    step(text, ["text"]),
+-                    step(
+-                        [
+-                            "type": ["enum": ["key"]], "key": ["type": "string", "minLength": 1],
+-                            "modifiers": [
+-                                "type": "array",
+-                                "items": ["type": "string", "enum": KeyboardMap.modifiers.keys.sorted()],
+-                            ],
+-                        ], ["key"]),
+-                    step(["delay": seconds], ["delay"]),
+-                    step(["wait": seconds], ["wait"]),
+-                    step(["type": ["enum": ["delay", "wait"]], "seconds": seconds], ["type", "seconds"]),
+-                ]
+-            ],
+-        ]
+-    }()
+-
+-    static func actions(arguments: [String: Any], language: AppLanguage = .en,
+-        directKeyboardConfigured: Bool = CoreDeviceKeyboard.isConfigured) throws -> [MCPKeyboardAction] {
+-        let table = StringsMCP(language: language)
+-        guard
+-            Set(arguments.keys).isSubset(of: [
+-                "steps", "actions", "device", "device_id", "include_image", "observe", "observation_timeout",
+-            ]),
+-            ["device", "device_id"].allSatisfy({ arguments[$0] == nil || arguments[$0] is String }),
+-            arguments["include_image"] == nil || isBoolean(arguments["include_image"]),
+-            let steps = (arguments["steps"] ?? arguments["actions"]) as? [[String: Any]],
+-            (1...16).contains(steps.count)
+-        else { throw MCPServer.MCPError(table.keyboardSequenceRange) }
+-        if let original = arguments["steps"], let alias = arguments["actions"],
+-            !NSDictionary(dictionary: ["steps": original]).isEqual(to: ["steps": alias])
+-        {
+-            throw MCPServer.MCPError(table.keyboardSequenceRange)
+-        }
+-
+-        var textCount = 0
+-        return try steps.enumerated().flatMap { index, step -> [MCPKeyboardAction] in
+-            let label = table.kbStepLabel(index + 1)
+-            if let text = step["text"] as? String,
+-                Set(step.keys).isSubset(of: Set(["type", "text"] + textOptions)),
+-                step["type"] == nil || step["type"] as? String == "text"
+-            {
+-                textCount += text.count
+-                guard !text.isEmpty, textCount <= 256
+-                else { throw MCPServer.MCPError(table.kbAscii(label)) }
+-                do { _ = try TypeTextRequest(step, language: language, directKeyboardConfigured: directKeyboardConfigured) } catch {
+-                    throw MCPServer.MCPError("\(label): \(error)")
+-                }
+-                // Keep clear/type/submit within one preflighted request. Expanding
+-                // them into separate requests could clear a field before the
+-                // clipboard write fails, and lost an explicit HID opt-out.
+-                var body = step
+-                body.removeValue(forKey: "type")
+-                return [.request(MCPToolRequest(path: "/type", body: body))]
+-            }
+-            if let key = step["key"] as? String,
+-                Set(step.keys).isSubset(of: ["type", "key", "modifiers"]),
+-                step["type"] == nil || step["type"] as? String == "key"
+-            {
+-                _ = key
+-                do { return [.request(MCPToolRequest(path: "/key", body: try KeyRequest(step).body))] }
+-                catch { throw MCPServer.MCPError("\(label): \(error)") }
+-            }
+-            let rawDelay: Any?
+-            if Set(step.keys) == ["delay"] {
+-                rawDelay = step["delay"]
+-            } else if Set(step.keys) == ["wait"] {
+-                rawDelay = step["wait"]
+-            } else if Set(step.keys) == ["type", "seconds"],
+-                let type = step["type"] as? String, ["delay", "wait"].contains(type)
+-            {
+-                rawDelay = step["seconds"]
+-            } else {
+-                throw MCPServer.MCPError(table.kbExpected(label))
+-            }
+-            guard let seconds = rawDelay as? NSNumber, !isBoolean(seconds),
+-                seconds.doubleValue.isFinite, (0...5).contains(seconds.doubleValue)
+-            else { throw MCPServer.MCPError(table.kbDelay(label)) }
+-            return [.delay(seconds.doubleValue)]
+-        }
+-    }
+-
+-    static func isBoolean(_ value: Any?) -> Bool {
+-        TextEntry.isBoolean(value)
+-    }
+-}
+diff --git a/Sources/iPhoneUse/MCP/MCPServer.swift b/Sources/iPhoneUse/MCP/MCPServer.swift
+index 0381aa3..7e7f1d0 100644
+--- a/Sources/iPhoneUse/MCP/MCPServer.swift
++++ b/Sources/iPhoneUse/MCP/MCPServer.swift
+@@ -112,17 +112,18 @@ enum MCPServer {
+     private static func call(_ name: String, _ arguments: [String: Any]) -> [String: Any] {
+         let table = StringsMCP(language: language)
+         do {
+-            // The managed USB entry exposes exactly the advertised contract.
+-            // Retained upstream handlers are not a second everyday input API.
+-            if ProcessInfo.processInfo.environment["IPHONE_USE_BLUETOOTH_DISABLED"] == "1",
+-                !["session_context", "list_devices", "screenshot", "screenshot_burst",
+-                  "accessibility_tree", "ocr_screen", "act"].contains(name) {
+-                throw MCPError("Unknown tool in USB mode; use the advertised tools and act for input")
++            // The advertised catalog is the whole callable MCP surface in every
++            // mode. Reject removed names before helper, discovery or host access.
++            guard MCPToolCatalog.tools(for: language).contains(where: { $0["name"] as? String == name }) else {
++                return failure(table.unknownTool(name), inputNotSent: true)
++            }
++            guard ["device", "device_id"].allSatisfy({ arguments[$0] == nil || arguments[$0] is String }) else {
++                throw MCPError("device and device_id must be strings when supplied")
+             }
+             if name == "session_context" { return try sessionContext(arguments) }
+             if name == "accessibility_tree" { return try accessibilityTree(arguments) }
+-            if arguments["frame_id"] != nil, !["tap", "long_press", "swipe", "touch_sequence"].contains(name) {
+-                throw MCPError("Place frame_id on the first touch step in act; legacy touch aliases also accept it at the top level")
++            if arguments["frame_id"] != nil {
++                throw MCPError("Place frame_id on the first touch step in act")
+             }
+             let burstOptions = name == "screenshot_burst" ? try MCPScreenshotBurst.Options(arguments) : nil
+             let observe = arguments["observe"] as? String ?? "full"
+@@ -139,16 +140,10 @@ enum MCPServer {
+             } else {
+                 includeImage = true
+             }
+-            let actions: [MCPKeyboardAction]
+-            if name == "keyboard_sequence" {
+-                actions = try MCPKeyboardSequence.actions(arguments: arguments, language: language)
+-            } else {
+-                let action = try MCPToolRequest.action(
+-                    named: name, arguments: arguments, longEdge: longEdge, language: language)
+-                guard name == "list_devices" || name == "screenshot" || burstOptions != nil || action != nil else {
+-                    return failure(table.unknownTool(name))
+-                }
+-                actions = action.map { [.request($0)] } ?? []
++            let action = try MCPToolRequest.action(
++                named: name, arguments: arguments, longEdge: longEdge, language: language)
++            guard name == "list_devices" || name == "screenshot" || burstOptions != nil || action != nil else {
++                return failure(table.unknownTool(name), inputNotSent: true)
+             }
+             return try MCPAccess.withService(port: base.port ?? 7390, language: language) {
+                 let usedCache = name != "list_devices" && devicesCache.isValid(origin: base.absoluteString)
+@@ -189,7 +184,7 @@ enum MCPServer {
+                                 to: MCPScreenshotBurst.content(burst, device: device, includeImage: includeImage),
+                                 includeCheckpoint: showContext)
+                         }
+-                        if name == "ocr_screen", case .request(let action) = actions.first {
++                        if name == "ocr_screen", let action {
+                             var body = action.body
+                             body["device"] = device
+                             recording.requestStarted()
+@@ -200,43 +195,20 @@ enum MCPServer {
+                                 "content": [["type": "text", "text": String(decoding: data, as: UTF8.self)]]
+                             ])
+                         }
+-                        let shouldObserve =
+-                            observe != "none"
+-                            && !(name == "keyboard_sequence" && arguments["include_image"] as? Bool == false
+-                                && arguments["observe"] == nil)
++                        let shouldObserve = observe != "none"
+                         // A baseline is diagnostic only: failure must not prevent authorized input.
+                         let baseline =
+-                            !actions.isEmpty && shouldObserve
++                            action != nil && shouldObserve
+                             ? try? readScreenshot(device, baseline: true, timeout: 0.4) : nil
+-                        for (index, action) in actions.enumerated() {
+-                            do {
+-                                switch action {
+-                                case .delay(let seconds):
+-                                    Thread.sleep(forTimeInterval: seconds)
+-                                case .request(let request):
+-                                    var body = request.body
+-                                    body["device"] = device
+-                                    recording.requestStarted()
+-                                    let response = try client.post(request.path, body)
+-                                    recording.requestAcknowledged()
+-                                    recording.recordTransport(response)
+-                                }
+-                            } catch {
+-                                guard name == "keyboard_sequence" else { throw error }
+-                                throw MCPError(
+-                                    table.keyboardStopped(index + 1, actions.count, "\(error)"),
+-                                    httpStatus: (error as? MCPError)?.httpStatus,
+-                                    completedSteps: index, failedStep: index + 1,
+-                                    inputNotSent: (error as? MCPError)?.inputNotSent == true,
+-                                    transportReceipt: (error as? MCPError)?.transportReceipt,
+-                                    frameRejected: (error as? MCPError)?.frameRejected == true)
+-                            }
+-                            if index < actions.count - 1 {
+-                                // Let focus changes settle without capturing every intermediate field.
+-                                Thread.sleep(forTimeInterval: 0.15)
+-                            }
++                        if let action {
++                            var body = action.body
++                            body["device"] = device
++                            recording.requestStarted()
++                            let response = try client.post(action.path, body)
++                            recording.requestAcknowledged()
++                            recording.recordTransport(response)
+                         }
+-                        guard !actions.isEmpty else {
++                        guard action != nil else {
+                             let frame = try readScreenshot(device)
+                             recording.finishSnapshot(frame)
+                             let showContext = contextShown.insert(device.lowercased()).inserted
+@@ -278,7 +250,7 @@ enum MCPServer {
+             }
+         } catch {
+             devicesCache.invalidate()
+-            return failure("\(error)", inputNotSent: MCPToolRequest.inputNames.contains(name))
++            return failure("\(error)", inputNotSent: name == "act")
+         }
+     }
+ 
+diff --git a/Sources/iPhoneUse/MCP/MCPTools.swift b/Sources/iPhoneUse/MCP/MCPTools.swift
+index a67b212..45199bf 100644
+--- a/Sources/iPhoneUse/MCP/MCPTools.swift
++++ b/Sources/iPhoneUse/MCP/MCPTools.swift
+@@ -136,14 +136,12 @@ enum MCPToolCatalog {
+ 
+ }
+ 
+-/// Pure translation to the existing HTTP executor. Hidden single-action names
+-/// are compatibility adapters to the same act contract, not alternate transports.
++/// Translate current catalog requests to the HTTP executor. Input has one
++/// entry point: act. Historical tool names are not compatibility adapters.
+ struct MCPToolRequest {
+     let path: String
+     let body: [String: Any]
+ 
+-    static let inputNames: Set<String> = ["act", "tap", "long_press", "swipe", "touch_sequence",
+-                                         "type_text", "press_key", "home", "keyboard_sequence", "tap_text"]
+     private static let common: Set<String> = ["device", "device_id", "include_image", "observe", "observation_timeout"]
+ 
+     static func action(named name: String, arguments: [String: Any], longEdge: Int,
+@@ -153,44 +151,13 @@ struct MCPToolRequest {
+             let edge = try OCRRequest.maxEdge(arguments, table: StringsAPI(language: language)) ?? longEdge
+             return MCPToolRequest(path: "/ocr", body: withDevice(["maxEdge": edge], device))
+         }
+-        if name == "tap_text" {
+-            throw InputRequestError("tap_text is retired from MCP; observe a fresh screenshot and use act with frame_id and image pixels")
+-        }
+         if name == "act" {
+             guard Set(arguments.keys).isSubset(of: common.union(["steps"])) else {
+                 throw InputRequestError("act accepts steps and ordinary device/observation options; frame_id belongs to its first touch step")
+             }
+             return try batch(arguments, device: device, longEdge: longEdge)
+         }
+-        let fields: Set<String>
+-        let type: String
+-        switch name {
+-        case "tap": fields = ["x", "y", "frame_id", "normalized"]; type = "tap"
+-        case "long_press": fields = ["x", "y", "frame_id", "normalized", "seconds"]; type = "tap"
+-        case "swipe": fields = ["points", "duration", "frame_id", "normalized"]; type = "swipe"
+-        case "touch_sequence": fields = ["samples", "frame_id"]; type = "touch"
+-        case "type_text": fields = Set(["text"] + TextEntry.textOptions); type = "type"
+-        case "press_key": fields = ["key", "modifiers"]; type = "key"
+-        case "home": fields = []; type = "home"
+-        default: return nil
+-        }
+-        guard Set(arguments.keys).isSubset(of: fields.union(common)) else {
+-            throw InputRequestError("Unsupported parameter for \(name)")
+-        }
+-        var step = arguments.filter { fields.contains($0.key) }
+-        // Existing registered clients may explicitly specify pixel mode.
+-        if let raw = step.removeValue(forKey: "normalized") {
+-            guard try InputRequestValue.boolean(raw, field: "normalized", default: false) == false else {
+-                throw InputRequestError("MCP touch requires frame_id and screenshot pixels; normalized coordinates are unsupported")
+-            }
+-        }
+-        if name == "long_press" {
+-            step["hold"] = try HoldRequest(arguments, key: "seconds", default: 1).seconds
+-            step.removeValue(forKey: "seconds")
+-        }
+-        if name == "type_text", step["text"] == nil { step["text"] = "" }
+-        step["type"] = type
+-        return try batch(["steps": [step]], device: device, longEdge: longEdge)
++        return nil
+     }
+ 
+     private static func batch(_ arguments: [String: Any], device: String?, longEdge: Int) throws -> MCPToolRequest {
+diff --git a/Tests/PythonTests/test_mcp_stdio.py b/Tests/PythonTests/test_mcp_stdio.py
+index c28284f..ce8ac7f 100644
+--- a/Tests/PythonTests/test_mcp_stdio.py
++++ b/Tests/PythonTests/test_mcp_stdio.py
+@@ -216,7 +216,7 @@ class MCPStdioTests(unittest.TestCase):
+                 posted_at = {}
+                 self.server.before_post = lambda body: posted_at.update(sequence=sequence)
+                 result, context = self.exchange([
+-                    ("touch_sequence", {"frame_id": FRAME, "samples": samples, "observation_timeout": 0.3}),
++                    ("act", {"steps": [{"type": "touch", "frame_id": FRAME, "samples": samples}], "observation_timeout": 0.3}),
+                     ("session_context", {"device": "phone-1"})])
+                 self.assertEqual(bool(result.get("isError")), not success)
+                 self.assertEqual(result["structuredContent"].get("ok", False), success)
+@@ -235,11 +235,11 @@ class MCPStdioTests(unittest.TestCase):
+         self.assertTrue(all(event[1] == "/act" and event[2]["steps"][0]["samples"] == samples for event in posts))
+ 
+     def test_bad_touch_tail_is_rejected_before_discovery_or_post(self):
+-        result, = self.exchange([("touch_sequence", {
+-            "frame_id": "00000000-0000-4000-8000-000000000001",
++        result, = self.exchange([("act", {"steps": [{
++            "type": "touch", "frame_id": FRAME,
+             "samples": [{"at_ms": 0, "contacts": [{"id": 0, "x": 7, "y": 9}]},
+                         {"at_ms": 20, "contacts": [{"id": True, "x": 7, "y": 9}]},
+-                        {"at_ms": 70, "contacts": []}]} )])
++                        {"at_ms": 70, "contacts": []}]}]})])
+         self.assertTrue(result["isError"])
+         self.assertEqual(self.server.events, [("GET", "/config?wake=0")])
+ 
+@@ -257,7 +257,7 @@ class MCPStdioTests(unittest.TestCase):
+         self.server.screenshot_response = screenshot
+         first, action = self.exchange([
+             ("screenshot", {}),
+-            ("tap", {"frame_id": frame_id, "x": 7, "y": 12, "observation_timeout": 0.3}),
++            ("act", {"steps": [{"type": "tap", "frame_id": frame_id, "x": 7, "y": 12}], "observation_timeout": 0.3}),
+         ])
+         self.assertEqual(first["structuredContent"]["frame"]["id"], frame_id)
+         self.assertEqual(first["structuredContent"]["frame"]["width"], 16)
+@@ -276,21 +276,21 @@ class MCPStdioTests(unittest.TestCase):
+         self.assertEqual(base64.b64decode(images[0]["data"]), capture_reply(160, 1, 0)[1])
+ 
+     def test_frame_rejection_is_not_sent_but_other_http_errors_stay_unconfirmed(self):
+-        args = {"frame_id": "00000000-0000-4000-8000-000000000001", "x": 7, "y": 12}
++        args = {"steps": [{"type": "tap", "frame_id": FRAME, "x": 7, "y": 12}]}
+         self.server.frame_rejection = True
+-        rejected, = self.exchange([("tap", args)])
++        rejected, = self.exchange([("act", args)])
+         self.assertTrue(rejected["isError"])
+         self.assertEqual(rejected["structuredContent"]["input_receipt"]["status"], "not_sent")
+         self.server.frame_rejection = False
+         self.server.fail_actions = True
+-        uncertain, = self.exchange([("tap", args)])
++        uncertain, = self.exchange([("act", args)])
+         self.assertTrue(uncertain["isError"])
+         self.assertEqual(uncertain["structuredContent"]["input_receipt"]["status"], "unconfirmed")
+         self.assertEqual(len([e for e in self.server.events if e[0] == "POST"]), 2)
+ 
+     def test_acknowledged_frame_action_with_failed_capture_does_not_retry(self):
+         self.server.screenshot_response = lambda path: (503, b'{"error":"capture absent"}', None)
+-        result, = self.exchange([("tap", {"frame_id": "00000000-0000-4000-8000-000000000001", "x": 7, "y": 12})])
++        result, = self.exchange([("act", {"steps": [{"type": "tap", "frame_id": FRAME, "x": 7, "y": 12}]})])
+         self.assertFalse(result.get("isError", False))
+         metadata = result["structuredContent"]
+         self.assertTrue(metadata["action_acknowledged"])
+@@ -300,17 +300,17 @@ class MCPStdioTests(unittest.TestCase):
+         self.assertEqual(len([e for e in self.server.events if e[0] == "POST"]), 1)
+ 
+     def test_frame_id_is_never_silently_ignored_or_used_with_normalized_coordinates(self):
+-        frame_id = "00000000-0000-4000-8000-000000000001"
+-        for name, args in [
+-            ("tap", {"frame_id": FRAME, "x": 4, "y": 5, "normalized": True}),
+-            ("press_key", {"key": "tab"}),
+-            ("act", {"steps": [{"type": "tap", "x": 4, "y": 5}]}),
+-        ]:
+-            with self.subTest(name=name):
+-                result, = self.exchange([(name, dict(args, frame_id=frame_id))])
+-                self.assertTrue(result["isError"])
+-                self.assertEqual(result["structuredContent"]["input_receipt"]["status"], "not_sent")
+-        self.assertFalse(any(e[0] == "POST" for e in self.server.events))
++        invalid = [
++            {"steps": [{"type": "tap", "frame_id": FRAME, "x": 4, "y": 5, "normalized": True}]},
++            {"steps": [{"type": "key", "key": "tab", "frame_id": FRAME}]},
++            {"steps": [{"type": "tap", "x": 4, "y": 5}], "frame_id": FRAME},
++            {"steps": [{"type": "tap", "frame_id": FRAME, "x": 4, "y": 5}], "frame_id": FRAME},
++        ]
++        results = self.exchange([("act", arguments) for arguments in invalid])
++        self.assertTrue(all(result["isError"] for result in results))
++        self.assertTrue(all(result["structuredContent"]["input_receipt"]["status"] == "not_sent"
++                            for result in results))
++        self.assertEqual(self.server.events, [("GET", "/config?wake=0")])
+ 
+     def test_screenshot_burst_returns_ordered_fresh_images_using_only_capture_gets(self):
+         sequence = 0
+@@ -581,7 +581,10 @@ class MCPStdioTests(unittest.TestCase):
+             file = next(Path(self.state.name).glob("session-context-*.json"))
+             starts.append(json.loads(file.read_text())["recent"][-1])
+         self.server.before_post = before_post
+-        action, context = self.exchange([("tap", {"frame_id": FRAME, "x": 22, "y": 33, "observe": "none"}), ("session_context", {})])
++        action, context = self.exchange([
++            ("act", {"steps": [{"type": "tap", "frame_id": FRAME, "x": 22, "y": 33}], "observe": "none"}),
++            ("session_context", {}),
++        ])
+         self.assertEqual(starts[0]["state"], "request_started")
+         self.assertEqual(starts[0]["requests_started"], 1)
+         self.assertEqual(starts[0]["requests_acknowledged"], 0)
+@@ -591,21 +594,17 @@ class MCPStdioTests(unittest.TestCase):
+         self.assertEqual(action["structuredContent"]["session_activity"]["event_id"], event["id"])
+         self.assertEqual(action["structuredContent"]["app_completion"], "unverified")
+ 
+-    def test_context_omits_secret_text_through_aliases_ocr_and_raw_errors(self):
++    def test_context_omits_secret_act_text_keys_ocr_and_raw_errors(self):
+         self.env["IPHONE_USE_DEVICE_ID"] = "phone-1"
+         secret = "private-marker-9371"
+         self.server.screen_ocr = {"device": "phone-1", "width": 500, "height": 1000,
+                                   "screenHash": "hash", "items": [{"text": secret, "x": 2, "y": 3}]}
+         results = self.exchange([
+-            ("type_text", {"text": secret, "use_clipboard": True, "observe": "none"}),
+-            ("keyboard_sequence", {"actions": [{"text": secret}, {"key": "9"}], "observe": "none"}),
+-            ("act", {"steps": [{"type": "type", "text": secret}], "observe": "none"}),
+-            ("tap_text", {"text": secret}),
++            ("act", {"steps": [{"type": "type", "text": secret, "use_clipboard": True}], "observe": "none"}),
++            ("act", {"steps": [{"type": "type", "text": secret}, {"type": "key", "key": "9"}], "observe": "none"}),
+             ("screenshot", {}),
+         ])
+-        self.assertTrue(all("isError" not in result for result in results[:3] + results[4:]))
+-        self.assertTrue(results[3]["isError"])
+-        self.assertEqual(results[3]["structuredContent"]["input_receipt"]["status"], "not_sent")
++        self.assertTrue(all("isError" not in result for result in results))
+         self.server.act_failure = {"error": secret, "completed": 1, "failed_step": 2}
+         failed = self.exchange([("act", {"steps": [{"type": "home"}] * 2})])[0]
+         self.assertTrue(failed["isError"])
+@@ -628,7 +627,7 @@ class MCPStdioTests(unittest.TestCase):
+             file.mkdir()
+             self.server.before_screenshot = None
+         self.server.before_screenshot = disrupt_record
+-        result = self.exchange([("home", {})])[0]
++        result = self.exchange([("act", {"steps": [{"type": "home"}]})])[0]
+         self.assertNotIn("isError", result)
+         self.assertTrue(result["structuredContent"]["action_acknowledged"])
+         self.assertEqual(result["structuredContent"]["session_activity"]["recording"], "unavailable")
+@@ -696,14 +695,38 @@ class MCPStdioTests(unittest.TestCase):
+         self.assertEqual(context["structuredContent"]["recent"][-1]["state"], "finished")
+         self.assertEqual(self.server.events, [("GET", "/config?wake=0"), ("GET", "/status?wake=0")])
+ 
+-    def test_usb_mode_rejects_hidden_input_aliases_before_device_access(self):
+-        self.env["IPHONE_USE_BLUETOOTH_DISABLED"] = "1"
+-        results = self.exchange([(name, {}) for name in
+-                                ("tap", "long_press", "swipe", "touch_sequence", "type_text",
+-                                 "press_key", "home", "keyboard_sequence", "tap_text", "future_tool")])
+-        self.assertTrue(all(result["isError"] for result in results))
+-        self.assertTrue(all("use the advertised tools and act" in json.dumps(result) for result in results))
+-        self.assertEqual(self.server.events, [("GET", "/config?wake=0")])
++    def test_removed_input_names_reject_before_device_access_in_every_mode(self):
++        # Otherwise-valid cached calls must not reach the old parser or HTTP route.
++        calls = [
++            ("tap", {"frame_id": FRAME, "x": 1, "y": 2}),
++            ("long_press", {"frame_id": FRAME, "x": 1, "y": 2, "seconds": 0.2}),
++            ("swipe", {"frame_id": FRAME, "points": [{"x": 1, "y": 2}, {"x": 3, "y": 4}]}),
++            ("touch_sequence", {"frame_id": FRAME, "samples": [
++                {"at_ms": 0, "contacts": [{"id": 0, "x": 1, "y": 2}]},
++                {"at_ms": 70, "contacts": []}]}),
++            ("type_text", {"text": "synthetic"}),
++            ("press_key", {"key": "enter"}),
++            ("home", {}),
++            ("keyboard_sequence", {"steps": [{"key": "enter"}]}),
++            ("tap_text", {"text": "synthetic"}),
++            ("move_pointer", {"x": 1, "y": 2}),
++            ("adjust_pointer", {"dx": 1, "dy": 2}),
++            ("click_pointer", {}),
++            ("future_tool", {}),
++        ]
++        for disabled in ("0", "1"):
++            with self.subTest(bluetooth_disabled=disabled):
++                self.env["IPHONE_USE_BLUETOOTH_DISABLED"] = disabled
++                self.server.events.clear()
++                results = self.exchange(calls)
++                self.assertTrue(all(result["isError"] for result in results))
++                self.assertTrue(all("unknown" in result["content"][0]["text"].lower() for result in results))
++                self.assertTrue(all(result["structuredContent"]["input_receipt"] == {
++                    "status": "not_sent", "requests_started": 0, "requests_acknowledged": 0,
++                } for result in results))
++                self.assertEqual(self.server.events, [("GET", "/config?wake=0")])
++                self.assertEqual(self.server.stability_events, [])
++                self.assertEqual(list(Path(self.state.name).glob("session-context-*.json")), [])
+ 
+     def test_native_accessibility_reading_retains_archive_reference_without_payload_duplication(self):
+         self.env["IPHONE_USE_DEVICE_ID"] = "phone-1"
+@@ -762,14 +785,25 @@ class MCPStdioTests(unittest.TestCase):
+             [touch, {"type": "key", "key": "invalid-key"}],
+             [touch, {"type": "key", "key": "enter", "frame_id": FRAME}],
+         ]
+-        results = self.exchange([("act", {"steps": steps}) for steps in invalid] + [
+-            ("tap", {"x": 1, "y": 2}),
+-            ("swipe", {"points": [{"x": 1, "y": 2}, {"x": 3, "y": 4}]}),
+-        ])
++        results = self.exchange([("act", {"steps": steps}) for steps in invalid])
+         self.assertTrue(all(result["isError"] for result in results))
+         self.assertTrue(all(result["structuredContent"]["input_receipt"]["status"] == "not_sent" for result in results))
+         self.assertEqual(self.server.events, [("GET", "/config?wake=0")])
+ 
++    def test_act_rejects_nonstrings_for_either_device_selector_before_discovery(self):
++        calls = []
++        for selector in ("device", "device_id"):
++            for value in (7, True, None, [], {}):
++                arguments = {"steps": [{"type": "home"}], selector: value}
++                calls.append(("act", arguments))
++        # A valid preferred selector must not mask an invalid secondary selector.
++        calls.append(("act", {"steps": [{"type": "home"}], "device": "First", "device_id": 7}))
++        results = self.exchange(calls)
++        self.assertTrue(all(result["isError"] for result in results))
++        self.assertTrue(all(result["structuredContent"]["input_receipt"]["status"] == "not_sent"
++                            for result in results))
++        self.assertEqual(self.server.events, [("GET", "/config?wake=0")])
++
+     def test_batch_partial_input_retains_each_transport_without_backend_reassignment(self):
+         touch = {"backend": "coredevice", "input_status": "sent_unverified"}
+         stopped = {"backend": "coredevice-keyboard", "input_status": "not_sent", "cleanup": {"errors": ["release_timeout"]}}
+@@ -828,7 +862,10 @@ class MCPStdioTests(unittest.TestCase):
+                 self.assertEqual(progress[field], value)
+ 
+     def test_none_reuses_device_cache_and_performs_no_screen_reads(self):
+-        results = self.exchange([("home", {"observe": "none"}), ("home", {"observe": "none"})])
++        results = self.exchange([
++            ("act", {"steps": [{"type": "home"}], "observe": "none"}),
++            ("act", {"steps": [{"type": "home"}], "observe": "none"}),
++        ])
+         self.assertTrue(all("isError" not in result for result in results))
+         self.assertEqual(sum(event[1] == "/devices" for event in self.server.events), 1)
+         self.assertEqual(sum(event[0] == "POST" for event in self.server.events), 2)
+@@ -845,7 +882,9 @@ class MCPStdioTests(unittest.TestCase):
+ 
+         self.server.screen_ocr = ocr
+         full, changed, unchanged = self.exchange([
+-            ("home", {}), ("home", {"observe": "ocr_diff"}), ("home", {"observe": "ocr_diff"}),
++            ("act", {"steps": [{"type": "home"}]}),
++            ("act", {"steps": [{"type": "home"}], "observe": "ocr_diff"}),
++            ("act", {"steps": [{"type": "home"}], "observe": "ocr_diff"}),
+         ])
+         self.assertNotIn("isError", full)
+         self.assertIn('"old" (20,30)', full["content"][1]["text"])
+@@ -859,23 +898,22 @@ class MCPStdioTests(unittest.TestCase):
+         self.assertTrue(self.server.stability_events)
+ 
+     def test_invalid_observation_and_later_act_step_never_send_input(self):
+-        calls = [("home", {"observe": value}) for value in ("bad", True, 1)]
+-        calls += [("home", {"observation_timeout": value}) for value in (True, "1", 0, 0.1, 5.1)]
+-        calls += [("keyboard_sequence", {"steps": [{"key": "enter"}], "observation_timeout": value})
+-                  for value in (True, "1", 0, 0.1, 5.1)]
++        calls = [("act", {"steps": [{"type": "home"}], "observe": value}) for value in ("bad", True, 1)]
++        for step in ({"type": "home"}, {"type": "key", "key": "enter"}):
++            calls += [("act", {"steps": [step], "observation_timeout": value})
++                      for value in (True, "1", 0, 0.1, 5.1)]
+         calls += [("act", {"steps": [{"type": "home"}, {"type": "key", "key": "invalid-key"}]})]
+         for call in calls:
+             self.assertTrue(self.exchange([call])[0]["isError"])
+         self.assertEqual(self.server.events, [("GET", "/config?wake=0")] * len(calls))
+ 
+-    def test_keyboard_sequence_accepts_its_advertised_observation_timeout(self):
+-        result = self.exchange([("keyboard_sequence", {
+-            "steps": [{"key": "enter"}], "observation_timeout": 0.5,
+-        })])[0]
++    def test_act_key_accepts_its_advertised_observation_timeout(self):
++        steps = [{"type": "key", "key": "enter"}]
++        result = self.exchange([("act", {"steps": steps, "observation_timeout": 0.5})])[0]
+         self.assertNotIn("isError", result)
+         self.assertTrue(result["structuredContent"]["action_acknowledged"])
+         self.assertEqual([event for event in self.server.events if event[0] == "POST"], [
+-            ("POST", "/key", {"key": "enter", "modifiers": [], "device": "phone-1"}),
++            ("POST", "/act", {"steps": steps, "device": "phone-1"}),
+         ])
+ 
+     def test_delayed_transition_returns_its_observed_image_without_replaying_input(self):
+@@ -889,7 +927,7 @@ class MCPStdioTests(unittest.TestCase):
+             return capture_reply(240 if changed else 0, state["sequence"], capture_uptime())
+ 
+         self.server.screenshot_response = screenshot
+-        result = self.exchange([("tap", {"frame_id": FRAME, "x": 5, "y": 5})])[0]
++        result = self.exchange([("act", {"steps": [{"type": "tap", "frame_id": FRAME, "x": 5, "y": 5}]})])[0]
+         self.assertNotIn("isError", result)
+         metadata = result["structuredContent"]
+         observation = metadata["observation"]
+@@ -911,7 +949,7 @@ class MCPStdioTests(unittest.TestCase):
+     def test_frozen_capture_is_unobserved_and_fresh_unchanged_capture_waits_full_window(self):
+         fixed_time = capture_uptime()
+         self.server.screenshot_response = lambda path: capture_reply(0, 1, fixed_time)
+-        frozen = self.exchange([("home", {"observation_timeout": 0.5})])[0]
++        frozen = self.exchange([("act", {"steps": [{"type": "home"}], "observation_timeout": 0.5})])[0]
+         observation = frozen["structuredContent"]["observation"]
+         self.assertEqual(observation["status"], "unobserved")
+         self.assertEqual(observation["reason"], "no_fresh_frame")
+@@ -937,7 +975,7 @@ class MCPStdioTests(unittest.TestCase):
+             return reply
+ 
+         self.server.screenshot_response = fresh
+-        unchanged = self.exchange([("home", {"observation_timeout": 1.5})])[0]
++        unchanged = self.exchange([("act", {"steps": [{"type": "home"}], "observation_timeout": 1.5})])[0]
+         observation = unchanged["structuredContent"]["observation"]
+         selected = int(observation["frame"]["sequence"])
+         frames = {frame["sequence"]: frame for frame in list(produced)}
+@@ -992,7 +1030,7 @@ class MCPStdioTests(unittest.TestCase):
+             return reply
+ 
+         self.server.screenshot_response = screenshot
+-        result = self.exchange([("home", {"observation_timeout": 1.5})])[0]
++        result = self.exchange([("act", {"steps": [{"type": "home"}], "observation_timeout": 1.5})])[0]
+         frames = list(produced)
+         self.assertNotIn("isError", result)
+         observation = result["structuredContent"]["observation"]
+@@ -1016,7 +1054,7 @@ class MCPStdioTests(unittest.TestCase):
+ 
+     def test_failed_capture_does_not_turn_acknowledged_input_into_a_retryable_action_error(self):
+         self.server.screenshot_response = lambda path: (503, b'{"error":"capture unavailable"}', None)
+-        result = self.exchange([("home", {"observation_timeout": 0.3})])[0]
++        result = self.exchange([("act", {"steps": [{"type": "home"}], "observation_timeout": 0.3})])[0]
+         self.assertNotIn("isError", result)
+         metadata = result["structuredContent"]
+         self.assertTrue(metadata["action_acknowledged"])
+@@ -1073,8 +1111,8 @@ class MCPStdioTests(unittest.TestCase):
+ 
+         self.server.before_post = attach_second
+         results = self.exchange([
+-            ("home", {"device": "First", "observe": "none"}),
+-            ("home", {"device": "Second", "observe": "none"}),
++            ("act", {"steps": [{"type": "home"}], "device": "First", "observe": "none"}),
++            ("act", {"steps": [{"type": "home"}], "device": "Second", "observe": "none"}),
+         ])
+         self.assertTrue(all("isError" not in result for result in results))
+         self.assertEqual(sum(event[1] == "/devices" for event in self.server.events), 2)
+@@ -1094,7 +1132,8 @@ class MCPStdioTests(unittest.TestCase):
+ 
+     def test_device_list_and_tap_preserve_routing_scaling_and_confirmation_image(self):
+         listed, tapped = self.exchange([
+-            ("list_devices", {}), ("tap", {"frame_id": FRAME, "x": 120.5, "y": 400, "device": "phone-1"}),
++            ("list_devices", {}),
++            ("act", {"steps": [{"type": "tap", "frame_id": FRAME, "x": 120.5, "y": 400}], "device": "phone-1"}),
+         ])
+         self.assertEqual(json.loads(listed["content"][0]["text"])["devices"][0]["id"], "phone-1")
+         self.assertNotIn("isError", tapped)
+@@ -1123,17 +1162,11 @@ class MCPStdioTests(unittest.TestCase):
+             ("POST", "/ocr", {"device": "phone-1", "maxEdge": 800}),
+         ])
+ 
+-    def test_text_only_screenshot_has_no_base64_image_and_tap_text_is_retired(self):
+-        screenshot, retired = self.exchange([
+-            ("screenshot", {"device": "First", "include_image": False}),
+-            ("tap_text", {"text": "设置", "exact": True, "index": 1, "hold": 0.2,
+-                          "maxEdge": 800, "device": "phone-1", "include_image": False}),
+-        ])
++    def test_text_only_screenshot_has_no_base64_image(self):
++        screenshot, = self.exchange([("screenshot", {"device": "First", "include_image": False})])
+         self.assertNotIn("isError", screenshot)
+         self.assertTrue(all(block["type"] == "text" for block in screenshot["content"]))
+         self.assertIn("500x1000 px", screenshot["content"][0]["text"])
+-        self.assertTrue(retired["isError"])
+-        self.assertIn("retired", retired["content"][0]["text"])
+         self.assertFalse(any(event[0] == "POST" for event in self.server.events))
+         self.assertEqual(sum(event[1].startswith("/screenshot?") for event in self.server.events), 1)
+ 
+@@ -1145,56 +1178,36 @@ class MCPStdioTests(unittest.TestCase):
+     def test_failed_action_and_unknown_tool_return_errors_without_a_screenshot(self):
+         self.server.fail_actions = True
+         failed, unknown = self.exchange([
+-            ("tap", {"frame_id": FRAME, "x": 1, "y": 2, "device": "phone-1"}), ("missing_tool", {}),
++            ("act", {"steps": [{"type": "tap", "frame_id": FRAME, "x": 1, "y": 2}], "device": "phone-1"}), ("missing_tool", {}),
+         ])
+         self.assertTrue(failed["isError"])
+         self.assertEqual(failed["content"][0]["text"], "pointer is not ready")
+         self.assertTrue(unknown["isError"])
+-        self.assertEqual(unknown["content"][0]["text"], "unknown tool missing_tool")
++        self.assertIn("unknown", unknown["content"][0]["text"].lower())
+         self.assertEqual(len(self.server.events), 3)
+         self.assertEqual(self.server.events[2][:2], ("POST", "/act"))
+ 
+-    def test_normalized_touch_aliases_reject_before_discovery_even_with_valid_frame(self):
+-        results = self.exchange([
+-            ("tap", {"frame_id": FRAME, "x": 0, "y": 1000, "normalized": True}),
+-            ("long_press", {"frame_id": FRAME, "x": 500, "y": 500, "seconds": 2, "normalized": True}),
+-            ("swipe", {"frame_id": FRAME, "points": [{"x": 0, "y": 1000}, {"x": 500, "y": 0}],
+-                       "duration": 0.4, "normalized": True}),
+-        ])
++    def test_normalized_touch_steps_reject_before_discovery_even_with_valid_frame(self):
++        steps = [
++            {"type": "tap", "frame_id": FRAME, "x": 0, "y": 1000, "normalized": True},
++            {"type": "tap", "frame_id": FRAME, "x": 500, "y": 500, "hold": 2, "normalized": True},
++            {"type": "swipe", "frame_id": FRAME, "points": [{"x": 0, "y": 1000}, {"x": 500, "y": 0}],
++             "duration": 0.4, "normalized": True},
++        ]
++        results = self.exchange([("act", {"steps": [step]}) for step in steps])
+         self.assertTrue(all(result["isError"] for result in results))
+-        self.assertTrue(all("normalized" in result["content"][0]["text"] for result in results))
++        self.assertTrue(all(result["structuredContent"]["input_receipt"]["status"] == "not_sent" for result in results))
+         self.assertEqual(self.server.events, [("GET", "/config?wake=0")])
+ 
+-    def test_retired_pointer_tools_do_not_query_devices_or_send_input(self):
+-        calls = [
+-            ("move_pointer", {"x": 100, "y": 200}),
+-            ("adjust_pointer", {"dx": -2, "dy": 3}),
+-            ("click_pointer", {}),
+-        ]
+-        results = self.exchange(calls)
+-        for (name, _), result in zip(calls, results):
+-            self.assertTrue(result["isError"])
+-            self.assertEqual(result["content"][0]["text"], "unknown tool " + name)
+-        # The removed MCP surface has no dispatch and cannot touch the host.
+-        self.assertEqual(self.server.events, [("GET", "/config?wake=0")])
+-        # Old cached clients may attach a frame; that also rejects before discovery.
+-        bound = self.exchange([(name, dict(arguments, frame_id="00000000-0000-4000-8000-000000000001"))
+-                               for name, arguments in calls])
+-        self.assertTrue(all(result["isError"] for result in bound))
+-        self.assertEqual(self.server.events, [("GET", "/config?wake=0")] * 2)
+-
+-    def test_keyboard_sequence_preserves_order_and_captures_only_the_final_screen(self):
+-        result = self.exchange([("keyboard_sequence", {"device": "First", "steps": [
+-            {"key": "l", "modifiers": ["cmd"]}, {"text": "https://www.baidu.com"}, {"key": "enter"},
+-        ]})])[0]
++    def test_act_keyboard_steps_preserve_order_and_observe_only_after_the_batch(self):
++        steps = [{"type": "key", "key": "l", "modifiers": ["cmd"]},
++                 {"type": "type", "text": "https://example.invalid"}, {"type": "key", "key": "enter"}]
++        result = self.exchange([("act", {"device": "First", "steps": steps})])[0]
+         self.assertNotIn("isError", result)
+         self.assertEqual(result["content"][0]["type"], "image")
+         self.assertEqual(self.server.events, [
+-            ("GET", "/config?wake=0"),
+-            ("GET", "/devices"),
+-            ("POST", "/key", {"key": "l", "modifiers": ["cmd"], "device": "phone-1"}),
+-            ("POST", "/type", {"text": "https://www.baidu.com", "device": "phone-1"}),
+-            ("POST", "/key", {"key": "enter", "modifiers": [], "device": "phone-1"}),
++            ("GET", "/config?wake=0"), ("GET", "/devices"),
++            ("POST", "/act", {"steps": steps, "device": "phone-1"}),
+             ("GET", "/screenshot?maxEdge=1000&device=phone-1&ocr=1"),
+         ])
+ 
+@@ -1202,9 +1215,9 @@ class MCPStdioTests(unittest.TestCase):
+         self.server.devices.append({"id": "phone-2", "name": "Second"})
+         results = self.exchange([
+             ("screenshot", {"device_id": "Second"}),
+-            ("type_text", {"text": "nihao", "device_id": "Second", "clear_before": True,
+-                           "commit_ime": True, "press_enter": True}),
+-            ("home", {"device": "First", "device_id": "Second"}),
++            ("act", {"steps": [{"type": "type", "text": "nihao", "clear_before": True,
++                                "commit_ime": True, "press_enter": True}], "device_id": "Second"}),
++            ("act", {"steps": [{"type": "home"}], "device": "First", "device_id": "Second"}),
+         ])
+         self.assertTrue(all("isError" not in result for result in results))
+         posts = [event for event in self.server.events if event[0] == "POST"]
+@@ -1225,152 +1238,151 @@ class MCPStdioTests(unittest.TestCase):
+         ])
+         self.assertFalse(any(event[1].startswith("/screenshot?") for event in self.server.events))
+ 
+-    def test_actions_typed_steps_and_delays_preserve_atomic_order(self):
+-        result = self.exchange([("keyboard_sequence", {"device_id": "First", "actions": [
+-            {"type": "text", "text": "nihao", "clear_before": True,
+-             "commit_ime": True, "press_enter": True},
+-            {"delay": 0}, {"wait": 0}, {"type": "delay", "seconds": 0.01},
+-            {"type": "wait", "seconds": 0}, {"type": "key", "key": "tab"},
+-        ]})])[0]
++    def test_act_type_key_and_delay_steps_forward_in_exact_order(self):
++        steps = [{"type": "type", "text": "nihao", "clear_before": True,
++                  "commit_ime": True, "press_enter": True},
++                 {"type": "delay", "seconds": 0}, {"type": "delay", "seconds": 0.01},
++                 {"type": "key", "key": "tab"}]
++        result = self.exchange([("act", {"device_id": "First", "steps": steps})])[0]
+         self.assertNotIn("isError", result)
+         self.assertEqual([event for event in self.server.events if event[0] == "POST"], [
+-            ("POST", "/type", {"text": "nihao", "device": "phone-1", "clear_before": True,
+-                                "commit_ime": True, "press_enter": True}),
+-            ("POST", "/key", {"key": "tab", "modifiers": [], "device": "phone-1"}),
++            ("POST", "/act", {"steps": steps, "device": "phone-1"}),
+         ])
+         self.assertEqual(sum(event[1].startswith("/screenshot") for event in self.server.events), 1)
+ 
+-    def test_chinese_text_and_sequence_forward_ime_option(self):
++    def test_act_chinese_text_forwards_explicit_ime_options(self):
+         results = self.exchange([
+-            ("type_text", {"text": "蓝牙", "device": "First", "ensure_chinese_ime": False}),
+-            ("keyboard_sequence", {"device": "First", "include_image": False,
+-                                   "steps": [{"text": "快捷指令", "ensure_chinese_ime": True}]}),
++            ("act", {"steps": [{"type": "type", "text": "蓝牙", "ensure_chinese_ime": False}], "device": "First"}),
++            ("act", {"steps": [{"type": "type", "text": "快捷指令", "ensure_chinese_ime": True}],
++                     "device": "First", "include_image": False}),
+         ])
+         self.assertTrue(all("isError" not in result for result in results))
++        self.assertFalse(any(block["type"] == "image" for block in results[1]["content"]))
+         self.assertEqual([event for event in self.server.events if event[0] == "POST"], [
+             ("POST", "/act", {"steps": [{"type": "type", "text": "蓝牙", "ensure_chinese_ime": False}], "device": "phone-1"}),
+-            ("POST", "/type", {"text": "快捷指令", "device": "phone-1", "ensure_chinese_ime": True}),
++            ("POST", "/act", {"steps": [{"type": "type", "text": "快捷指令", "ensure_chinese_ime": True}], "device": "phone-1"}),
+         ])
+ 
+-    def test_configured_usb_unicode_preserves_default_and_hid_optout_in_all_paths(self):
++    def test_act_configured_usb_unicode_preserves_clipboard_default_and_hid_optout(self):
+         self.env.update(IPHONE_USE_USB_CLIPBOARD_PYTHON="/unused/test/python",
+                         IPHONE_USE_USB_DEVICE_ID="00000000-0000000000000001")
+-        calls = [
+-            ("type_text", {"text": "中文 🧩", "clear_before": True, "observe": "none"}),
+-            ("keyboard_sequence", {"steps": [{"text": "中文 🧩", "clear_before": True}], "observe": "none"}),
+-            ("keyboard_sequence", {"steps": [{"text": "ascii", "use_clipboard": False}], "observe": "none"}),
+-            ("act", {"steps": [{"type": "type", "text": "中文 🧩"}], "observe": "none"}),
+-        ]
+-        results = self.exchange(calls)
++        steps = [{"type": "type", "text": "中文 🧩", "clear_before": True},
++                 {"type": "type", "text": "ascii", "use_clipboard": False},
++                 {"type": "type", "text": "中文 🧩"}]
++        results = self.exchange([("act", {"steps": [step], "observe": "none"}) for step in steps])
+         self.assertTrue(all("isError" not in result for result in results))
+         self.assertEqual([event for event in self.server.events if event[0] == "POST"], [
+-            ("POST", "/act", {"steps": [{"type": "type", "text": "中文 🧩", "clear_before": True}], "device": "phone-1"}),
+-            ("POST", "/type", {"text": "中文 🧩", "clear_before": True, "device": "phone-1"}),
+-            ("POST", "/type", {"text": "ascii", "use_clipboard": False, "device": "phone-1"}),
+-            ("POST", "/act", {"steps": [{"type": "type", "text": "中文 🧩"}], "device": "phone-1"}),
++            ("POST", "/act", {"steps": [step], "device": "phone-1"}) for step in steps
+         ])
+ 
+-    def test_text_sequence_failure_does_not_send_clear_or_enter_separately(self):
++    def test_act_type_failure_does_not_send_clear_or_enter_separately(self):
+         self.server.fail_actions = True
+-        result = self.exchange([("keyboard_sequence", {
+-            "steps": [{"text": "中文 🧩", "use_clipboard": True, "clear_before": True, "press_enter": True}],
+-            "observe": "none",
++        result = self.exchange([("act", {
++            "steps": [{"type": "type", "text": "中文 🧩", "use_clipboard": True,
++                       "clear_before": True, "press_enter": True}], "observe": "none",
+         })])[0]
+         self.assertTrue(result["isError"])
+-        self.assertEqual([event[1] for event in self.server.events if event[0] == "POST"], ["/type"])
++        self.assertEqual([event[1] for event in self.server.events if event[0] == "POST"], ["/act"])
+ 
+-    def test_new_invalid_forms_fail_before_device_lookup(self):
++    def test_invalid_act_delay_and_text_options_fail_before_device_lookup(self):
+         invalid = [
+-            {"actions": [{"delay": True}]}, {"actions": [{"wait": 5.1}]},
+-            {"actions": [{"type": "delay", "seconds": -1}]},
+-            {"actions": [{"type": "key", "text": "x"}]},
+-            {"actions": [{"text": "x", "commit_ime": 1}]},
+-            {"steps": [{"text": "x"}], "actions": [{"text": "y"}]},
++            {"type": "delay", "seconds": True}, {"type": "delay", "seconds": 6.1},
++            {"type": "delay", "seconds": -1}, {"type": "delay"},
++            {"type": "key", "text": "x"},
++            {"type": "type", "text": "x", "commit_ime": 1},
++            {"type": "type", "text": "a", "press_enter": 1},
+         ]
+-        for arguments in invalid:
+-            self.assertTrue(self.exchange([("keyboard_sequence", arguments)])[0]["isError"])
+-        self.assertTrue(self.exchange([("type_text", {"text": "a", "press_enter": 1})])[0]["isError"])
+-        self.assertEqual(self.server.events, [("GET", "/config?wake=0")] * (len(invalid) + 1))
+-
+-    def test_sequence_can_omit_confirmation_image(self):
+-        result = self.exchange([("keyboard_sequence", {
+-            "actions": [{"wait": 0}], "include_image": False,
+-        })])[0]
++        results = self.exchange([("act", {"steps": [step]}) for step in invalid])
++        self.assertTrue(all(result["isError"] for result in results))
++        self.assertTrue(all(result["structuredContent"]["input_receipt"]["status"] == "not_sent" for result in results))
++        self.assertEqual(self.server.events, [("GET", "/config?wake=0")])
++
++    def test_act_can_omit_image_without_disabling_observation(self):
++        steps = [{"type": "delay", "seconds": 0}]
++        result = self.exchange([("act", {"steps": steps, "include_image": False})])[0]
+         self.assertNotIn("isError", result)
+-        self.assertEqual(self.server.events, [("GET", "/config?wake=0"), ("GET", "/devices")])
++        self.assertTrue(all(block["type"] == "text" for block in result["content"]))
++        self.assertEqual(self.server.events, [
++            ("GET", "/config?wake=0"), ("GET", "/devices"),
++            ("POST", "/act", {"steps": steps, "device": "phone-1"}),
++            ("GET", "/screenshot?maxEdge=1000&device=phone-1&ocr=1"),
++        ])
+ 
+-    def test_invalid_later_keyboard_step_prevents_all_input_and_device_queries(self):
++    def test_invalid_later_act_keyboard_step_prevents_all_input_and_device_queries(self):
+         bad_steps = [
+-            {"text": "🙂"}, {"text": "x" * 257}, {"text": ""},
+-            {"text": "x", "key": "enter"}, {"key": "enter", "unexpected": True},
+-            {"key": "unknown-name"}, {"key": ""}, {"key": "🌟"},
+-            {"key": "enter", "modifiers": ["unknown"]}, {"key": "enter", "modifiers": "cmd"},
+-            {"text": 123},
++            {"type": "type", "text": "🙂", "use_clipboard": False},
++            {"type": "type", "text": "x", "key": "enter"},
++            {"type": "key", "key": "enter", "unexpected": True},
++            {"type": "key", "key": "unknown-name"}, {"type": "key", "key": ""},
++            {"type": "key", "key": "🌟"},
++            {"type": "key", "key": "enter", "modifiers": ["unknown"]},
++            {"type": "key", "key": "enter", "modifiers": "cmd"},
++            {"type": "type", "text": 123},
+         ]
+-        for bad in bad_steps:
+-            with self.subTest(step=bad):
+-                result = self.exchange([("keyboard_sequence", {"steps": [
+-                    {"key": "l", "modifiers": ["cmd"]}, bad,
+-                ]})])[0]
+-                self.assertTrue(result["isError"])
+-                self.assertIn("step 2", result["content"][0]["text"])
+-        for steps in ([], [{"key": "enter"}] * 17, "not-an-array", [{"text": "x" * 200}] * 2):
+-            with self.subTest(steps=steps):
+-                self.assertTrue(self.exchange([("keyboard_sequence", {"steps": steps})])[0]["isError"])
+-        # Validation fails before any device query; only initialize's /config ran.
+-        self.assertEqual(self.server.events, [("GET", "/config?wake=0")] * (len(bad_steps) + 4))
+-
+-    def test_keyboard_sequence_stops_at_failed_step_without_replaying(self):
+-        def fail_second_step(body):
+-            if "text" in body:
+-                self.server.fail_actions = True
+-
+-        self.server.before_post = fail_second_step
+-        result = self.exchange([("keyboard_sequence", {"steps": [
+-            {"key": "l", "modifiers": ["cmd"]}, {"text": "example.com"}, {"key": "enter"},
++        calls = [("act", {"steps": [{"type": "key", "key": "l", "modifiers": ["cmd"]}, bad]})
++                 for bad in bad_steps]
++        calls += [("act", {"steps": steps})
++                  for steps in ([], [{"type": "key", "key": "enter"}] * 17, "not-an-array")]
++        results = self.exchange(calls)
++        self.assertTrue(all(result["isError"] for result in results))
++        self.assertTrue(all(result["structuredContent"]["input_receipt"]["status"] == "not_sent" for result in results))
++        # No prefix executes, and even device discovery waits for full preflight.
++        self.assertEqual(self.server.events, [("GET", "/config?wake=0")])
++
++    def test_act_keyboard_failure_preserves_host_prefix_without_replaying(self):
++        rows = [{"step": 1, "type": "key", "ok": True}, {"step": 2, "type": "type", "ok": False}]
++        self.server.act_failure = {"error": "synthetic text failure", "completed": 1,
++                                   "failed_step": 2, "step_receipts": rows}
++        result = self.exchange([("act", {"steps": [
++            {"type": "key", "key": "l", "modifiers": ["cmd"]},
++            {"type": "type", "text": "example.invalid"}, {"type": "key", "key": "enter"},
+         ]})])[0]
+         self.assertTrue(result["isError"])
+-        self.assertIn("stopped at step 2/3", result["content"][0]["text"])
+-        self.assertIn("fresh screenshot", result["content"][0]["text"])
++        metadata = result["structuredContent"]
++        self.assertEqual(metadata["input_receipt"]["steps"], rows)
++        progress = json.loads(result["content"][0]["text"].splitlines()[0])
++        self.assertEqual(progress["completed"], 1)
++        self.assertEqual(progress["failed_step"], 2)
+         self.assertEqual([event[:2] for event in self.server.events], [
+-            ("GET", "/config?wake=0"), ("GET", "/devices"), ("POST", "/key"), ("POST", "/type"),
++            ("GET", "/config?wake=0"), ("GET", "/devices"), ("POST", "/act"),
+         ])
+ 
+-    def test_same_phone_cannot_interleave_a_keyboard_sequence(self):
+-        first_step = threading.Event()
+-        release_step = threading.Event()
++    def test_same_phone_cannot_interleave_an_act_keyboard_batch(self):
++        first_batch = threading.Event()
++        release_batch = threading.Event()
+         other_input = threading.Event()
++        steps = [{"type": "key", "key": "l", "modifiers": ["cmd"]},
++                 {"type": "type", "text": "example.invalid"}, {"type": "key", "key": "enter"}]
+ 
+         def post(body):
+-            if body.get("key") == "l":
+-                first_step.set()
+-                release_step.wait(5)
+-            elif body.get("steps", [{}])[0].get("key") == "escape":
++            if body["steps"][0].get("key") == "l":
++                first_batch.set()
++                release_batch.wait(5)
++            elif body["steps"][0].get("key") == "escape":
+                 other_input.set()
+ 
+         self.server.before_post = post
+         with ThreadPoolExecutor(max_workers=2) as pool:
+-            sequence = pool.submit(self.exchange, [("keyboard_sequence", {"device": "First", "steps": [
+-                {"key": "l", "modifiers": ["cmd"]}, {"text": "example.com"}, {"key": "enter"},
+-            ]})])
++            batch = pool.submit(self.exchange, [("act", {"device": "First", "steps": steps})])
+             try:
+-                self.assertTrue(first_step.wait(5))
++                self.assertTrue(first_batch.wait(5))
+                 self.server.devices_requested.clear()
+-                other = pool.submit(self.exchange, [("press_key", {"device": "phone-1", "key": "escape"})])
++                other = pool.submit(self.exchange, [("act", {"device": "phone-1", "steps": [
++                    {"type": "key", "key": "escape"}]})])
+                 self.assertTrue(self.server.devices_requested.wait(5))
+                 self.assertFalse(other_input.wait(0.3))
+             finally:
+-                release_step.set()
+-            self.assertNotIn("isError", sequence.result(timeout=8)[0])
++                release_batch.set()
++            self.assertNotIn("isError", batch.result(timeout=8)[0])
+             self.assertNotIn("isError", other.result(timeout=8)[0])
+         changes = [event for event in self.server.events if event[0] == "POST" or event[1].startswith("/screenshot")]
+         self.assertEqual([event[:2] for event in changes], [
+-            ("POST", "/key"), ("POST", "/type"), ("POST", "/key"),
+-            ("GET", "/screenshot?maxEdge=1000&device=phone-1&ocr=1"),
++            ("POST", "/act"), ("GET", "/screenshot?maxEdge=1000&device=phone-1&ocr=1"),
+             ("POST", "/act"), ("GET", "/screenshot?maxEdge=1000&device=phone-1&ocr=1"),
+         ])
++        self.assertEqual(changes[0][2]["steps"], steps)
+ 
+-    def test_same_phone_aliases_queue_action_and_confirmation_across_processes(self):
++    def test_same_phone_selectors_queue_act_and_confirmation_across_processes(self):
+         screenshot_started = threading.Event()
+         release_screenshot = threading.Event()
+         second_post = threading.Event()
+@@ -1383,7 +1395,8 @@ class MCPStdioTests(unittest.TestCase):
+         self.server.before_screenshot = screenshot
+         self.server.before_post = lambda body: second_post.set() if body["steps"][0]["x"] == 2 else None
+         with ThreadPoolExecutor(max_workers=2) as pool:
+-            first = pool.submit(self.exchange, [("tap", {"frame_id": FRAME, "x": 1, "y": 1, "device": "First"})])
++            first = pool.submit(self.exchange, [("act", {"steps": [
++                {"type": "tap", "frame_id": FRAME, "x": 1, "y": 1}], "device": "First"})])
+             try:
+                 self.assertTrue(screenshot_started.wait(5))
+                 # The shared service lock also prevents recovery from stopping
+@@ -1393,7 +1406,8 @@ class MCPStdioTests(unittest.TestCase):
+                     with self.assertRaises(BlockingIOError):
+                         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                 self.server.devices_requested.clear()
+-                second = pool.submit(self.exchange, [("tap", {"frame_id": FRAME, "x": 2, "y": 1, "device": "phone-1"})])
++                second = pool.submit(self.exchange, [("act", {"steps": [
++                    {"type": "tap", "frame_id": FRAME, "x": 2, "y": 1}], "device": "phone-1"})])
+                 self.assertTrue(self.server.devices_requested.wait(5))
+                 self.assertFalse(second_post.wait(0.3))
+             finally:
+@@ -1409,14 +1423,15 @@ class MCPStdioTests(unittest.TestCase):
+         barrier = threading.Barrier(2)
+         self.server.before_post = lambda body: barrier.wait(timeout=5)
+         with ThreadPoolExecutor(max_workers=2) as pool:
+-            calls = [pool.submit(self.exchange, [("tap", {"frame_id": FRAME, "x": 1, "y": 1, "device": phone})])
++            calls = [pool.submit(self.exchange, [("act", {"steps": [
++                {"type": "tap", "frame_id": FRAME, "x": 1, "y": 1}], "device": phone})])
+                      for phone in ("phone-1", "phone-2")]
+             for result in calls:
+                 self.assertNotIn("isError", result.result(timeout=10)[0])
+ 
+     def test_ambiguous_phone_name_does_not_send_input(self):
+         self.server.devices.append({"id": "phone-2", "name": "First"})
+-        result = self.exchange([("tap", {"frame_id": FRAME, "x": 1, "y": 1, "device": "First"})])[0]
++        result = self.exchange([("act", {"steps": [{"type": "tap", "frame_id": FRAME, "x": 1, "y": 1}], "device": "First"})])[0]
+         self.assertTrue(result["isError"])
+         self.assertIn("found 2", result["content"][0]["text"])
+         self.assertEqual(self.server.events, [("GET", "/config?wake=0"), ("GET", "/devices")])
+@@ -1441,7 +1456,7 @@ class MCPStdioTests(unittest.TestCase):
+                 {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                 {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+                 {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+-                    "name": "tap", "arguments": {"frame_id": FRAME, "x": -1, "y": 1},
++                    "name": "act", "arguments": {"steps": [{"type": "tap", "frame_id": FRAME, "x": -1, "y": 1}]},
+                 }},
+             ]),
+             env=self.env, cwd="/", capture_output=True, text=True, timeout=15,
+diff --git a/Tests/iPhoneUseTests/API/HTTPAPITests.swift b/Tests/iPhoneUseTests/API/HTTPAPITests.swift
+index 86c46b0..e31389a 100644
+--- a/Tests/iPhoneUseTests/API/HTTPAPITests.swift
++++ b/Tests/iPhoneUseTests/API/HTTPAPITests.swift
+@@ -289,7 +289,9 @@ final class SwipeRequestTests: XCTestCase {
+         for sample in program.samples.dropLast() {
+             let contacts = try XCTUnwrap(sample["contacts"] as? [[String: Any]])
+             XCTAssertEqual(contacts.count, 1)
+-            XCTAssertEqual(contacts.first?["id"] as? Int, 0)
++            // The generated numeric dictionary stores id alongside Double coordinates.
++            let id = try XCTUnwrap(contacts.first?["id"] as? NSNumber)
++            XCTAssertEqual(id.doubleValue, 0)
+         }
+         XCTAssertEqual(program.samples.last?["at_ms"] as? Double, 121)
+         XCTAssertTrue(try XCTUnwrap(program.samples.last?["contacts"] as? [[String: Any]]).isEmpty)
+@@ -374,23 +376,24 @@ final class SwipeRequestTests: XCTestCase {
+     }
+ 
+     func testMCPRejectsNormalizedAndUnboundCoordinatesBeforeHTTPEncoding() {
+-        for name in ["tap", "long_press", "swipe"] {
+-            var arguments: [String: Any] = name == "swipe"
++        for type in ["tap", "swipe"] {
++            var step: [String: Any] = type == "swipe"
+                 ? ["points": [["x": 0, "y": 800], ["x": 400, "y": 0]]]
+                 : ["x": 400, "y": 800]
+-            arguments["normalized"] = true
+-            arguments["frame_id"] = "00000000-0000-4000-8000-000000000001"
++            step["type"] = type
++            step["normalized"] = true
++            step["frame_id"] = "00000000-0000-4000-8000-000000000001"
+             XCTAssertThrowsError(
+-                try MCPToolRequest.action(named: name, arguments: arguments, longEdge: MCPServer.longEdge)
++                try MCPToolRequest.action(named: "act", arguments: ["steps": [step]], longEdge: MCPServer.longEdge)
+             ) { error in
+                 XCTAssertTrue(error is InputRequestError)
+                 XCTAssertEqual(String(describing: error),
+-                    "MCP touch requires frame_id and screenshot pixels; normalized coordinates are unsupported")
++                    "frame_id is valid only for a first touch step using screenshot pixels")
+             }
+-            arguments.removeValue(forKey: "normalized")
+-            arguments.removeValue(forKey: "frame_id")
++            step.removeValue(forKey: "normalized")
++            step.removeValue(forKey: "frame_id")
+             XCTAssertThrowsError(
+-                try MCPToolRequest.action(named: name, arguments: arguments, longEdge: MCPServer.longEdge)
++                try MCPToolRequest.action(named: "act", arguments: ["steps": [step]], longEdge: MCPServer.longEdge)
+             ) { error in
+                 XCTAssertEqual(String(describing: error), "Invalid act parameters; touch requires frame_id and screenshot pixels")
+             }
+@@ -740,7 +743,7 @@ final class TypeTextRequestTests: XCTestCase {
+             host: UUID(), session: UUID(), screenSize: { nil }, sleep: { _ in },
+             reportSender: { _, _ in reports += 1 }, reportReadiness: { _, _, _ in true })
+         var invalid: [[String: Any]] = [["clear_before": true], ["text": "🙂", "clear_before": true]]
+-        for option in MCPKeyboardSequence.textOptions {
++        for option in TextEntry.textOptions {
+             for value: Any in [0, 1, "true", NSNull()] {
+                 var body: [String: Any] = ["text": "a", "clear_before": true]
+                 body[option] = value
+diff --git a/Tests/iPhoneUseTests/API/Phase2Tests.swift b/Tests/iPhoneUseTests/API/Phase2Tests.swift
+index 29643b7..fe02759 100644
+--- a/Tests/iPhoneUseTests/API/Phase2Tests.swift
++++ b/Tests/iPhoneUseTests/API/Phase2Tests.swift
+@@ -224,9 +224,14 @@ final class Phase2Tests: XCTestCase {
+         XCTAssertEqual(pressed.map { $0[2] }, [0x19])
+         XCTAssertEqual(pressed.first?[0], 8)
+         XCTAssertThrowsError(try TypeTextRequest(["text": "x", "use_clipboard": 1]))
+-        let sequence = try MCPKeyboardSequence.actions(arguments: ["steps": [["text": "🙂", "use_clipboard": true]]])
+-        guard case .request(let action) = sequence[0] else { return XCTFail("Expected request") }
+-        XCTAssertEqual(action.body["use_clipboard"] as? Bool, true)
++        let action = try XCTUnwrap(MCPToolRequest.action(named: "act", arguments: [
++            "steps": [["type": "type", "text": "🙂", "use_clipboard": true]]
++        ], longEdge: MCPServer.longEdge))
++        XCTAssertEqual(action.path, "/act")
++        let steps = try XCTUnwrap(action.body["steps"] as? [[String: Any]])
++        XCTAssertEqual(steps.count, 1)
++        XCTAssertEqual(steps.first?["text"] as? String, "🙂")
++        XCTAssertEqual(steps.first?["use_clipboard"] as? Bool, true)
+     }
+ 
+     func testClipboardFailureCannotClearFocusedField() throws {
+diff --git a/Tests/iPhoneUseTests/MCP/MCPProtocolTests.swift b/Tests/iPhoneUseTests/MCP/MCPProtocolTests.swift
+index 3a921b1..75f8533 100644
+--- a/Tests/iPhoneUseTests/MCP/MCPProtocolTests.swift
++++ b/Tests/iPhoneUseTests/MCP/MCPProtocolTests.swift
+@@ -7,6 +7,11 @@ private let fixtureFrameID = "00000000-0000-4000-8000-000000000001"
+ private func firstActionStep(_ request: MCPToolRequest) throws -> [String: Any] {
+     try XCTUnwrap((request.body["steps"] as? [[String: Any]])?.first)
+ }
++private func actRequest(_ steps: [[String: Any]], device: String? = nil, longEdge: Int = 1000) throws -> MCPToolRequest {
++    var arguments: [String: Any] = ["steps": steps]
++    if let device { arguments["device"] = device }
++    return try XCTUnwrap(MCPToolRequest.action(named: "act", arguments: arguments, longEdge: longEdge))
++}
+ private func actStepSchema(_ type: String, language: AppLanguage = .en) throws -> [String: Any] {
+     let action = try XCTUnwrap(MCPToolCatalog.tools(for: language).first { $0["name"] as? String == "act" })
+     let schema = try XCTUnwrap(action["inputSchema"] as? [String: Any])
+@@ -32,58 +37,57 @@ final class MCPProtocolTests: XCTestCase {
+         }
+     }
+ 
+-    func testHiddenCoordinateAliasesPreserveFramePixelsAndRejectNormalizedMode() throws {
+-        let cases: [(String, [String: Any])] = [
+-            ("tap", ["x": 250, "y": 750]),
+-            ("long_press", ["x": 250, "y": 750, "seconds": 2.0]),
+-            ("swipe", ["duration": 0.8, "points": [["x": 0, "y": 1000], ["x": 250, "y": 750]]]),
++    func testActCoordinateStepsPreserveFramePixelsAndRejectNormalizedMode() throws {
++        let cases: [[String: Any]] = [
++            ["type": "tap", "x": 250, "y": 750],
++            ["type": "tap", "x": 250, "y": 750, "hold": 2.0],
++            ["type": "swipe", "duration": 0.8, "points": [["x": 0, "y": 1000], ["x": 250, "y": 750]]],
+         ]
+-        for (name, fields) in cases {
+-            var arguments = fields; arguments["frame_id"] = fixtureFrameID; arguments["device"] = "phone"
+-            arguments["normalized"] = false
+-            let request = try XCTUnwrap(MCPToolRequest.action(named: name, arguments: arguments, longEdge: 1000))
++        for fields in cases {
++            var input = fields; input["frame_id"] = fixtureFrameID
++            let request = try actRequest([input], device: "phone")
+             let step = try firstActionStep(request)
+             XCTAssertEqual(request.path, "/act")
+             XCTAssertEqual(request.body["device"] as? String, "phone")
+             XCTAssertEqual(step["frame_id"] as? String, fixtureFrameID)
+             XCTAssertNil(step["fraction"]); XCTAssertNil(step["normalized"]); XCTAssertNil(step["maxEdge"])
+-            if name == "swipe" {
++            if fields["type"] as? String == "swipe" {
+                 XCTAssertEqual(step["points"] as? [[String: Int]], fields["points"] as? [[String: Int]])
+                 XCTAssertEqual(step["duration"] as? Double, 0.8)
+             } else {
+                 XCTAssertEqual(step["x"] as? Int, 250); XCTAssertEqual(step["y"] as? Int, 750)
+-                if name == "long_press" { XCTAssertEqual(step["hold"] as? Double, 2) }
++                XCTAssertEqual(step["hold"] as? Double, fields["hold"] as? Double)
++            }
++            for flag in [false, true] {
++                input["normalized"] = flag
++                XCTAssertThrowsError(try actRequest([input]))
+             }
+-            arguments["normalized"] = true
+-            XCTAssertThrowsError(try MCPToolRequest.action(named: name, arguments: arguments, longEdge: 1000))
+         }
+     }
+ 
+-    func testFrameAliasesRejectInvalidFlagsCoordinatesAndPaths() {
+-        for name in ["tap", "long_press", "swipe"] {
+-            let coordinates: [String: Any] = name == "swipe"
++    func testActRejectsInvalidFrameFlagsCoordinatesAndPaths() {
++        for type in ["tap", "swipe"] {
++            let coordinates: [String: Any] = type == "swipe"
+                 ? ["points": [["x": 0, "y": 0], ["x": 500, "y": 500]]]
+                 : ["x": 500, "y": 500]
+-            var arguments = coordinates; arguments["frame_id"] = fixtureFrameID
+-            for invalid: Any in ["true", 1, NSNull(), true] {
+-                arguments["normalized"] = invalid
+-                XCTAssertThrowsError(try MCPToolRequest.action(named: name, arguments: arguments, longEdge: 1000))
++            var step = coordinates; step["type"] = type; step["frame_id"] = fixtureFrameID
++            for invalid: Any in ["true", 1, NSNull(), false, true] {
++                var malformed = step; malformed["normalized"] = invalid
++                XCTAssertThrowsError(try actRequest([malformed]))
+             }
+-            arguments["normalized"] = false
+             for invalid: Any in [true, "500", NSNull(), -1, Double.nan, Double.infinity] {
+                 for axis in ["x", "y"] {
+-                    var malformed = arguments
+-                    if name == "swipe" {
++                    var malformed = step
++                    if type == "swipe" {
+                         var point: [String: Any] = ["x": 0, "y": 0]; point[axis] = invalid
+                         malformed["points"] = [["x": 0, "y": 0], point]
+                     } else { malformed[axis] = invalid }
+-                    XCTAssertThrowsError(try MCPToolRequest.action(named: name, arguments: malformed, longEdge: 1000))
++                    XCTAssertThrowsError(try actRequest([malformed]))
+                 }
+             }
+         }
+         for points: Any in [[], [["x": 0, "y": 0]], "bad", [["x": 0, "y": 0], ["x": 1]]] {
+-            XCTAssertThrowsError(try MCPToolRequest.action(named: "swipe",
+-                arguments: ["frame_id": fixtureFrameID, "points": points], longEdge: 1000))
++            XCTAssertThrowsError(try actRequest([["type": "swipe", "frame_id": fixtureFrameID, "points": points]]))
+         }
+     }
+ 
+@@ -134,13 +138,13 @@ final class MCPProtocolTests: XCTestCase {
+         XCTAssertEqual(reply["result"] as? [String: Bool], ["isError": true])
+     }
+ 
+-    func testTapAndLongPressPreserveFramePixelsDeviceAndDurationDefaults() throws {
+-        let args: [String: Any] = ["frame_id": fixtureFrameID, "x": 50, "y": 80, "device": "phone"]
+-        let tap = try XCTUnwrap(MCPToolRequest.action(named: "tap", arguments: args, longEdge: 1000))
++    func testTapPreservesFramePixelsDeviceAndOptionalHold() throws {
++        let input: [String: Any] = ["type": "tap", "frame_id": fixtureFrameID, "x": 50, "y": 80]
++        let tap = try actRequest([input], device: "phone")
+         let step = try firstActionStep(tap)
+         XCTAssertEqual(tap.path, "/act"); XCTAssertEqual(tap.body["device"] as? String, "phone")
+         XCTAssertEqual(step["x"] as? Int, 50); XCTAssertNil(step["hold"]); XCTAssertNil(step["maxEdge"])
+-        let longPress = try XCTUnwrap(MCPToolRequest.action(named: "long_press", arguments: args, longEdge: 1000))
++        let longPress = try actRequest([input.merging(["hold": 1.0]) { _, value in value }])
+         XCTAssertEqual(longPress.path, "/act")
+         XCTAssertEqual(try firstActionStep(longPress)["hold"] as? Double, 1.0)
+     }
+@@ -166,8 +170,9 @@ final class MCPProtocolTests: XCTestCase {
+ 
+     func testSwipePreservesPointOrderPixelsDeviceAndExplicitDuration() throws {
+         let points = [["x": 300.5, "y": 900.0], ["x": 100.0, "y": 600.25], ["x": 400.0, "y": 300.0]]
+-        let args: [String: Any] = ["frame_id": fixtureFrameID, "points": points, "duration": 0.8, "device": "phone"]
+-        let swipe = try XCTUnwrap(MCPToolRequest.action(named: "swipe", arguments: args, longEdge: 1000))
++        let swipe = try actRequest([
++            ["type": "swipe", "frame_id": fixtureFrameID, "points": points, "duration": 0.8]
++        ], device: "phone")
+         let step = try firstActionStep(swipe)
+         XCTAssertEqual(swipe.path, "/act"); XCTAssertEqual(swipe.body["device"] as? String, "phone")
+         XCTAssertEqual(step["points"] as? [[String: Double]], points)
+@@ -177,40 +182,46 @@ final class MCPProtocolTests: XCTestCase {
+ 
+     func testSwipeLeavesDurationDefaultToLeafAndRejectsFormerSecondsParameter() throws {
+         let points = [["x": 1, "y": 2], ["x": 3, "y": 4]]
+-        let args: [String: Any] = ["frame_id": fixtureFrameID, "points": points]
+-        let swipe = try XCTUnwrap(MCPToolRequest.action(named: "swipe", arguments: args, longEdge: 1000))
++        let step: [String: Any] = ["type": "swipe", "frame_id": fixtureFrameID, "points": points]
++        let swipe = try actRequest([step])
+         XCTAssertNil(try firstActionStep(swipe)["duration"])
+-        XCTAssertThrowsError(try MCPToolRequest.action(named: "swipe",
+-            arguments: args.merging(["seconds": 9.0]) { _, value in value }, longEdge: 1000))
++        XCTAssertThrowsError(try actRequest([step.merging(["seconds": 9.0]) { _, value in value }]))
+     }
+ 
+     func testSwipeRequiresPointsAndRejectsFormerEndpointParameters() {
+-        XCTAssertThrowsError(try MCPToolRequest.action(named: "swipe",
+-            arguments: ["frame_id": fixtureFrameID], longEdge: 1000)) { error in
++        XCTAssertThrowsError(try actRequest([["type": "swipe", "frame_id": fixtureFrameID]])) { error in
+             XCTAssertEqual(String(describing: error), "swipe requires at least two points")
+         }
+-        XCTAssertThrowsError(try MCPToolRequest.action(named: "swipe", arguments:
+-            ["frame_id": fixtureFrameID, "x1": 1, "y1": 2, "x2": 3, "y2": 4, "seconds": 0.5], longEdge: 1000))
++        XCTAssertThrowsError(try actRequest([
++            ["type": "swipe", "frame_id": fixtureFrameID, "x1": 1, "y1": 2, "x2": 3, "y2": 4, "seconds": 0.5]
++        ]))
+     }
+ 
+     func testMissingCoordinatesReportTheFirstMissingKeyAndPresentNullIsRejected() {
+-        XCTAssertThrowsError(try MCPToolRequest.action(named: "tap", arguments: ["frame_id": fixtureFrameID, "x": 1], longEdge: 1000)) { error in
++        XCTAssertThrowsError(try actRequest([["type": "tap", "frame_id": fixtureFrameID, "x": 1]])) { error in
+             XCTAssertEqual(String(describing: error), "y must be a finite number")
+         }
+-        XCTAssertThrowsError(try MCPToolRequest.action(
+-            named: "tap", arguments: ["frame_id": fixtureFrameID, "x": NSNull(), "y": "unchecked"], longEdge: 1000))
++        XCTAssertThrowsError(try actRequest([["type": "tap", "frame_id": fixtureFrameID, "x": NSNull(), "y": "unchecked"]]))
+     }
+ 
+-    func testKeyboardAndHomeAliasesUseCanonicalBatchWithExistingDefaults() throws {
+-        let type = try XCTUnwrap(MCPToolRequest.action(named: "type_text", arguments: [:], longEdge: 1000))
++    func testActKeyboardAndHomeStepsRequireTheirExplicitFields() throws {
++        let type = try actRequest([["type": "type", "text": ""]])
+         XCTAssertEqual(type.path, "/act"); XCTAssertEqual(try firstActionStep(type)["text"] as? String, "")
+-        XCTAssertThrowsError(try MCPToolRequest.action(named: "press_key", arguments: [:], longEdge: 1000))
+-        let key = try XCTUnwrap(MCPToolRequest.action(named: "press_key", arguments: ["key": "enter"], longEdge: 1000))
++        XCTAssertThrowsError(try actRequest([["type": "type"]]))
++        XCTAssertThrowsError(try actRequest([["type": "key"]]))
++        let key = try actRequest([["type": "key", "key": "enter"]])
+         XCTAssertEqual(key.path, "/act"); XCTAssertEqual(try firstActionStep(key)["key"] as? String, "enter")
+-        let home = try XCTUnwrap(MCPToolRequest.action(named: "home", arguments: ["device": "phone"], longEdge: 1000))
++        let home = try actRequest([["type": "home"]], device: "phone")
+         XCTAssertEqual(home.path, "/act"); XCTAssertEqual(home.body["device"] as? String, "phone")
+         XCTAssertEqual(try firstActionStep(home) as? [String: String], ["type": "home"])
+-        XCTAssertNil(try MCPToolRequest.action(named: "unknown", arguments: [:], longEdge: 1000))
++    }
++
++    func testRetiredAndUnknownToolNamesHaveNoCompatibilityDispatch() throws {
++        for name in ["tap", "long_press", "swipe", "touch_sequence", "type_text", "press_key", "home",
++                     "keyboard_sequence", "tap_text", "unknown"] {
++            XCTAssertNil(try MCPToolRequest.action(named: name, arguments: [:], longEdge: 1000), name)
++            XCTAssertNil(try MCPToolRequest.action(named: name, arguments: ["steps": [["type": "home"]]], longEdge: 1000), name)
++        }
+     }
+ 
+ }
+@@ -220,7 +231,7 @@ final class MCPOCRTests: XCTestCase {
+         let ocr = try XCTUnwrap(MCPToolRequest.action(named: "ocr_screen", arguments: ["device": "phone"], longEdge: 1200))
+         XCTAssertEqual(ocr.path, "/ocr"); XCTAssertEqual(ocr.body["maxEdge"] as? Int, 1200)
+         XCTAssertEqual(ocr.body["device"] as? String, "phone")
+-        XCTAssertThrowsError(try MCPToolRequest.action(named: "tap_text", arguments: ["text": "设置"], longEdge: 1200))
++        XCTAssertNil(try MCPToolRequest.action(named: "tap_text", arguments: ["text": "设置"], longEdge: 1200))
+         XCTAssertThrowsError(try MCPToolRequest.action(named: "ocr_screen", arguments: ["maxEdge": 0], longEdge: 1200))
+     }
+ 
+@@ -267,10 +278,12 @@ final class MCPOCRTests: XCTestCase {
+     }
+ }
+ 
+-final class MCPKeyboardAliasTests: XCTestCase {
++final class MCPKeyboardBatchTests: XCTestCase {
+     func testEveryToolAdvertisesDeviceAliasAndOriginalWins() throws {
+         let tools = MCPToolCatalog.tools(for: .en)
+         XCTAssertEqual(tools.count, 7)
++        XCTAssertEqual(Set(tools.compactMap { $0["name"] as? String }),
++            ["session_context", "accessibility_tree", "list_devices", "screenshot", "screenshot_burst", "ocr_screen", "act"])
+         for tool in tools {
+             let schema = try XCTUnwrap(tool["inputSchema"] as? [String: Any])
+             let properties = try XCTUnwrap(schema["properties"] as? [String: Any])
+@@ -294,9 +307,10 @@ final class MCPKeyboardAliasTests: XCTestCase {
+             XCTAssertFalse((schema["required"] as? [String] ?? []).contains("include_image"))
+         }
+         let cases: [(String, [String: Any])] = [
+-            ("tap", ["frame_id": fixtureFrameID, "x": 1, "y": 2]), ("long_press", ["frame_id": fixtureFrameID, "x": 1, "y": 2]),
+-            ("swipe", ["frame_id": fixtureFrameID, "points": [["x": 0, "y": 0], ["x": 1, "y": 1]]]),
+-            ("type_text", ["text": "nihao"]), ("press_key", ["key": "enter"]), ("home", [:]),
++            ("act", ["steps": [["type": "tap", "frame_id": fixtureFrameID, "x": 1, "y": 2]]]),
++            ("act", ["steps": [["type": "swipe", "frame_id": fixtureFrameID,
++                                "points": [["x": 0, "y": 0], ["x": 1, "y": 1]]]]]),
++            ("act", ["steps": [["type": "type", "text": "nihao"], ["type": "key", "key": "enter"], ["type": "home"]]]),
+             ("ocr_screen", [:]),
+         ]
+         for (name, parameters) in cases {
+@@ -312,95 +326,85 @@ final class MCPKeyboardAliasTests: XCTestCase {
+         }
+     }
+ 
+-    func testSequenceAliasesAndAllDelayForms() throws {
++    func testActPreservesOrderedKeyboardStepsAndCanonicalDelays() throws {
+         let steps: [[String: Any]] = [
+-            ["type": "text", "text": "nihao", "clear_before": true, "commit_ime": true, "press_enter": true],
++            ["type": "type", "text": "nihao", "clear_before": true, "commit_ime": true, "press_enter": true],
+             ["type": "key", "key": "tab", "modifiers": ["shift"]],
+-            ["delay": 0], ["wait": 5], ["type": "delay", "seconds": 0.25], ["type": "wait", "seconds": 1],
++            ["type": "delay", "seconds": 0], ["type": "delay", "seconds": 6],
++            ["type": "delay", "seconds": 0.25], ["type": "delay", "seconds": 1],
+         ]
+-        let actions = try MCPKeyboardSequence.actions(arguments: ["actions": steps, "device_id": "phone"])
+-        let requests = actions.compactMap { action -> MCPToolRequest? in
+-            if case .request(let request) = action { return request }
+-            return nil
+-        }
+-        XCTAssertEqual(requests.map(\.path), ["/type", "/key"])
+-        XCTAssertEqual(requests.compactMap { $0.body["key"] as? String }, ["tab"])
+-        XCTAssertEqual(requests[0].body["clear_before"] as? Bool, true)
+-        XCTAssertEqual(requests[0].body["commit_ime"] as? Bool, true)
+-        XCTAssertEqual(requests[0].body["press_enter"] as? Bool, true)
+-        let delays = actions.compactMap { action -> Double? in
+-            if case .delay(let seconds) = action { return seconds }
+-            return nil
+-        }
+-        XCTAssertEqual(delays, [0, 5, 0.25, 1])
+-        XCTAssertEqual(try MCPKeyboardSequence.actions(arguments: ["steps": steps, "actions": steps]).count, 6)
+-        XCTAssertThrowsError(try MCPKeyboardSequence.actions(arguments: ["steps": steps, "actions": [["wait": 0]]]))
++        let request = try actRequest(steps, device: "phone")
++        XCTAssertEqual(request.path, "/act")
++        XCTAssertEqual(request.body["device"] as? String, "phone")
++        let actual = try XCTUnwrap(request.body["steps"] as? [[String: Any]])
++        XCTAssertTrue(NSDictionary(dictionary: ["steps": actual]).isEqual(to: ["steps": steps]))
++        XCTAssertEqual(actual.compactMap { $0["type"] as? String }, ["type", "key", "delay", "delay", "delay", "delay"])
++        XCTAssertEqual(actual.dropFirst(2).compactMap { ($0["seconds"] as? NSNumber)?.doubleValue }, [0, 6, 0.25, 1])
++        XCTAssertThrowsError(try MCPToolRequest.action(named: "act", arguments: ["actions": steps], longEdge: 1000))
++        XCTAssertThrowsError(try MCPToolRequest.action(named: "act", arguments: ["steps": steps, "actions": steps], longEdge: 1000))
+     }
+ 
+-    func testChineseSequenceForwardsTextAndIMEOption() throws {
+-        let actions = try MCPKeyboardSequence.actions(arguments: [
+-            "steps": [
+-                ["text": "蓝牙", "ensure_chinese_ime": false]
+-            ]
+-        ])
+-        guard case .request(let request) = try XCTUnwrap(actions.first) else { return XCTFail("expected request") }
+-        XCTAssertEqual(request.path, "/type")
+-        XCTAssertEqual(request.body["text"] as? String, "蓝牙")
+-        XCTAssertEqual(request.body["ensure_chinese_ime"] as? Bool, false)
+-        XCTAssertEqual(try TypeTextRequest(request.body).actions.first?.body["text"] as? String, "蓝牙")
++    func testActChineseTextForwardsIMEOptionToTheLeaf() throws {
++        let request = try actRequest([["type": "type", "text": "蓝牙", "ensure_chinese_ime": false]])
++        let step = try firstActionStep(request)
++        XCTAssertEqual(step["text"] as? String, "蓝牙")
++        XCTAssertEqual(step["ensure_chinese_ime"] as? Bool, false)
++        XCTAssertEqual(try TypeTextRequest(step).actions.first?.body["text"] as? String, "蓝牙")
+     }
+ 
+-    func testTextSequenceKeepsClipboardPreflightBeforeClearAndPreservesExplicitHID() throws {
++    func testActKeepsClipboardClearAndSubmitOptionsInOneTypeStep() throws {
+         for flag in [true, false] {
+-            let actions = try MCPKeyboardSequence.actions(arguments: [
+-                "steps": [["text": "literal", "use_clipboard": flag, "clear_before": true, "press_enter": true]]
++            let request = try actRequest([
++                ["type": "type", "text": "literal", "use_clipboard": flag, "clear_before": true, "press_enter": true]
+             ])
+-            XCTAssertEqual(actions.count, 1)
+-            guard case .request(let request) = actions[0] else { return XCTFail("expected request") }
+-            XCTAssertEqual(request.path, "/type")
+-            XCTAssertEqual(request.body["use_clipboard"] as? Bool, flag)
+-            XCTAssertEqual(request.body["clear_before"] as? Bool, true)
+-            XCTAssertEqual(request.body["press_enter"] as? Bool, true)
++            XCTAssertEqual((request.body["steps"] as? [[String: Any]])?.count, 1)
++            let step = try firstActionStep(request)
++            XCTAssertEqual(step["use_clipboard"] as? Bool, flag)
++            XCTAssertEqual(step["clear_before"] as? Bool, true)
++            XCTAssertEqual(step["press_enter"] as? Bool, true)
+         }
+     }
+ 
+-    func testInvalidSequenceFormsAreRejectedBeforeExecution() {
++    func testInvalidKeyboardAndDelayStepsAreRejectedBeforeReturningABatch() {
+         let invalid: [[String: Any]] = [
+             ["type": "key", "text": "x"], ["type": "text", "key": "enter"],
+             ["type": 1, "text": "x"], ["delay": 1, "wait": 1], ["seconds": 1],
+             ["type": "delay", "seconds": 1, "text": "x"],
+-            ["text": "x", "clear_before": 1], ["key": "enter", "commit_ime": true],
++            ["type": "type", "text": "x", "clear_before": 1],
++            ["type": "key", "key": "enter", "commit_ime": true],
++            ["type": "key", "key": "unknown-key"], ["type": "key", "key": "enter", "modifiers": "shift"],
++            ["type": "key", "key": "enter", "modifiers": ["unknown-modifier"]],
++            ["type": "type", "text": "x", "device": "other"],
++            ["type": "type", "text": "x", "device_id": "other"],
+         ]
+         for step in invalid {
+-            XCTAssertThrowsError(try MCPKeyboardSequence.actions(arguments: ["actions": [["text": "ok"], step]]))
++            XCTAssertThrowsError(try actRequest([["type": "type", "text": "ok"], step]))
+         }
+-        for value: Any in [true, false, -0.1, 5.1, Double.nan, Double.infinity, "1", NSNull()] {
+-            for step: [String: Any] in [["delay": value], ["wait": value], ["type": "wait", "seconds": value]] {
+-                XCTAssertThrowsError(try MCPKeyboardSequence.actions(arguments: ["steps": [step]]))
+-            }
++        for value: Any in [true, false, -0.1, 6.1, Double.nan, Double.infinity, "1", NSNull()] {
++            XCTAssertThrowsError(try actRequest([["type": "delay", "seconds": value]]))
++        }
++        for step: [String: Any] in [["delay": 0], ["wait": 0], ["type": "wait", "seconds": 0], ["type": "delay"]] {
++            XCTAssertThrowsError(try actRequest([step]))
+         }
+         for arguments: [String: Any] in [
+-            [:], ["actions": []], ["actions": [["wait": 0]], "device_id": 1],
+-            ["steps": [["text": "ok"]], "actions": "invalid"],
+-            ["actions": [["wait": 0]], "include_image": 1],
++            [:], ["steps": []], ["steps": "invalid"], ["actions": [["type": "delay", "seconds": 0]]],
++            ["steps": Array(repeating: ["type": "home"], count: 17)],
+         ] {
+-            XCTAssertThrowsError(try MCPKeyboardSequence.actions(arguments: arguments))
++            XCTAssertThrowsError(try MCPToolRequest.action(named: "act", arguments: arguments, longEdge: 1000))
+         }
+     }
+ 
+-    func testTypeTextForwardsStrictBooleanOptions() throws {
+-        let arguments: [String: Any] = [
+-            "text": "nihao", "clear_before": true, "commit_ime": true, "press_enter": false,
+-            "ensure_chinese_ime": true, "device_id": "phone",
++    func testActTypeForwardsStrictBooleanOptions() throws {
++        let input: [String: Any] = [
++            "type": "type", "text": "nihao", "clear_before": true, "commit_ime": true, "press_enter": false,
++            "ensure_chinese_ime": true, "use_clipboard": false,
+         ]
+-        let request = try XCTUnwrap(MCPToolRequest.action(named: "type_text", arguments: arguments, longEdge: 1200))
++        let request = try actRequest([input], device: "phone", longEdge: 1200)
+         XCTAssertEqual(request.body["device"] as? String, "phone")
+-        for option in MCPKeyboardSequence.textOptions {
+-            XCTAssertEqual(try firstActionStep(request)[option] as? Bool, arguments[option] as? Bool)
++        for option in TextEntry.textOptions {
++            XCTAssertEqual(try firstActionStep(request)[option] as? Bool, input[option] as? Bool)
+             for invalid: Any in [0, 1, "true", NSNull()] {
+-                XCTAssertThrowsError(
+-                    try MCPToolRequest.action(
+-                        named: "type_text", arguments: ["text": "x", option: invalid], longEdge: 1200))
++                XCTAssertThrowsError(try actRequest([["type": "type", "text": "x", option: invalid]], longEdge: 1200))
+             }
+         }
+     }
+diff --git a/docs/architecture.md b/docs/architecture.md
+index 39baaf2..81e5b8c 100644
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -13,7 +13,7 @@
+ | `Bluetooth/` | `HIDPeripheral.swift` 管理 GATT；`HIDConnectionState.swift` 管理连接和背压；`HIDReports.swift` 定义描述符与报告字节 |
+ | `Input/` | `DeviceInput.swift` 管理每台手机的输入队列；`KeyboardMap.swift` 定义键盘映射；`RelativePointerCalibration.swift` 定义模型和位移算法，`+Storage.swift` 处理文件兼容与迁移 |
+ | `API/` | `HTTPServer.swift` 包含传输及请求/响应编解码；`ControlAPI.swift` 包含路由与坐标换算；`WebPreview.swift` 提供 `/viewer` 只读实时预览页，供 Codex 右侧浏览器显示 |
+-| `MCP/` | `MCPServer.swift` 包含 JSON-RPC 分派和私有 HTTP 客户端；`MCPTools.swift` 定义工具目录与参数映射；`MCPKeyboardSequence.swift` 校验键盘组合；`MCPAccess.swift` 协调不同 stdio 进程的设备访问和主程序恢复 |
++| `MCP/` | `MCPServer.swift` 包含 JSON-RPC 分派和私有 HTTP 客户端；`MCPTools.swift` 定义工具目录与参数映射；`ActRequest` 校验唯一输入批次；`MCPAccess.swift` 协调不同 stdio 进程的设备访问和主程序恢复 |
+ | `Localization/` | `AppLanguage.swift` 定义语言枚举与线程安全的当前语言存储（UserDefaults 持久化 + 变更通知）；`StringsUI` / `StringsAPI` / `StringsWeb` / `StringsMCP` 四个表以存储属性同时给出中英文文案，编译期保证两语言键一致 |
+ 
+ 以上目录位于 `Sources/iPhoneUse/`。`scripts/calibrate-pointer.py` 负责通过 Safari 测量指针曲线。
+@@ -52,14 +52,16 @@ USB-only 是上述蓝牙兼容窗口规则的例外：当 Bluetooth lifecycle 
+ - **锁屏观察队列**以 utility 优先级每约 2 秒使用原生 Vision 识别已有帧，不在采集回调或窗口渲染中执行 OCR。结果按物理手机和采集实例隔离，连续两次识别才显示锁屏提示；超过 5 秒无新帧单独提示画面暂停。窗口读取短时缓存，提示不参与蓝牙、输入或校准的可用性判断。
+ - **MCP 跨进程锁**先按端口持有服务共享锁，再按完整设备 ID 持有排他锁，覆盖动作、等待和结果截图；不同手机使用不同锁。恢复脚本持有同一服务文件的排他锁，不能在 MCP 调用期间重启主程序。锁文件不能删除，以免并发进程锁住不同 inode。此协调限于 MCP 客户端，不隔离两次工具调用之间的页面状态或 HTTP/手动输入。
+ 
+-`codex/skills/iphone-use/scripts/mcp_call.py` 在原生工具未加载或传输关闭时，通过仓库启动器新建独立 MCP 连接。每次调用严格先握手再执行工具，截图落盘为唯一文件；出错不重放动作，也不终止其他 MCP 进程。`ensure_service.py` 只处理 GUI/设备恢复，复用健康服务，不为缺失的单台手机重启仍能操作其他手机的共享主程序。
++`codex/skills/iphone-use/scripts/mcp_call.py` 在原生工具未加载或传输关闭时，通过集成仓库的 `ios/phone.mjs mcp` 新建独立连接，只接受当前七工具。每次调用先握手再执行工具，截图落盘为唯一文件；出错不重放动作，也不终止其他 MCP 进程。`ensure_service.py` 只委托同一管理启动器的 `start`，不能直接重启宿主、选择其他手机或启动备用传输。
+ 
+ ## 保持现有行为时需要核对的边界
+ 
+ 1. HTTP 返回字段、错误文案、状态码、默认参数和校验先后顺序都属于接口行为。错误文案会随界面语言本地化，但字段结构、状态码与校验顺序不变。坐标支持完整屏幕尺寸、缩放截图尺寸以及 fraction；显式 width/height 的覆盖顺序必须保留。
+-   `swipe` 的 HTTP/MCP 参数统一为至少两个 `{x, y}` 对象的 `points` 数组与可选 `duration`（默认 0.3 秒）。`SwipeRequest` 在发送输入前校验整条路径，并用同一画面尺寸转换所有点；底层在一次串行手势中按下、经过全部点、释放，段间不能松手。分段移动等待时长按屏幕像素距离分配，总和为 duration，额外准备、释放及校准耗时不计入该值。
+-2. MCP 动作后默认最多观察 1.5 秒，画面变化且稳定时可提前返回；观察不等同于应用完成。`keyboard_sequence` 在任何 HTTP 请求前校验全部步骤，整组持有设备锁，步骤间等待 0.15 秒，只在最后截图；任一步失败即停止且不重放。组合不改动底层 HID 报告间隔，不能替代网页加载检查。工具目录、参数映射、截图尺寸说明及错误封装都需要兼容现有客户端。
+-   MCP 指针定位/修正工具已移除；公共目录保留 16 个工具。配置直接 USB 触控时，使用 frame ID 的 tap/long_press/swipe 与 touch_sequence 是日常触控入口。底层 `/move`、`/nudge` 与 GUI 仍服务于悬停和 BLE 诊断；键盘、Home 与未绑定坐标仍有独立 BLE 消费者。
++   原生内部 `SwipeRequest` 仍校验完整路径并转换坐标。MCP 输入只使用 `act.steps`：`swipe` 步骤提供 `frame_id`、至少两个截图像素 `{x,y}` 点及可选 `duration`（默认 0.3 秒）。USB 计划全程维持接触，结束时全部抬起；不得用旧指针报告测试来认定 MCP 的传输行为。
++2. MCP 目录与可调用工具严格一致：`session_context`、`list_devices`、`screenshot`、`screenshot_burst`、`accessibility_tree`、`ocr_screen`、`act`。旧 `tap/long_press/swipe/touch_sequence/type_text/press_key/home/keyboard_sequence/tap_text` 工具及其兼容执行器已删除，所有模式都在设备访问前拒绝这些名称。
++   `act` 只发送一个经过完整预校验的 HTTP batch；最多一个触控步骤且必须第一步，键盘、Home 和等待作为后续步骤。每批持有设备锁，但调用之间没有任务所有权。失败保存已执行前缀，不重放。动作后默认最多观察 1.5 秒，画面变化且稳定时可提前返回；`include_image=false` 只控制返回图片，`observe=none` 才关闭观察。
++   当前用户入口只走管理启动器的 USB 路径。原生 GUI/驱动中的内部 leaf 或指针功能不是备用 MCP 接口，保留有实际驱动消费者的代码不表示重新开放旧工具。
++   **迁移陷阱：** 历史补丁与旧测试可能描述已退役接口。以完整补丁合成后的目录、当前调用者和协议测试为准；不得为了通过旧断言而恢复无消费者的接口。集成仓库 `check-native-input.mjs` 替换原生测试目录，仅运行选定 overlay；其通过不证明完整 XCTest 可编译或通过。当前完整 `swift test` 和 overlay 都须检查。旧 journal 的 Codable 字段保留读取，不代表旧工具仍可执行。
+ 3. GATT 服务/特征的发布顺序、UUID、权限、描述符及 HID 字节布局涉及手机端缓存，不能当作普通内部实现任意调整。
+ 4. 蓝牙背压只能合并相邻、同设备、同按钮状态的绝对位置报告；按键、按钮变化和相对位移必须按顺序发送。
+ 5. 拖拽期间，针对同一手机的 API 坐标手势返回冲突，其他设备的输入不受影响。失焦、释放、取消、窗口关闭和设备重连时，要保留原有的按钮释放及位置失效顺序；不得释放其他窗口对应设备的按钮。

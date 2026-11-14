@@ -8,4 +8,4 @@ description = "Literal synthetic marker in a native session-journal regression f
 condition = "AND"
 regexTarget = "secret"
 regexes = ['''^private-marker-9371$''']
-paths = ['''(^|/)ios/patches/0005-session-context\.patch$''']
+paths = ['''(^|/)ios/patches/(0005-session-context|0040-remove-unused-mcp-compatibility)\.patch$''']
