@@ -34,30 +34,40 @@ export function observePhone(adb: AdbClient, ui: UiInspector, device: string, ev
   screenshot: boolean, privateText: boolean, suppliedElements?: any[] | null, onScreenshot?: (png: Buffer) => void,
   store?: ImageStore, guard: () => void = () => requireAwake(adb, device), retainText = false): any {
   return withDeadline(10000, () => {
-    const observation: any = { at: new Date().toISOString(), errors: [] };
+    const start = performance.now();
+    const timing: any = { clock: "host_monotonic_ms", uiSource: suppliedElements === null ? "unavailable" : suppliedElements ? "supplied" : "fresh" };
+    const timed = <T>(name: string, operation: () => T): T => {
+      const before = performance.now();
+      try { return operation(); } finally { timing[name] = performance.now() - before; }
+    };
+    const observation: any = { at: new Date().toISOString(), errors: [], timing, uiCapture: { backend: "uiautomator" } };
     try { guard(); } catch {
       return { ...observation, uiOmitted: "UI policy or lock state changed", screenshotOmitted: "UI policy or lock state changed" };
     }
     let elements: any[] | undefined;
     try {
-      observation.foregroundApp = adb.getCurrentApp(device);
+      observation.foregroundApp = timed("foregroundMs", () => adb.getCurrentApp(device));
       if (suppliedElements === null) throw new Error();
-      elements = suppliedElements || ui.getElements(device);
+      elements = timed("uiMs", () => suppliedElements || ui.getElements(device));
+      observation.uiCapture = suppliedElements ? { backend: "supplied", source: "same-call upstream UI" }
+        : ui.getLastCaptureInfo?.() ?? { backend: "unreported" };
       guard();
       observation.passwordInputVisible = elements.some(e => e.password);
       observation.elements = !privateText && retainText ? elements.filter(e => !e.editable)
         : "[observation text retention disabled]";
-    } catch { elements = undefined; observation.errors.push("UI text unavailable; no image permitted"); }
+    } catch { elements = undefined; observation.uiCapture = { backend: "unreported" }; observation.errors.push("UI text unavailable; no image permitted"); }
     if (screenshot && !privateText && elements && !observation.passwordInputVisible) {
       try {
         guard();
         const captureStartedAt = new Date().toISOString();
-        const png = requirePng(adb.adb(device, "exec-out", "screencap", "-p"));
+        const png = timed("screenshotCaptureAndVerifyMs", () => requirePng(adb.adb(device, "exec-out", "screencap", "-p")));
         const captureFinishedAt = new Date().toISOString();
         guard();
         if (!store) throw new Error();
-        observation.screenshot = { ...store.save(eventId, png), captureStartedAt, captureFinishedAt, returnedInline: !!onScreenshot };
-        onScreenshot?.(png);
+        timed("screenshotArchiveAndAttachMs", () => {
+          observation.screenshot = { ...store.save(eventId, png), captureStartedAt, captureFinishedAt, returnedInline: !!onScreenshot };
+          onScreenshot?.(png);
+        });
       } catch {
         observation.errors.push("Post-action screenshot could not be saved or verified; action receipt retained");
         observation.screenshotOmitted = "capture or storage unavailable";
@@ -65,6 +75,7 @@ export function observePhone(adb: AdbClient, ui: UiInspector, device: string, ev
     } else if (screenshot) {
       observation.screenshotOmitted = privateText ? "private call" : observation.passwordInputVisible ? "password input visible" : "UI privacy state unavailable";
     }
+    timing.totalMs = performance.now() - start;
     return observation;
   });
 }

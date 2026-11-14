@@ -29,3 +29,9 @@ by an earlier ephemeral identity. Do not publish it or treat it as a release.
 
 The script never invokes ADB, enumerates devices or installs an APK. Installation
 and device acceptance need their own owner-authorized check.
+
+The public companion also includes `UiSnapshotInstrumentation`, a one-shot
+read-only active-root snapshot for explicitly configured `uiSnapshotApps`.
+It retains the non-debuggable release manifest and existing signing rules.
+No idle-screen guarantee, persistent accessibility service or private-development
+helper version is implied. See [dynamic native pages](SHORT-DELEGATION.md#dynamic-native-pages).

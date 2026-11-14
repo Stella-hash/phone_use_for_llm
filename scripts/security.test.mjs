@@ -127,7 +127,7 @@ test('authentication, field/body/batch caps and legacy filtering reject requests
   for (const body of [JSON.stringify([{ jsonrpc: '2.0', id: 1, method: 'tools/list' }]), JSON.stringify({ text: 'x'.repeat(65536) })])
     assert.equal((await fetch(f.endpoint + '/mcp', { method: 'POST', headers, body })).status, 413);
   const catalog = (await f.client.listTools()).tools;
-  assert.equal(catalog.length, 31);
+  assert.equal(catalog.length, 36);
   for (const name of expertGrantableTools) assert.match(catalog.find(tool => tool.name === name)?.description || '', /explicit (?:local owner|app) grant/);
   for (const name of ['android_press_key', 'android_device_info']) assert.match(catalog.find(tool => tool.name === name).description, /cannot be pregranted/);
   const clipCapture = catalog.find(tool => tool.name === 'android_capture_clip');

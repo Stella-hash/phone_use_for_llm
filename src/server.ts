@@ -40,14 +40,14 @@ const validateOutputPath = (filePath: string): void => {
 	}
 };
 
-export const createServer = (): McpServer => {
+export const createServer = (options: { uiSnapshotApps?: string[] } = {}): McpServer => {
 	const server = new McpServer({
 		name: "android-mcp",
 		version: SERVER_VERSION,
 	});
 
 	const adb = new AdbClient();
-	const ui = new UiInspector(adb);
+	const ui = new UiInspector(adb, 2, 8000, options.uiSnapshotApps);
 	const activeRecordings = new Map<string, ActiveRecording>();
 
 	type ZodShape = Record<string, z.ZodType>;
@@ -350,6 +350,7 @@ export const createServer = (): McpServer => {
 				clickable: el.clickable,
 				editable: el.editable,
 				password: el.password,
+				webView: el.webView,
 				coordinates: {
 					x: el.rect.x + Math.floor(el.rect.width / 2),
 					y: el.rect.y + Math.floor(el.rect.height / 2),

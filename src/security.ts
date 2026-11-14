@@ -5,6 +5,7 @@ import { isIP } from "node:net";
 import { z } from "zod";
 import { privateDirectory, readPrivate, writePrivate } from "./private-files.js";
 import { strictJson } from "./json.js";
+import { delegationNames } from "./delegation-tools.js";
 import { DEFAULT_KEEPSAKE_BYTES, DEFAULT_KEEPSAKE_COUNT } from "./keepsakes.js";
 import { canonical, canonicalArguments, gameGrantableTools, expertGrantableTools, passiveTools, readTools, isInputOperation, isPowerKey } from "./operation.js";
 export { canonical, touchTools, passiveTools, readTools } from "./operation.js";
@@ -23,7 +24,13 @@ const configSchema = z.object({
   allowedDomains: z.array(z.string().max(253).regex(/^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,63}$/)).max(64).default([]),
   browserPackage: z.literal("com.android.chrome").default("com.android.chrome"),
   retainObservationText: z.boolean().default(false),
+  uiSnapshotApps: z.array(packageName).max(16).default([]),
   allowModelSummary: z.boolean().default(false),
+  delegation: z.object({ enabled: z.boolean().default(false), acceptsModelEgress: z.boolean().default(false),
+    allowImages: z.boolean().default(false), keyFile: z.string().max(1024).refine(p => path.isAbsolute(p)).optional(),
+    model: z.string().min(1).max(120).regex(/^[A-Za-z0-9][A-Za-z0-9._:-]*$/).optional(),
+    reasoningEffort: z.enum(["none", "minimal", "low", "medium", "high", "xhigh"]).optional(),
+  }).strict().prefault({}),
   screenshotKeepsakes: z.object({ enabled: z.boolean().default(false),
     maxBytes: z.number().int().min(1).max(16 * 1024 * 1024 * 1024).default(DEFAULT_KEEPSAKE_BYTES),
     maxCount: z.number().int().min(1).max(10000).default(DEFAULT_KEEPSAKE_COUNT),
@@ -74,6 +81,7 @@ export class OwnerSecurity {
       this.approvalKey = createPublicKey(this.config.approvalPublicKey);
       if (this.approvalKey.asymmetricKeyType !== "ed25519") throw new Error();
       const clips = this.config.shortClips;
+      if (this.config.uiSnapshotApps.some(pkg => !this.config.allowedApps.includes(pkg))) throw new Error();
       if (clips.allowedApps.some(pkg => !this.config.allowedApps.includes(pkg) || pkg === this.config.browserPackage)) throw new Error();
       if (clips.enabled && (!clips.acceptsTransientScreenContent || !clips.recorderPath || !path.isAbsolute(clips.recorderPath))) throw new Error();
       for (const grant of this.config.gameGrants) {
@@ -106,6 +114,17 @@ export class OwnerSecurity {
     return url.href;
   }
   authorize(name: string, args: Record<string, unknown>) {
+    if (delegationNames.has(name)) {
+      if (name === "android_delegate_status") {
+        if (args.requestId !== undefined) deny("REQUEST_ID_INPUT_ONLY");
+        return;
+      }
+      if (typeof args.requestId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/.test(args.requestId)) deny("REQUEST_ID_REQUIRED");
+      if (name === "android_delegate_stop") return;
+      if ((args.context as any)?.private === true) deny("PRIVATE_CALL_CANNOT_DELEGATE");
+      if (!this.config.delegation.enabled || !this.config.delegation.acceptsModelEgress || !this.config.retainObservationText) deny("DELEGATION_DISABLED_OR_CONSENT_MISSING");
+      return; // Host lifecycle only. Each inner phone call needs ordinary authorization.
+    }
     if (["android_capture_clip", "android_clip_open", "android_clip_keep"].includes(name)) {
       const clips = this.config.shortClips;
       if (!clips.enabled) deny("CLIPS_DISABLED");

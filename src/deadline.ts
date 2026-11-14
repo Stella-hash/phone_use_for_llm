@@ -2,6 +2,8 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { performance } from "node:perf_hooks";
 
 const deadlines = new AsyncLocalStorage<number>();
+/** A finite background job has its own budget, not the start RPC's deadline. */
+export const withoutDeadline = <T>(run: () => T): T => deadlines.exit(run);
 
 export class DeadlineExceeded extends Error {
   constructor() {

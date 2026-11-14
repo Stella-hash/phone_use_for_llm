@@ -1,6 +1,6 @@
 {
   "name": "phone-use",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "description": "Owner-authenticated Android MCP with bounded observations and durable action receipts",
   "type": "module",
   "main": "dist/phone.js",
@@ -33,7 +33,9 @@
     "modelcontextprotocol"
   ],
   "author": "Stella-hash and contributors (https://github.com/Stella-hash)",
-  "contributors": ["Alvin Ahmad (upstream; https://github.com/qalvinahmad)"],
+  "contributors": [
+    "Alvin Ahmad (upstream; https://github.com/qalvinahmad)"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -45,7 +47,7 @@
   "homepage": "https://github.com/Stella-hash/phone_use_for_llm",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",
-    "fast-xml-parser": "^5.11.2",
+    "fast-xml-parser": "^5.12.0",
     "pngjs": "7.0.0",
     "zod": "^4.6.7"
   },
