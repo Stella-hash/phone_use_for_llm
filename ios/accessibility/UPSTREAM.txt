@@ -1,0 +1,11 @@
+Native iPhone accessibility codec provenance
+
+Codec: https://github.com/ipbtools/ipb/blob/8c227a10710dad479852aa0203de729fed57471b/Sources/ax_archive.py
+Protocol reference: https://github.com/ipbtools/ipb/blob/8c227a10710dad479852aa0203de729fed57471b/docs/protocol.md
+License: MIT, Copyright (c) 2026 Borealin and ipbtools contributors; see LICENSE.ipb.
+Local codec modification: retain application/snapshot/point reads only; remove action arguments.
+
+The surrounding reader, snapshot archive and reading projection are integration
+code. They use the separately installed pymobiledevice3==11.50.0 USB transport,
+licensed GPL-3.0-or-later; see ../THIRD_PARTY_NOTICES.md. Source tests and fixtures
+in this distribution are synthetic. No device captures are included.

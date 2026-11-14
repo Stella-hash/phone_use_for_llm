@@ -1,0 +1,638 @@
+diff --git a/Sources/iPhoneUse/MCP/MCPScreenshotBurst.swift b/Sources/iPhoneUse/MCP/MCPScreenshotBurst.swift
+new file mode 100644
+index 0000000..cf36022
+--- /dev/null
++++ b/Sources/iPhoneUse/MCP/MCPScreenshotBurst.swift
+@@ -0,0 +1,163 @@
++import CoreFoundation
++import Foundation
++
++/// A short observation sequence, not a video stream or an input loop. The
++/// existing capture identity distinguishes new samples even when pixels match.
++enum MCPScreenshotBurst {
++    static let samplingBudget: TimeInterval = 6
++    static let imageByteBudget = 8 * 1024 * 1024
++
++    struct Options {
++        let frames: Int
++        let intervalMilliseconds: Int
++        var interval: TimeInterval { Double(intervalMilliseconds) / 1000 }
++
++        init(_ arguments: [String: Any]) throws {
++            guard Set(arguments.keys).isSubset(of: ["device", "device_id", "include_image", "frames", "interval_ms"]),
++                arguments["device"] == nil || arguments["device"] is String,
++                arguments["device_id"] == nil || arguments["device_id"] is String
++            else { throw MCPServer.MCPError("Invalid screenshot_burst arguments") }
++            frames = try Self.integer(arguments["frames"], fallback: 3, range: 2...6, name: "frames")
++            intervalMilliseconds = try Self.integer(
++                arguments["interval_ms"], fallback: 300, range: 100...1000, name: "interval_ms")
++        }
++
++        private static func integer(_ raw: Any?, fallback: Int, range: ClosedRange<Int>, name: String) throws -> Int {
++            guard let raw else { return fallback }
++            guard let value = raw as? NSNumber, CFGetTypeID(value) != CFBooleanGetTypeID(),
++                value.doubleValue.isFinite, value.doubleValue.rounded() == value.doubleValue,
++                (Double(range.lowerBound)...Double(range.upperBound)).contains(value.doubleValue)
++            else { throw MCPServer.MCPError("\(name) must be an integer in \(range.lowerBound)...\(range.upperBound)") }
++            return value.intValue
++        }
++    }
++
++    struct Sample {
++        let frame: MCPServer.ObservationFrame
++        let returnedAfter: TimeInterval
++    }
++
++    struct Result {
++        let options: Options
++        let startedAt: TimeInterval
++        var samples: [Sample] = []
++        var elapsed: TimeInterval = 0
++        var discardedSamples = 0
++        var reason: String?
++        var detail: String?
++        var complete: Bool { samples.count == options.frames }
++
++        var json: [String: Any] {
++            var previous: MCPServer.FrameIdentity?
++            let frames: [[String: Any]] = samples.enumerated().map { index, sample in
++                // Only frames with validated capture metadata enter samples.
++                let identity = sample.frame.identity!
++                var frame = identity.json
++                frame["index"] = index + 1
++                frame["width"] = Int(sample.frame.width)
++                frame["height"] = Int(sample.frame.height)
++                frame["captured_after_start_ms"] = Int(((identity.receivedAt - startedAt) * 1000).rounded())
++                frame["returned_after_start_ms"] = Int((sample.returnedAfter * 1000).rounded())
++                if let previous {
++                    frame["capture_gap_ms"] = Int(((identity.receivedAt - previous.receivedAt) * 1000).rounded())
++                }
++                previous = identity
++                return frame
++            }
++            var result: [String: Any] = [
++                "status": complete ? "complete" : samples.isEmpty ? "unavailable" : "partial",
++                "requested_frames": options.frames, "returned_frames": samples.count,
++                "requested_interval_ms": options.intervalMilliseconds,
++                "sampling_budget_ms": Int(MCPScreenshotBurst.samplingBudget * 1000),
++                "image_byte_budget": MCPScreenshotBurst.imageByteBudget,
++                "elapsed_ms": Int((elapsed * 1000).rounded()),
++                "discarded_stale_samples": discardedSamples,
++                "frames": frames,
++            ]
++            if let reason { result["reason"] = reason }
++            if let detail { result["detail"] = detail }
++            return result
++        }
++    }
++
++    static func collect(
++        options: Options, device: String,
++        sleep: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) },
++        now: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
++        frame: (TimeInterval) throws -> MCPServer.ObservationFrame
++    ) -> Result {
++        let start = now()
++        var result = Result(options: options, startedAt: start)
++        var nextRead: TimeInterval = 0
++        var bytes = 0
++        while !result.complete, result.elapsed < samplingBudget {
++            if result.elapsed < nextRead {
++                let delay = min(nextRead - result.elapsed, samplingBudget - result.elapsed)
++                sleep(delay)
++                result.elapsed = max(result.elapsed + delay, now() - start)
++            }
++            guard result.elapsed < samplingBudget else { break }
++            let current: MCPServer.ObservationFrame
++            do { current = try frame(samplingBudget - result.elapsed) }
++            catch {
++                result.reason = "capture_unavailable"
++                result.detail = String(decoding: String(describing: error).utf8.prefix(512), as: UTF8.self)
++                result.elapsed = max(result.elapsed, now() - start)
++                break
++            }
++            result.elapsed = max(result.elapsed, now() - start)
++            guard result.elapsed < samplingBudget else { break }
++            guard current.device.caseInsensitiveCompare(device) == .orderedSame else {
++                result.reason = "capture_device_mismatch"; break
++            }
++            guard let identity = current.identity else { result.reason = "missing_frame_metadata"; break }
++            guard identity.receivedAt <= start + result.elapsed + 0.001 else {
++                result.reason = "invalid_frame_timestamp"; break
++            }
++            guard !current.image.isEmpty, !current.signature.isEmpty,
++                ["image/png", "image/jpeg"].contains(current.mimeType),
++                let width = Int(current.width), let height = Int(current.height),
++                (1...MCPServer.longEdge).contains(width), (1...MCPServer.longEdge).contains(height)
++            else { result.reason = "invalid_frame"; break }
++            guard identity.receivedAt > start, identity.isNewer(than: result.samples.last?.frame.identity) else {
++                result.discardedSamples += 1
++                nextRead = result.elapsed + 0.05
++                continue
++            }
++            guard current.image.count <= imageByteBudget - bytes else {
++                result.reason = "image_byte_budget"; break
++            }
++            bytes += current.image.count
++            result.samples.append(Sample(frame: current, returnedAfter: result.elapsed))
++            // Delay from the completed fetch, without catch-up bursts after a
++            // slow response. Actual capture gaps remain explicit in the result.
++            nextRead = result.elapsed + options.interval
++        }
++        if !result.complete, result.reason == nil { result.reason = "sampling_deadline" }
++        return result
++    }
++
++    static func content(_ burst: Result, device: String, includeImage: Bool) -> [String: Any] {
++        let metadata: [String: Any] = ["device": device, "burst": burst.json]
++        let encoded = try? JSONSerialization.data(withJSONObject: metadata, options: [.sortedKeys])
++        var content: [[String: Any]] = [[
++            "type": "text", "text": encoded.map { String(decoding: $0, as: UTF8.self) } ?? "Burst metadata unavailable",
++        ]]
++        for (index, sample) in burst.samples.enumerated() {
++            let offset = Int(((sample.frame.identity!.receivedAt - burst.startedAt) * 1000).rounded())
++            content.append([
++                "type": "text",
++                "text": "Frame \(index + 1)/\(burst.samples.count), capture +\(offset) ms, "
++                    + "\(sample.frame.width)×\(sample.frame.height) pixels.",
++            ])
++            if includeImage {
++                content.append([
++                    "type": "image", "data": sample.frame.image.base64EncodedString(), "mimeType": sample.frame.mimeType,
++                ])
++            }
++        }
++        var result: [String: Any] = ["content": content, "structuredContent": metadata]
++        if !burst.complete { result["isError"] = true }
++        return result
++    }
++}
+diff --git a/Sources/iPhoneUse/MCP/MCPServer.swift b/Sources/iPhoneUse/MCP/MCPServer.swift
+index eb2a6b4..94ca01a 100644
+--- a/Sources/iPhoneUse/MCP/MCPServer.swift
++++ b/Sources/iPhoneUse/MCP/MCPServer.swift
+@@ -114,6 +114,7 @@ enum MCPServer {
+         do {
+             if name == "session_context" { return try sessionContext(arguments) }
+             if name == "accessibility_tree" { return try accessibilityTree(arguments) }
++            let burstOptions = name == "screenshot_burst" ? try MCPScreenshotBurst.Options(arguments) : nil
+             let observe = arguments["observe"] as? String ?? "full"
+             guard arguments["observe"] == nil || arguments["observe"] is String,
+                 ["full", "ocr_diff", "none"].contains(observe)
+@@ -134,7 +135,7 @@ enum MCPServer {
+             } else {
+                 let action = try MCPToolRequest.action(
+                     named: name, arguments: arguments, longEdge: longEdge, language: language)
+-                guard name == "list_devices" || name == "screenshot" || action != nil else {
++                guard name == "list_devices" || name == "screenshot" || burstOptions != nil || action != nil else {
+                     return failure(table.unknownTool(name))
+                 }
+                 actions = action.map { [.request($0)] } ?? []
+@@ -160,8 +161,24 @@ enum MCPServer {
+                 return try MCPAccess.withDevice(port: base.port ?? 7390, id: device, language: language) {
+                     let recording = MCPContextRecording(
+                         device: device, tool: name, arguments: arguments,
+-                        kind: name == "screenshot" || name == "ocr_screen" ? "observation" : "input")
++                        kind: name == "screenshot" || name == "ocr_screen" || burstOptions != nil ? "observation" : "input")
+                     do {
++                        if let burstOptions {
++                            let burst = MCPScreenshotBurst.collect(options: burstOptions, device: device) { remaining in
++                                // Same capture path and pixel coordinates, without OCR work between animation samples.
++                                try readScreenshot(device, baseline: true, timeout: remaining)
++                            }
++                            if let last = burst.samples.last {
++                                recording.finishSnapshot(last.frame)
++                            }
++                            // Preserve the valid prefix without recording a
++                            // partial/failed burst as a completed observation.
++                            if !burst.complete { recording.fail(MCPError("Screenshot burst incomplete")) }
++                            let showContext = !burst.samples.isEmpty && contextShown.insert(device.lowercased()).inserted
++                            return recording.attach(
++                                to: MCPScreenshotBurst.content(burst, device: device, includeImage: includeImage),
++                                includeCheckpoint: showContext)
++                        }
+                         if name == "ocr_screen", case .request(let action) = actions.first {
+                             var body = action.body
+                             body["device"] = device
+@@ -417,6 +434,7 @@ enum MCPServer {
+         var stable = false
+         var reason: String?
+         var detail: String?
++        var baselineFrame: FrameIdentity?
+ 
+         var json: [String: Any] {
+             var result: [String: Any] = [
+@@ -424,6 +442,8 @@ enum MCPServer {
+                 "changed_from_baseline": changed.map { $0 as Any } ?? NSNull(),
+                 "elapsed_ms": Int((elapsed * 1000).rounded()),
+                 "comparison": "coarse_luminance",
++                "comparison_reference": "this_call_pre_input_capture",
++                "baseline_frame": baselineFrame.map { $0.json as Any } ?? NSNull(),
+             ]
+             if let identity = frame?.identity { result["frame"] = identity.json }
+             if let reason { result["reason"] = reason }
+@@ -442,7 +462,7 @@ enum MCPServer {
+         frame: (TimeInterval) -> ObservationFrame?
+     ) -> ObservationResult {
+         let start = now()
+-        var result = ObservationResult(status: .unobserved, reason: "no_frame")
++        var result = ObservationResult(status: .unobserved, reason: "no_frame", baselineFrame: baseline?.identity)
+         var lastFresh: FrameIdentity?
+         var signature: String?
+         var stableSince: TimeInterval?
+diff --git a/Sources/iPhoneUse/MCP/MCPTools.swift b/Sources/iPhoneUse/MCP/MCPTools.swift
+index bc0b981..9c761ef 100644
+--- a/Sources/iPhoneUse/MCP/MCPTools.swift
++++ b/Sources/iPhoneUse/MCP/MCPTools.swift
+@@ -47,6 +47,16 @@ enum MCPToolCatalog {
+             tool("list_devices", table.toolListDevices, [:], readOnly: true),
+             tool(
+                 "screenshot", table.toolScreenshot, ["device": device, "include_image": includeImage], readOnly: true),
++            tool(
++                "screenshot_burst",
++                language == .zh
++                    ? "连续观察短暂动画，不发送输入。返回 2–6 张按采样时间排列的全新截图（默认 3 张、间隔 300ms，长边最多 1000px），附实际采样间隔；画面相同也可属于不同采样。采样阶段最多 6 秒、图片合计 8MiB；无法采到足量帧时明确返回部分结果。不是实时控制，不运行 OCR。"
++                    : "Observe a short animation without input: 2–6 ordered fresh screenshots (default 3, interval 300ms, long edge 1000px) with actual capture gaps. Identical pixels can be distinct samples. Sampling is capped at 6s and 8MiB of images; unavailable samples produce an explicit partial result. This is not realtime control and does not run OCR.",
++                [
++                    "device": device, "include_image": includeImage,
++                    "frames": ["type": "integer", "minimum": 2, "maximum": 6, "default": 3],
++                    "interval_ms": ["type": "integer", "minimum": 100, "maximum": 1000, "default": 300],
++                ], readOnly: true),
+             tool("ocr_screen", table.toolOCRScreen, ["device": device, "maxEdge": maxEdge], readOnly: true),
+             tool(
+                 "tap_text", table.toolTapText,
+@@ -203,11 +213,11 @@ enum MCPToolCatalog {
+             properties["observation_timeout"] = [
+                 "type": "number", "minimum": 0.2, "maximum": 5, "default": 1.5,
+                 "description":
+-                    "Seconds to observe after input. Reports fresh visual change/stability, not app completion; never retries input.",
++                    "Seconds to observe after input. Change compares to the capture before sending this call's input sequence, not the last screenshot shown to you. Reports fresh visual change/stability, not app completion; never retries input.",
+             ]
+         }
+         var schema: [String: Any] = ["type": "object", "properties": properties, "required": required]
+-        if ["session_context", "accessibility_tree"].contains(name) { schema["additionalProperties"] = false }
++        if ["session_context", "accessibility_tree", "screenshot_burst"].contains(name) { schema["additionalProperties"] = false }
+         if name == "keyboard_sequence" {
+             schema["anyOf"] = [["required": ["steps"]], ["required": ["actions"]]]
+         }
+diff --git a/Tests/PythonTests/test_mcp_stdio.py b/Tests/PythonTests/test_mcp_stdio.py
+index eced8ab..89d1ef0 100644
+--- a/Tests/PythonTests/test_mcp_stdio.py
++++ b/Tests/PythonTests/test_mcp_stdio.py
+@@ -158,6 +158,118 @@ class MCPStdioTests(unittest.TestCase):
+         self.assertEqual([reply["id"] for reply in replies], ["init"] + list(range(1, len(calls) + 1)))
+         return [reply["result"] for reply in replies[1:]]
+ 
++    def test_screenshot_burst_returns_ordered_fresh_images_using_only_capture_gets(self):
++        sequence = 0
++
++        def screenshot(path):
++            nonlocal sequence
++            self.assertIn("format=png&stability=1", path)
++            self.assertNotIn("ocr=1", path)
++            sequence += 1
++            return capture_reply(sequence * 40, sequence, capture_uptime())
++
++        self.server.screenshot_response = screenshot
++        result, context = self.exchange([
++            ("screenshot_burst", {"frames": 3, "interval_ms": 100}), ("session_context", {"device": "phone-1"}),
++        ])
++        self.assertFalse(result.get("isError", False), result)
++        burst = result["structuredContent"]["burst"]
++        self.assertEqual(burst["status"], "complete")
++        self.assertEqual(burst["returned_frames"], 3)
++        self.assertEqual([frame["index"] for frame in burst["frames"]], [1, 2, 3])
++        self.assertEqual([frame["sequence"] for frame in burst["frames"]], ["1", "2", "3"])
++        self.assertTrue(all(frame["capture_gap_ms"] > 0 for frame in burst["frames"][1:]))
++        images = [block for block in result["content"] if block["type"] == "image"]
++        self.assertEqual(len(images), 3)
++        self.assertEqual(len(self.server.stability_events), 3)
++        self.assertFalse(any(event[0] == "POST" for event in self.server.events))
++        recent = context["structuredContent"]["recent"][-1]
++        self.assertEqual(recent["kind"], "observation")
++        self.assertEqual(recent["action"]["tool"], "screenshot_burst")
++        self.assertEqual(recent["observation"]["frame"]["sequence"], "3")
++        saved = "".join(path.read_text() for path in Path(self.state.name).glob("session-context-*.json"))
++        self.assertFalse(any(image["data"] in saved for image in images))
++
++    def test_screenshot_burst_omits_duplicate_sample_but_keeps_identical_fresh_pixels(self):
++        reads = 0
++        first = None
++
++        def screenshot(path):
++            nonlocal reads, first
++            reads += 1
++            if reads == 1:
++                first = capture_reply(50, 1, capture_uptime())
++                return first
++            if reads == 2:
++                return first
++            return capture_reply(50, 2, capture_uptime())
++
++        self.server.screenshot_response = screenshot
++        result, = self.exchange([("screenshot_burst", {"frames": 2, "interval_ms": 100})])
++        self.assertFalse(result.get("isError", False), result)
++        burst = result["structuredContent"]["burst"]
++        self.assertEqual(burst["discarded_stale_samples"], 1)
++        self.assertEqual([frame["sequence"] for frame in burst["frames"]], ["1", "2"])
++        images = [block["data"] for block in result["content"] if block["type"] == "image"]
++        self.assertEqual(len(images), 2)
++        self.assertEqual(images[0], images[1])
++        self.assertEqual(reads, 3)
++
++    def test_screenshot_burst_returns_valid_prefix_and_explicit_capture_failure(self):
++        reads = 0
++
++        def screenshot(path):
++            nonlocal reads
++            reads += 1
++            if reads == 1:
++                return capture_reply(50, 1, capture_uptime())
++            return 503, b'{"error":"capture unavailable"}', None
++
++        self.server.screenshot_response = screenshot
++        result, context = self.exchange([
++            ("screenshot_burst", {"frames": 3, "interval_ms": 100}), ("session_context", {"device": "phone-1"}),
++        ])
++        self.assertTrue(result.get("isError"), result)
++        burst = result["structuredContent"]["burst"]
++        self.assertEqual(burst["status"], "partial")
++        self.assertEqual(burst["returned_frames"], 1)
++        self.assertEqual(burst["reason"], "capture_unavailable")
++        self.assertEqual(sum(block["type"] == "image" for block in result["content"]), 1)
++        self.assertEqual(reads, 2)
++        self.assertFalse(any(event[0] == "POST" for event in self.server.events))
++        recent = context["structuredContent"]["recent"][-1]
++        self.assertEqual(recent["state"], "call_error")
++        self.assertEqual(recent["requests_started"], 0)
++        self.assertEqual(recent["requests_acknowledged"], 0)
++        self.assertEqual(recent["observation"]["frame"]["sequence"], "1")
++
++    def test_screenshot_burst_requires_frame_identity_and_supports_metadata_only(self):
++        missing, = self.exchange([("screenshot_burst", {})])
++        self.assertTrue(missing.get("isError"), missing)
++        self.assertEqual(missing["structuredContent"]["burst"]["reason"], "missing_frame_metadata")
++        self.assertFalse(any(block["type"] == "image" for block in missing["content"]))
++        sequence = 0
++
++        def screenshot(path):
++            nonlocal sequence
++            sequence += 1
++            return capture_reply(80, sequence, capture_uptime())
++
++        self.server.screenshot_response = screenshot
++        result, = self.exchange([("screenshot_burst", {"frames": 2, "interval_ms": 100, "include_image": False})])
++        self.assertFalse(result.get("isError", False), result)
++        self.assertEqual(result["structuredContent"]["burst"]["returned_frames"], 2)
++        self.assertFalse(any(block["type"] == "image" for block in result["content"]))
++
++    def test_invalid_screenshot_burst_options_fail_before_discovery_or_capture(self):
++        invalid = [{"frames": value} for value in (1, 7, 2.5, True, "3")]
++        invalid += [{"interval_ms": value} for value in (99, 1001, False)]
++        invalid += [{"include_image": "false"}, {"observe": "none"}, {"device": 7}]
++        results = self.exchange([("screenshot_burst", arguments) for arguments in invalid])
++        self.assertTrue(all(result.get("isError") for result in results), results)
++        self.assertEqual(self.server.events, [("GET", "/config?wake=0")])
++        self.assertEqual(self.server.stability_events, [])
++
+     def test_session_context_reconnect_is_local_and_first_screenshot_includes_note(self):
+         self.env["IPHONE_USE_DEVICE_ID"] = "phone-1"
+         note = {"what_seen": "puzzle board", "what_done": "looked at door",
+@@ -406,6 +518,9 @@ class MCPStdioTests(unittest.TestCase):
+         self.assertLess(observation["elapsed_ms"], 1500)
+         self.assertEqual(result["content"][0]["data"], base64.b64encode(capture_reply(240, 1, 0)[1]).decode())
+         self.assertEqual(observation["frame"]["sequence"], str(state["sequence"]))
++        self.assertEqual(observation["baseline_frame"]["sequence"], "1")
++        self.assertEqual(observation["baseline_frame"]["source"], "capture-1")
++        self.assertEqual(observation["comparison_reference"], "this_call_pre_input_capture")
+         self.assertEqual(metadata["hid_delivery"], "unverified")
+         self.assertEqual(metadata["app_completion"], "unverified")
+         self.assertEqual(sum(event[0] == "POST" for event in self.server.events), 1)
+@@ -483,7 +598,7 @@ class MCPStdioTests(unittest.TestCase):
+                 capture_output=True, text=True, timeout=15,
+             )
+         self.assertEqual(process.returncode, 0, process.stderr)
+-        self.assertIn("17 tools", process.stdout)
++        self.assertIn("18 tools", process.stdout)
+         # The checker's initialize fetches /config; tools/list reuses the value.
+         self.assertEqual(self.server.events, [("GET", "/config?wake=0")])
+ 
+@@ -872,7 +987,7 @@ class MCPStdioTests(unittest.TestCase):
+         self.assertIn("控制真实 iPhone", replies[0]["result"]["instructions"])
+         tools = replies[1]["result"]["tools"]
+         # Tool and parameter names are the client contract and stay English.
+-        self.assertEqual(len(tools), 17)
++        self.assertEqual(len(tools), 18)
+         home = next(tool for tool in tools if tool["name"] == "home")
+         self.assertEqual(home["description"], "回到主屏幕。")
+         error = replies[2]["result"]["content"][0]["text"]
+diff --git a/Tests/iPhoneUseTests/MCP/MCPObservationTests.swift b/Tests/iPhoneUseTests/MCP/MCPObservationTests.swift
+index f3c9866..fe267c0 100644
+--- a/Tests/iPhoneUseTests/MCP/MCPObservationTests.swift
++++ b/Tests/iPhoneUseTests/MCP/MCPObservationTests.swift
+@@ -31,6 +31,11 @@ final class MCPObservationTests: XCTestCase {
+         XCTAssertTrue(result.stable)
+         XCTAssertEqual(result.changed, true)
+         XCTAssertEqual(result.frame?.image, Data("new".utf8))
++        XCTAssertEqual(result.baselineFrame, sample("old", sequence: 1, at: 9.9).identity)
++        let baseline = result.json["baseline_frame"] as? [String: Any]
++        XCTAssertEqual(baseline?["source"] as? String, "capture-1")
++        XCTAssertEqual(baseline?["sequence"] as? String, "1")
++        XCTAssertEqual(result.json["comparison_reference"] as? String, "this_call_pre_input_capture")
+     }
+ 
+     func testFrozenBaselineIsUnobservedEvenIfPixelsKeepMatching() {
+diff --git a/Tests/iPhoneUseTests/MCP/MCPProtocolTests.swift b/Tests/iPhoneUseTests/MCP/MCPProtocolTests.swift
+index 19d3dff..20048f1 100644
+--- a/Tests/iPhoneUseTests/MCP/MCPProtocolTests.swift
++++ b/Tests/iPhoneUseTests/MCP/MCPProtocolTests.swift
+@@ -298,7 +298,7 @@ final class MCPOCRTests: XCTestCase {
+ final class MCPKeyboardAliasTests: XCTestCase {
+     func testEveryToolAdvertisesDeviceAliasAndOriginalWins() throws {
+         let tools = MCPToolCatalog.tools(for: .en)
+-        XCTAssertEqual(tools.count, 17)
++        XCTAssertEqual(tools.count, 18)
+         for tool in tools {
+             let schema = try XCTUnwrap(tool["inputSchema"] as? [String: Any])
+             let properties = try XCTUnwrap(schema["properties"] as? [String: Any])
+diff --git a/Tests/iPhoneUseTests/MCP/MCPScreenshotBurstTests.swift b/Tests/iPhoneUseTests/MCP/MCPScreenshotBurstTests.swift
+new file mode 100644
+index 0000000..9d1d374
+--- /dev/null
++++ b/Tests/iPhoneUseTests/MCP/MCPScreenshotBurstTests.swift
+@@ -0,0 +1,162 @@
++import Foundation
++import XCTest
++
++@testable import iPhoneUse
++
++final class MCPScreenshotBurstTests: XCTestCase {
++    private func sample(
++        sequence: UInt64, at: TimeInterval, source: String = "capture-1", device: String = "phone-1",
++        metadata: Bool = true, image: Data = Data([1, 2, 3])
++    ) -> MCPServer.ObservationFrame {
++        MCPServer.ObservationFrame(
++            image: image, device: device, width: "462", height: "1000", mimeType: "image/png",
++            identity: metadata ? MCPServer.FrameIdentity(source: source, sequence: sequence, receivedAt: at) : nil,
++            signature: "same-pixels")
++    }
++
++    func testBoundedReadOnlySchemaMatchesValidation() throws {
++        let options = try MCPScreenshotBurst.Options([:])
++        XCTAssertEqual(options.frames, 3)
++        XCTAssertEqual(options.intervalMilliseconds, 300)
++        for invalid: [String: Any] in [
++            ["frames": 1], ["frames": 7], ["frames": 2.5], ["frames": true], ["frames": "3"],
++            ["interval_ms": 99], ["interval_ms": 1001], ["interval_ms": Double.nan],
++            ["interval_ms": false], ["device": 7], ["observe": "none"],
++        ] { XCTAssertThrowsError(try MCPScreenshotBurst.Options(invalid)) }
++        for language: AppLanguage in [.en, .zh] {
++            let tool = try XCTUnwrap(MCPToolCatalog.tools(for: language).first { $0["name"] as? String == "screenshot_burst" })
++            XCTAssertEqual((tool["annotations"] as? [String: Bool])?["readOnlyHint"], true)
++            let schema = try XCTUnwrap(tool["inputSchema"] as? [String: Any])
++            let properties = try XCTUnwrap(schema["properties"] as? [String: [String: Any]])
++            XCTAssertEqual(schema["additionalProperties"] as? Bool, false)
++            XCTAssertEqual(properties["frames"]?["maximum"] as? Int, 6)
++            XCTAssertEqual(properties["interval_ms"]?["minimum"] as? Int, 100)
++            XCTAssertNil(properties["observe"])
++            XCTAssertNotNil(properties["device_id"])
++        }
++        XCTAssertNil(try MCPToolRequest.action(named: "screenshot_burst", arguments: [:], longEdge: 1000))
++    }
++
++    func testFreshIdenticalPixelsRemainDistinctOrderedSamplesWithActualGaps() throws {
++        var clock: TimeInterval = 10
++        var sequence: UInt64 = 0
++        let result = MCPScreenshotBurst.collect(
++            options: try MCPScreenshotBurst.Options([:]), device: "phone-1",
++            sleep: { clock += $0 }, now: { clock }, frame: { remaining in
++                XCTAssertGreaterThan(remaining, 0)
++                sequence += 1; clock += 0.01
++                return self.sample(sequence: sequence, at: clock)
++            })
++        XCTAssertTrue(result.complete)
++        XCTAssertEqual(result.samples.count, 3)
++        XCTAssertEqual(Set(result.samples.map { $0.frame.identity!.sequence }).count, 3)
++        XCTAssertEqual(Set(result.samples.map { $0.frame.signature }).count, 1)
++        let frames = try XCTUnwrap(result.json["frames"] as? [[String: Any]])
++        XCTAssertEqual(frames.map { $0["index"] as? Int }, [1, 2, 3])
++        XCTAssertEqual(frames.dropFirst().map { $0["capture_gap_ms"] as? Int }, [310, 310])
++        XCTAssertEqual(result.elapsed, 0.63, accuracy: 0.0001)
++    }
++
++    func testOldAndDuplicateCapturesAreOmittedWithoutHidingAValidSourceRestart() throws {
++        var clock: TimeInterval = 10
++        var reads = 0
++        var first: MCPServer.ObservationFrame?
++        let result = MCPScreenshotBurst.collect(
++            options: try MCPScreenshotBurst.Options(["frames": 2, "interval_ms": 100]), device: "phone-1",
++            sleep: { clock += $0 }, now: { clock }, frame: { _ in
++                reads += 1; clock += 0.01
++                if reads == 1 { return self.sample(sequence: 98, at: 9.9) }
++                if reads == 2 { first = self.sample(sequence: 99, at: clock); return first! }
++                if reads == 3 { return first! }
++                return self.sample(sequence: 1, at: clock, source: "capture-restarted")
++            })
++        XCTAssertTrue(result.complete)
++        XCTAssertEqual(reads, 4)
++        XCTAssertEqual(result.discardedSamples, 2)
++        XCTAssertEqual(result.samples.map { $0.frame.identity?.source }, ["capture-1", "capture-restarted"])
++    }
++
++    func testFrozenCaptureEndsAtSamplingDeadlineWithNoRepeatedImages() throws {
++        let result = MCPScreenshotBurst.collect(
++            options: try MCPScreenshotBurst.Options([:]), device: "phone-1", sleep: { _ in }, now: { 10 },
++            frame: { _ in self.sample(sequence: 1, at: 9.9) })
++        XCTAssertFalse(result.complete)
++        XCTAssertTrue(result.samples.isEmpty)
++        XCTAssertEqual(result.reason, "sampling_deadline")
++        XCTAssertEqual(result.elapsed, MCPScreenshotBurst.samplingBudget, accuracy: 0.0001)
++        XCTAssertLessThanOrEqual(result.discardedSamples, 121)
++    }
++
++    func testUnavailableCapturePreservesEarlierSamplesAndReportsPartialFailure() throws {
++        var clock: TimeInterval = 10
++        var reads = 0
++        let result = MCPScreenshotBurst.collect(
++            options: try MCPScreenshotBurst.Options([:]), device: "phone-1",
++            sleep: { clock += $0 }, now: { clock }, frame: { _ in
++                reads += 1; clock += 0.01
++                if reads > 1 { throw MCPServer.MCPError("capture stopped") }
++                return self.sample(sequence: 1, at: clock)
++            })
++        XCTAssertEqual(reads, 2, "capture errors are not retried")
++        XCTAssertEqual(result.samples.count, 1)
++        XCTAssertEqual(result.reason, "capture_unavailable")
++        XCTAssertEqual(result.json["status"] as? String, "partial")
++        XCTAssertEqual(MCPScreenshotBurst.content(result, device: "phone-1", includeImage: true)["isError"] as? Bool, true)
++    }
++
++    func testMissingForeignMalformedOrFutureFramesStopBeforeImagesAreAccepted() throws {
++        let cases: [(MCPServer.ObservationFrame, String)] = [
++            (sample(sequence: 1, at: 10.01, metadata: false), "missing_frame_metadata"),
++            (sample(sequence: 1, at: 10.01, device: "other"), "capture_device_mismatch"),
++            (sample(sequence: 1, at: 10.01, image: Data()), "invalid_frame"),
++            (sample(sequence: 1, at: 11), "invalid_frame_timestamp"),
++        ]
++        for (frame, reason) in cases {
++            var clock: TimeInterval = 10
++            var reads = 0
++            let result = MCPScreenshotBurst.collect(
++                options: try MCPScreenshotBurst.Options([:]), device: "phone-1",
++                sleep: { clock += $0 }, now: { clock }, frame: { _ in reads += 1; clock += 0.01; return frame })
++            XCTAssertEqual(result.reason, reason)
++            XCTAssertEqual(reads, 1)
++            XCTAssertTrue(result.samples.isEmpty)
++        }
++    }
++
++    func testImageBudgetStopsBeforeAppendingAnOversizedSequence() throws {
++        var clock: TimeInterval = 10
++        var reads = 0
++        let result = MCPScreenshotBurst.collect(
++            options: try MCPScreenshotBurst.Options(["frames": 2]), device: "phone-1",
++            sleep: { clock += $0 }, now: { clock }, frame: { _ in
++                reads += 1; clock += 0.01
++                return self.sample(
++                    sequence: UInt64(reads), at: clock,
++                    image: reads == 1 ? Data([1]) : Data(repeating: 2, count: MCPScreenshotBurst.imageByteBudget))
++            })
++        XCTAssertEqual(result.samples.count, 1)
++        XCTAssertEqual(result.reason, "image_byte_budget")
++        XCTAssertEqual(result.json["status"] as? String, "partial")
++    }
++
++    func testOrderedCaptionsPrecedeImagesAndMetadataOnlyModeOmitsImagePayloads() throws {
++        var clock: TimeInterval = 10
++        var sequence: UInt64 = 0
++        let result = MCPScreenshotBurst.collect(
++            options: try MCPScreenshotBurst.Options(["frames": 2]), device: "phone-1",
++            sleep: { clock += $0 }, now: { clock }, frame: { _ in
++                sequence += 1; clock += 0.01
++                return self.sample(sequence: sequence, at: clock)
++            })
++        for includeImage in [false, true] {
++            let content = MCPScreenshotBurst.content(result, device: "phone-1", includeImage: includeImage)
++            XCTAssertNil(content["isError"])
++            let blocks = try XCTUnwrap(content["content"] as? [[String: Any]])
++            XCTAssertEqual(blocks.filter { $0["type"] as? String == "image" }.count, includeImage ? 2 : 0)
++            XCTAssertTrue(try XCTUnwrap(blocks[1]["text"] as? String).hasPrefix("Frame 1/2, capture +10 ms"))
++            if includeImage {
++                XCTAssertEqual(blocks.map { $0["type"] as? String }, ["text", "text", "image", "text", "image"])
++            }
++        }
++    }
++}
+diff --git a/scripts/check-mcp.py b/scripts/check-mcp.py
+index d85b1a8..6e25468 100755
+--- a/scripts/check-mcp.py
++++ b/scripts/check-mcp.py
+@@ -43,7 +43,7 @@ def check(command, live=False):
+     if "tools" not in initialized.get("capabilities", {}):
+         raise ValueError("Server did not advertise tools")
+     tools = replies[1]["result"].get("tools", [])
+-    required = {"session_context", "accessibility_tree", "list_devices", "screenshot", "move_pointer", "adjust_pointer", "click_pointer",
++    required = {"session_context", "accessibility_tree", "list_devices", "screenshot", "screenshot_burst", "move_pointer", "adjust_pointer", "click_pointer",
+                 "tap", "long_press", "swipe", "type_text", "press_key", "keyboard_sequence", "home"}
+     if not required.issubset({tool.get("name") for tool in tools}):
+         raise ValueError("Server is missing iPhone Use tools")

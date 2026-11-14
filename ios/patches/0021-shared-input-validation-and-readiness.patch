@@ -1,0 +1,1186 @@
+diff --git a/Sources/iPhoneUse/API/ControlAPI.swift b/Sources/iPhoneUse/API/ControlAPI.swift
+index 9568043..767fe69 100644
+--- a/Sources/iPhoneUse/API/ControlAPI.swift
++++ b/Sources/iPhoneUse/API/ControlAPI.swift
+@@ -105,8 +105,9 @@ enum ControlAPI {
+                 let (id, data) = try ocrCapture(deviceQuery, OCRRequest.maxEdge(options))
+                 return .json(ScreenOCR.recognize(data, device: id).json(device: id))
+             case ("POST", "/act"):
+-                return try ActRequest(body).perform(
+-                    device: try DeviceRegistry.shared.find(deviceQuery).id, capture: ocrCapture,
++                let target = try DeviceRegistry.shared.find(deviceQuery)
++                return try ActRequest(body, screenSize: target.screen.size, requireGeometry: true).perform(
++                    device: target.id, capture: ocrCapture,
+                     execute: { path, body, device in
+                         handle(
+                             HTTPRequest(
+@@ -134,6 +135,8 @@ enum ControlAPI {
+             }
+         } catch let error as ScreenshotReferences.Rejected {
+             return .json(["error": error.description, "frame_rejected": true, "input_sent": false], status: 409)
++        } catch let error as InputRequestError {
++            return .json(["error": error.description, "input_sent": false], status: 400)
+         } catch DeviceInput.InputError.pointerBusy {
+             return .error("\(DeviceInput.InputError.pointerBusy)", status: 409)
+         } catch {
+@@ -364,6 +367,7 @@ enum ControlAPI {
+                     screenSize: current.screen.size)
+             }
+         }
++        try validateLeaf(path: action.rawValue, body: body, screenSize: device.screen.size)
+         // Real input takes priority over background probes and measurement.
+         // Cancel before resolving/queuing input, so it cannot wait behind the
+         // very measurement that the user is trying to interrupt.
+@@ -379,7 +383,7 @@ enum ControlAPI {
+         switch action {
+         case .tap:
+             let (x, y) = try point(body, "x", "y", on: device)
+-            try input.tap(x: x, y: y, hold: (body["hold"] as? Double) ?? 0.08, beforeInput: validateReference)
++            try input.tap(x: x, y: y, hold: HoldRequest(body).seconds, beforeInput: validateReference)
+         case .swipe:
+             let swipe = try SwipeRequest(body, screenSize: device.screen.size, screenName: device.screen.name)
+             try input.swipe(points: swipe.points, duration: swipe.duration, beforeInput: validateReference)
+@@ -387,10 +391,11 @@ enum ControlAPI {
+             let (x, y) = try point(body, "x", "y", on: device)
+             try input.move(x: x, y: y, beforeInput: validateReference)
+         case .nudge:
+-            try input.nudge(
+-                dx: (body["dx"] as? Int) ?? 0, dy: (body["dy"] as? Int) ?? 0,
+-                click: (body["click"] as? Bool) ?? false)
++            let nudge = try NudgeRequest(body)
++            guard input.isRelativePointerReady else { throw DeviceError("Relative pointer channel is not ready; no input sent") }
++            try input.nudge(dx: nudge.dx, dy: nudge.dy, click: nudge.click)
+         case .type:
++            guard input.isKeyboardReady else { throw DeviceError("Keyboard channel is not ready; no input sent") }
+             guard let text = body["text"] as? String else { return .error(StringsAPI.current.textRequired) }
+             var parameters = body
+             parameters["text"] = text
+@@ -400,18 +405,34 @@ enum ControlAPI {
+                     device.screen.snapshot(png: false, maxEdge: 1600).map { ScreenOCR.recognize($0, device: device.id) }
+                 })
+         case .key:
+-            guard let key = body["key"] as? String else { return .error(StringsAPI.current.keyRequired) }
+-            try input.key(key, modifiers: (body["modifiers"] as? [String]) ?? [])
++            let key = try KeyRequest(body)
++            try input.key(key.key, modifiers: key.modifiers)
+         case .home:
+-            input.consumer(0x0223)
++            guard input.consumer(0x0223) else { throw DeviceError("Consumer channel is not ready; no input sent") }
+         case .power:
+             // Consumer Power is a short, state-dependent key press. Never
+             // retry it automatically or claim that an accepted report locked iOS.
+-            input.consumer(0x0030)
++            guard input.consumer(0x0030) else { throw DeviceError("Consumer channel is not ready; no input sent") }
+         }
+         return .json(["ok": true, "device": device.id])
+     }
+ 
++    /// Pure preflight, shared with tests; it runs before resolving input or
++    /// cancelling motion, so a malformed later value cannot emit a report.
++    static func validateLeaf(path: String, body: [String: Any], screenSize: CGSize?) throws {
++        switch path {
++        case "/tap":
++            _ = try CoordinateRequest(body).point(screenSize: screenSize)
++            _ = try HoldRequest(body)
++        case "/move": _ = try CoordinateRequest(body).point(screenSize: screenSize)
++        case "/swipe": _ = try SwipeRequest(body, screenSize: screenSize, screenName: "")
++        case "/key": _ = try KeyRequest(body)
++        case "/nudge": _ = try NudgeRequest(body)
++        case "/type": _ = try TypeTextRequest(body)
++        default: break
++        }
++    }
++
+     private static func point(
+         _ body: [String: Any], _ xKey: String, _ yKey: String, on device: Device
+     ) throws -> (Double, Double) {
+@@ -485,7 +506,7 @@ struct SwipeRequest {
+ }
+ 
+ /// Coordinate rules shared by the HTTP action and screenshot endpoints.
+-/// This layer preserves the API's permissive numeric input; DeviceInput applies pointer limits.
++/// Shared strict coordinate parsing; malformed input never becomes a clamp.
+ enum RequestCoordinates {
+     static func imageSize(_ size: CGSize, maxWidth: Int?, maxEdge: Int?) -> (Int, Int) {
+         var scale = 1.0
+@@ -500,26 +521,7 @@ enum RequestCoordinates {
+         _ body: [String: Any], _ xKey: String, _ yKey: String,
+         screenSize: @autoclosure () -> CGSize?, screenName: @autoclosure () -> String
+     ) throws -> (Double, Double) {
+-        guard let x = number(body[xKey]), let y = number(body[yKey]) else {
+-            throw DeviceError(StringsAPI.current.coordinatesRequired(xKey, yKey))
+-        }
+-        if (body["fraction"] as? Bool) == true { return (x, y) }
+-        // Evaluate the capture state only after coordinate validation, as on the API path.
+-        guard let size = screenSize() else { throw DeviceError(StringsAPI.current.noFrameFromScreen(screenName())) }
+-        var width = Double(size.width)
+-        var height = Double(size.height)
+-        if let maxEdge = number(body["maxEdge"]).map(Int.init) {
+-            let image = imageSize(size, maxWidth: nil, maxEdge: maxEdge)
+-            width = Double(image.0)
+-            height = Double(image.1)
+-        }
+-        width = number(body["width"]) ?? width
+-        height = number(body["height"]) ?? height
+-        return (x / width, y / height)
+-    }
+-
+-    private static func number(_ value: Any?) -> Double? {
+-        (value as? NSNumber)?.doubleValue
++        try CoordinateRequest(body, xKey: xKey, yKey: yKey).point(screenSize: screenSize())
+     }
+ }
+ 
+@@ -569,14 +571,7 @@ struct TextTapRequest {
+         } else {
+             index = 0
+         }
+-        if let raw = body["hold"] {
+-            guard let value = OCRRequest.number(raw), value >= 0, value <= 60 else {
+-                throw DeviceError(table.ocrParameterInvalid("hold"))
+-            }
+-            hold = value
+-        } else {
+-            hold = 0.08
+-        }
++        hold = try HoldRequest(body).seconds
+     }
+ 
+     func match(_ result: ScreenOCR.Result) throws -> ScreenOCR.Item {
+@@ -594,7 +589,7 @@ struct TextTapRequest {
+ struct ActRequest {
+     let steps: [[String: Any]]
+ 
+-    init(_ body: [String: Any]) throws {
++    init(_ body: [String: Any], screenSize: CGSize? = nil, requireGeometry: Bool = false) throws {
+         guard let steps = body["steps"] as? [[String: Any]], (1...16).contains(steps.count) else {
+             throw DeviceError("steps must contain 1...16 actions")
+         }
+@@ -619,22 +614,23 @@ struct ActRequest {
+                 _ = try TextTapRequest(step)
+                 _ = try OCRRequest.maxEdge(step)
+             case "tap":
+-                let point = try RequestCoordinates.point(
+-                    step, "x", "y", screenSize: CGSize(width: 1, height: 1), screenName: "")
+-                guard point.0.isFinite, point.1.isFinite else { throw DeviceError("Invalid tap dimensions") }
+-                guard OCRRequest.number(step["x"]) != nil, OCRRequest.number(step["y"]) != nil else {
+-                    throw DeviceError("tap coordinates must be finite numbers")
+-                }
+-                _ = try TextTapRequest(step.merging(["text": "tap"]) { _, value in value })
++                let coordinate = try CoordinateRequest(step)
++                if requireGeometry || screenSize != nil || coordinate.fraction { _ = try coordinate.point(screenSize: screenSize) }
++                _ = try HoldRequest(step)
+             case "swipe":
+-                _ = try SwipeRequest(step, screenSize: CGSize(width: 1, height: 1), screenName: "")
++                guard let points = step["points"] as? [[String: Any]], points.count >= 2 else {
++                    throw DeviceError("swipe requires at least two points")
++                }
++                for point in points {
++                    var coordinates = step
++                    coordinates["x"] = point["x"]; coordinates["y"] = point["y"]
++                    let coordinate = try CoordinateRequest(coordinates)
++                    if requireGeometry || screenSize != nil || coordinate.fraction { _ = try coordinate.point(screenSize: screenSize) }
++                }
++                let duration = try InputRequestValue.number(step["duration"] ?? 0.3, field: "duration")
++                guard duration > 0 else { throw DeviceError("swipe duration must be positive") }
+             case "key":
+-                guard let key = step["key"] as? String,
+-                    KeyboardMap.named[key.lowercased()] != nil || key.count == 1,
+-                    KeyboardMap.code(for: key) != nil,
+-                    step["modifiers"] == nil || step["modifiers"] is [String],
+-                    KeyboardMap.modifierMask(for: step["modifiers"] as? [String] ?? []) != nil
+-                else { throw DeviceError("Invalid key or modifiers") }
++                _ = try KeyRequest(step)
+             default: break
+             }
+             if type == "delay" || type == "wait_text" {
+diff --git a/Sources/iPhoneUse/API/LeafInputRequests.swift b/Sources/iPhoneUse/API/LeafInputRequests.swift
+new file mode 100644
+index 0000000..862d9b5
+--- /dev/null
++++ b/Sources/iPhoneUse/API/LeafInputRequests.swift
+@@ -0,0 +1,161 @@
++import CoreFoundation
++import Foundation
++
++/// Pure leaf validation shared by HTTP authority and MCP/batch preflight.
++/// A parser does not select a device, check channel readiness or send input.
++struct InputRequestError: Error, CustomStringConvertible {
++    let description: String
++    init(_ description: String) { self.description = description }
++}
++
++enum InputRequestValue {
++    static func number(_ raw: Any?, field: String) throws -> Double {
++        guard let number = raw as? NSNumber,
++            CFGetTypeID(number) != CFBooleanGetTypeID(), number.doubleValue.isFinite
++        else { throw InputRequestError("\(field) must be a finite number") }
++        return number.doubleValue
++    }
++
++    static func boolean(_ raw: Any?, field: String, default fallback: Bool) throws -> Bool {
++        guard let raw else { return fallback }
++        guard let number = raw as? NSNumber, CFGetTypeID(number) == CFBooleanGetTypeID()
++        else { throw InputRequestError("\(field) must be a boolean") }
++        return number.boolValue
++    }
++}
++
++struct KeyRequest {
++    let key: String
++    let modifiers: [String]
++
++    init(_ body: [String: Any]) throws {
++        guard let key = body["key"] as? String,
++            KeyboardMap.named[key.lowercased()] != nil || key.count == 1,
++            KeyboardMap.code(for: key) != nil
++        else { throw InputRequestError("Unknown or invalid key") }
++        let modifiers: [String]
++        if let raw = body["modifiers"] {
++            guard let strings = raw as? [String] else {
++                throw InputRequestError("modifiers must be an array of strings")
++            }
++            modifiers = strings
++        } else {
++            modifiers = []
++        }
++        guard KeyboardMap.modifierMask(for: modifiers) != nil else {
++            throw InputRequestError("Unknown modifier")
++        }
++        self.key = key
++        self.modifiers = modifiers
++    }
++
++    var body: [String: Any] { ["key": key, "modifiers": modifiers] }
++}
++
++struct HoldRequest {
++    let seconds: TimeInterval
++
++    init(_ body: [String: Any], key: String = "hold", default fallback: TimeInterval = 0.08) throws {
++        let seconds = try InputRequestValue.number(body[key] ?? fallback, field: key)
++        guard (0...60).contains(seconds) else {
++            throw InputRequestError("\(key) must be in 0...60 seconds")
++        }
++        self.seconds = seconds
++    }
++}
++
++struct NudgeRequest {
++    let dx: Int
++    let dy: Int
++    let click: Bool
++
++    /// HTTP may omit either delta; MCP adjust_pointer requires both.
++    /// The bounded range is the existing MCP adjustment contract.
++    init(_ body: [String: Any], requireDeltas: Bool = false) throws {
++        func delta(_ key: String) throws -> Int {
++            if requireDeltas, body[key] == nil { throw InputRequestError("\(key) is required") }
++            let value = try InputRequestValue.number(body[key] ?? 0, field: key)
++            guard (-32...32).contains(value), value.rounded() == value else {
++                throw InputRequestError("\(key) must be an integer in -32...32")
++            }
++            return Int(value)
++        }
++        dx = try delta("dx")
++        dy = try delta("dy")
++        click = try InputRequestValue.boolean(body["click"], field: "click", default: false)
++    }
++
++    var body: [String: Any] { ["dx": dx, "dy": dy, "click": click] }
++}
++
++/// Parses numeric shape first; resolving pixel bounds requires the real capture
++/// size. MCP can do shape preflight early, but the HTTP authority must resolve
++/// every point against actual or frame-bound dimensions before sending input.
++struct CoordinateRequest {
++    let x: Double
++    let y: Double
++    let fraction: Bool
++    let width: Double?
++    let height: Double?
++    let maxEdge: Int?
++
++    init(_ body: [String: Any], xKey: String = "x", yKey: String = "y") throws {
++        let x = try InputRequestValue.number(body[xKey], field: xKey)
++        let y = try InputRequestValue.number(body[yKey], field: yKey)
++        let fraction = try InputRequestValue.boolean(body["fraction"], field: "fraction", default: false)
++        guard x >= 0, y >= 0 else { throw InputRequestError("Coordinates must be nonnegative") }
++        func dimension(_ key: String) throws -> Double? {
++            guard let raw = body[key] else { return nil }
++            let value = try InputRequestValue.number(raw, field: key)
++            guard value > 0 else { throw InputRequestError("\(key) must be positive") }
++            return value
++        }
++        let width = try dimension("width")
++        let height = try dimension("height")
++        let maxEdge: Int?
++        if let raw = body["maxEdge"] {
++            let value = try InputRequestValue.number(raw, field: "maxEdge")
++            guard value >= 1, value < Double(Int.max) else {
++                throw InputRequestError("maxEdge must be a positive size smaller than Int.max")
++            }
++            // Preserve the legacy coordinate endpoint's positive-size truncation.
++            // OCR maxEdge has a separate integer-only contract.
++            maxEdge = Int(value)
++        } else {
++            maxEdge = nil
++        }
++        if fraction {
++            guard x <= 1, y <= 1 else { throw InputRequestError("Fractions must be in 0...1") }
++        } else {
++            // Explicit dimensions already allow an early, definitive rejection.
++            if let width, x >= width { throw InputRequestError("x must be inside the image width") }
++            if let height, y >= height { throw InputRequestError("y must be inside the image height") }
++        }
++        self.x = x
++        self.y = y
++        self.fraction = fraction
++        self.width = width
++        self.height = height
++        self.maxEdge = maxEdge
++    }
++
++    func point(screenSize: @autoclosure () -> CGSize?) throws -> (Double, Double) {
++        if fraction { return (x, y) }
++        guard let size = screenSize(), size.width.isFinite, size.height.isFinite,
++            size.width > 0, size.height > 0,
++            size.width < Double(Int.max), size.height < Double(Int.max)
++        else { throw InputRequestError("A finite positive capture size is required for image pixels") }
++        var imageWidth = Double(size.width), imageHeight = Double(size.height)
++        if let maxEdge {
++            let scale = min(1, Double(maxEdge) / max(imageWidth, imageHeight))
++            imageWidth = (imageWidth * scale).rounded()
++            imageHeight = (imageHeight * scale).rounded()
++        }
++        imageWidth = width ?? imageWidth
++        imageHeight = height ?? imageHeight
++        guard imageWidth > 0, imageHeight > 0, x < imageWidth, y < imageHeight else {
++            throw InputRequestError("Coordinates must be inside the current image")
++        }
++        return (x / imageWidth, y / imageHeight)
++    }
++}
+diff --git a/Sources/iPhoneUse/Input/DeviceInput.swift b/Sources/iPhoneUse/Input/DeviceInput.swift
+index 39e6dd7..fa12263 100644
+--- a/Sources/iPhoneUse/Input/DeviceInput.swift
++++ b/Sources/iPhoneUse/Input/DeviceInput.swift
+@@ -25,6 +25,13 @@ final class DeviceInput {
+         coordinateMappingAvailable && pointerReports.allSatisfy { reportReadiness($0, host, session) }
+     }
+ 
++    var isKeyboardReady: Bool { channelReady(.keyboard) }
++    var isConsumerReady: Bool { channelReady(.consumer) }
++    var isRelativePointerReady: Bool { channelReady(.relativeMouse) }
++    private func channelReady(_ report: ReportID) -> Bool {
++        !isRetired && inputIsAllowed() && reportReadiness(report, host, session)
++    }
++
+     var needsCalibration: Bool {
+         if calibrationRequired && calibration == nil { return true }
+         if let calibration, let size = screenSize?() { return !calibration.matches(size) }
+@@ -686,6 +693,7 @@ extension DeviceInput {
+     func nudge(dx: Int, dy: Int, click: Bool) throws {
+         if dx != 0 || dy != 0 || click { discardPendingMotion() }
+         try queue.sync {
++            guard isRelativePointerReady else { throw DeviceError("Relative pointer channel is not ready; no input sent") }
+             try requireIdlePointer()
+             if dx != 0 || dy != 0 { clearPointerEstimate() }
+             var remainingX = dx
+@@ -715,6 +723,7 @@ extension DeviceInput {
+     /// Keyboard events originating in the control window are asynchronous so text
+     /// entry never blocks AppKit's event loop while BLE reports are sent.
+     func typeFromKeyboard(_ text: String, modifiers: [String] = []) -> Bool {
++        guard isKeyboardReady else { return false }
+         guard let modifierMask = KeyboardMap.modifierMask(for: modifiers) else { return false }
+         let strokes = text.compactMap { KeyboardMap.stroke(for: $0) }.map {
+             KeyboardMap.Stroke(code: $0.code, modifiers: $0.modifiers | modifierMask)
+@@ -722,17 +731,20 @@ extension DeviceInput {
+         guard strokes.count == text.count else { return false }
+         if !strokes.isEmpty { discardPendingMotion() }
+         queue.async {
++            guard self.isKeyboardReady else { return }
+             for stroke in strokes { self.press(stroke) }
+         }
+         return true
+     }
+ 
+     func keyFromKeyboard(_ name: String, modifiers: [String] = []) -> Bool {
++        guard isKeyboardReady else { return false }
+         guard let code = KeyboardMap.code(for: name),
+             let modifierMask = KeyboardMap.modifierMask(for: modifiers)
+         else { return false }
+         discardPendingMotion()
+         queue.async {
++            guard self.isKeyboardReady else { return }
+             self.press(KeyboardMap.Stroke(code: code, modifiers: modifierMask))
+         }
+         return true
+@@ -745,7 +757,8 @@ extension DeviceInput {
+         }
+         let strokes = keyboardText.compactMap { KeyboardMap.stroke(for: $0) }
+         if !strokes.isEmpty { discardPendingMotion() }
+-        queue.sync {
++        try queue.sync {
++            guard isKeyboardReady else { throw DeviceError("Keyboard channel is not ready; no input sent") }
+             for stroke in strokes {
+                 press(stroke)
+             }
+@@ -762,16 +775,22 @@ extension DeviceInput {
+             mask |= bit
+         }
+         discardPendingMotion()
+-        queue.sync { press(KeyboardMap.Stroke(code: code, modifiers: mask)) }
++        try queue.sync {
++            guard isKeyboardReady else { throw DeviceError("Keyboard channel is not ready; no input sent") }
++            press(KeyboardMap.Stroke(code: code, modifiers: mask))
++        }
+     }
+ 
+-    func consumer(_ usage: UInt16) {
++    @discardableResult
++    func consumer(_ usage: UInt16) -> Bool {
+         discardPendingMotion()
+-        queue.sync {
++        return queue.sync {
++            guard isConsumerReady else { return false }
+             send(.consumer, HIDReportPayload.consumer(usage))
+             pause(0.08)
+             send(.consumer, HIDReportPayload.consumer(0))
+             pause(step)
++            return true
+         }
+     }
+ 
+diff --git a/Sources/iPhoneUse/Input/KeyboardMap.swift b/Sources/iPhoneUse/Input/KeyboardMap.swift
+index 277c93c..6d8d2b6 100644
+--- a/Sources/iPhoneUse/Input/KeyboardMap.swift
++++ b/Sources/iPhoneUse/Input/KeyboardMap.swift
+@@ -51,7 +51,9 @@ enum KeyboardMap {
+     /// Key commands supply their modifiers separately, so character lookup
+     /// returns only the usage code and does not add an implicit Shift modifier.
+     static func code(for name: String) -> UInt8? {
+-        named[name.lowercased()] ?? stroke(for: Character(name))?.code
++        if let code = named[name.lowercased()] { return code }
++        guard name.count == 1, let character = name.first else { return nil }
++        return stroke(for: character)?.code
+     }
+ 
+     static func modifierBit(for name: String) -> UInt8? {
+diff --git a/Sources/iPhoneUse/MCP/MCPKeyboardSequence.swift b/Sources/iPhoneUse/MCP/MCPKeyboardSequence.swift
+index cdbf4ca..88cbcaf 100644
+--- a/Sources/iPhoneUse/MCP/MCPKeyboardSequence.swift
++++ b/Sources/iPhoneUse/MCP/MCPKeyboardSequence.swift
+@@ -80,17 +80,11 @@ enum MCPKeyboardSequence {
+             }
+             if let key = step["key"] as? String,
+                 Set(step.keys).isSubset(of: ["type", "key", "modifiers"]),
+-                step["type"] == nil || step["type"] as? String == "key",
+-                // Character(String) traps for unknown multi-character names.
+-                KeyboardMap.named[key.lowercased()] != nil || key.count == 1,
+-                KeyboardMap.code(for: key) != nil,
+-                step["modifiers"] == nil || step["modifiers"] is [String]
++                step["type"] == nil || step["type"] as? String == "key"
+             {
+-                let modifiers = step["modifiers"] as? [String] ?? []
+-                guard KeyboardMap.modifierMask(for: modifiers) != nil else {
+-                    throw MCPServer.MCPError(table.kbUnknownModifier(label))
+-                }
+-                return [.request(MCPToolRequest(path: "/key", body: ["key": key, "modifiers": modifiers]))]
++                _ = key
++                do { return [.request(MCPToolRequest(path: "/key", body: try KeyRequest(step).body))] }
++                catch { throw MCPServer.MCPError("\(label): \(error)") }
+             }
+             let rawDelay: Any?
+             if Set(step.keys) == ["delay"] {
+diff --git a/Sources/iPhoneUse/MCP/MCPServer.swift b/Sources/iPhoneUse/MCP/MCPServer.swift
+index e3373a7..8fbd61c 100644
+--- a/Sources/iPhoneUse/MCP/MCPServer.swift
++++ b/Sources/iPhoneUse/MCP/MCPServer.swift
+@@ -721,7 +721,7 @@ private struct MCPHTTPClient {
+         let message = body?["error"] as? String ?? "HTTP \(status)"
+         guard let body, body["failed_step"] != nil || body["completed"] != nil else {
+             return MCPServer.MCPError(message, httpStatus: status,
+-                inputNotSent: body?["frame_rejected"] as? Bool == true && body?["input_sent"] as? Bool == false)
++                inputNotSent: body?["input_sent"] as? Bool == false)
+         }
+         var progress: [String: Any] = ["error": message]
+         progress["failed_step"] = body["failed_step"]
+diff --git a/Sources/iPhoneUse/MCP/MCPTools.swift b/Sources/iPhoneUse/MCP/MCPTools.swift
+index b5a6153..c1de9ea 100644
+--- a/Sources/iPhoneUse/MCP/MCPTools.swift
++++ b/Sources/iPhoneUse/MCP/MCPTools.swift
+@@ -274,7 +274,6 @@ struct MCPToolRequest {
+             }
+             return MCPToolRequest(path: name == "ocr_screen" ? "/ocr" : "/tap_text", body: withDevice(body, device))
+         case "move_pointer":
+-            let body = try scaled(arguments, ["x", "y"], longEdge: longEdge, language: language)
+             for key in ["x", "y"] {
+                 guard let value = arguments[key] as? NSNumber,
+                     CFGetTypeID(value) != CFBooleanGetTypeID(), value.doubleValue.isFinite, value.doubleValue >= 0
+@@ -282,17 +281,11 @@ struct MCPToolRequest {
+                     throw MCPServer.MCPError(StringsMCP(language: language).coordinateFinite(key))
+                 }
+             }
++            let body = try scaled(arguments, ["x", "y"], longEdge: longEdge, language: language)
+             return MCPToolRequest(path: "/move", body: body)
+         case "adjust_pointer":
+-            var body: [String: Any] = ["click": false]
+-            for key in ["dx", "dy"] {
+-                guard let value = arguments[key] as? NSNumber,
+-                    CFGetTypeID(value) != CFBooleanGetTypeID(), value.doubleValue.isFinite,
+-                    (-32...32).contains(value.doubleValue), value.doubleValue.rounded() == value.doubleValue
+-                else { throw MCPServer.MCPError(StringsMCP(language: language).hidCountRange(key)) }
+-                body[key] = value.intValue
+-            }
+-            return MCPToolRequest(path: "/nudge", body: withDevice(body, device))
++            let nudge = try NudgeRequest(arguments, requireDeltas: true)
++            return MCPToolRequest(path: "/nudge", body: withDevice(["dx": nudge.dx, "dy": nudge.dy, "click": false], device))
+         case "click_pointer":
+             return MCPToolRequest(path: "/nudge", body: withDevice(["dx": 0, "dy": 0, "click": true], device))
+         case "tap":
+@@ -300,7 +293,7 @@ struct MCPToolRequest {
+                 path: "/tap", body: try scaled(arguments, ["x", "y"], longEdge: longEdge, language: language))
+         case "long_press":
+             var body = try scaled(arguments, ["x", "y"], longEdge: longEdge, language: language)
+-            body["hold"] = arguments["seconds"] ?? 1.0
++            body["hold"] = try HoldRequest(arguments, key: "seconds", default: 1.0).seconds
+             return MCPToolRequest(path: "/tap", body: body)
+         case "swipe":
+             var body = try scaled(arguments, ["points"], longEdge: longEdge, language: language)
+@@ -320,7 +313,7 @@ struct MCPToolRequest {
+         case "press_key":
+             return MCPToolRequest(
+                 path: "/key",
+-                body: withDevice(["key": arguments["key"] ?? "", "modifiers": arguments["modifiers"] ?? []], device))
++                body: withDevice(try KeyRequest(arguments).body, device))
+         case "home":
+             return MCPToolRequest(path: "/home", body: withDevice([:], device))
+         default:
+@@ -372,6 +365,18 @@ struct MCPToolRequest {
+             }
+         }
+         if normalized { body["fraction"] = true }
++        if let points = body["points"] as? [[String: Any]] {
++            guard points.count >= 2 else { throw InputRequestError("swipe requires at least two points") }
++            for point in points {
++                var coordinates = body
++                coordinates["x"] = point["x"]; coordinates["y"] = point["y"]
++                _ = try CoordinateRequest(coordinates)
++            }
++        } else if body["points"] != nil {
++            throw InputRequestError("points must be an array of positions")
++        } else {
++            _ = try CoordinateRequest(body)
++        }
+         return withDevice(body, (arguments["device"] as? String) ?? (arguments["device_id"] as? String))
+     }
+ 
+diff --git a/Tests/iPhoneUseTests/API/HTTPAPITests.swift b/Tests/iPhoneUseTests/API/HTTPAPITests.swift
+index 2178f55..70267c8 100644
+--- a/Tests/iPhoneUseTests/API/HTTPAPITests.swift
++++ b/Tests/iPhoneUseTests/API/HTTPAPITests.swift
+@@ -195,17 +195,20 @@ final class RequestCoordinatesTests: XCTestCase {
+         XCTAssertEqual(point.1, 0.5)
+     }
+ 
+-    func testFractionsAvoidFrameAccessAndDoNotClampAtTheAPIBoundary() throws {
++    func testValidFractionsAvoidFrameAccessAndOutOfRangeFractionsAreRejected() throws {
+         var frameReads = 0
+         func readFrame() -> CGSize? {
+             frameReads += 1
+             return nil
+         }
+         let point = try RequestCoordinates.point(
+-            ["x": -0.25, "y": 1.5, "fraction": true], "x", "y",
++            ["x": 0.25, "y": 1, "fraction": true], "x", "y",
+             screenSize: readFrame(), screenName: "phone")
+-        XCTAssertEqual(point.0, -0.25)
+-        XCTAssertEqual(point.1, 1.5)
++        XCTAssertEqual(point.0, 0.25)
++        XCTAssertEqual(point.1, 1)
++        XCTAssertThrowsError(try RequestCoordinates.point(
++            ["x": -0.25, "y": 1.5, "fraction": true], "x", "y",
++            screenSize: readFrame(), screenName: "phone"))
+         XCTAssertEqual(frameReads, 0)
+     }
+ 
+@@ -214,23 +217,25 @@ final class RequestCoordinatesTests: XCTestCase {
+             try RequestCoordinates.point(
+                 ["x": 12], "x", "y", screenSize: nil, screenName: "phone")
+         ) { error in
+-            XCTAssertEqual(String(describing: error), "x and y are required")
++            XCTAssertEqual(String(describing: error), "y must be a finite number")
+         }
+         XCTAssertThrowsError(
+             try RequestCoordinates.point(
+                 ["x": 1, "y": 2, "width": 100, "height": 200], "x", "y",
+                 screenSize: nil, screenName: "phone")
+         ) { error in
+-            XCTAssertEqual(String(describing: error), "no frame yet from phone")
++            XCTAssertEqual(String(describing: error), "A finite positive capture size is required for image pixels")
+         }
+     }
+ 
+-    func testNumericBridgingAndZeroDimensionsRemainPermissive() throws {
+-        let point = try RequestCoordinates.point(
+-            ["x": true, "y": 2, "width": 2, "height": 0], "x", "y",
+-            screenSize: CGSize(width: 100, height: 200), screenName: "phone")
+-        XCTAssertEqual(point.0, 0.5)
+-        XCTAssertTrue(point.1.isInfinite)
++    func testBooleanCoordinatesAndZeroDimensionsAreRejected() {
++        for body: [String: Any] in [
++            ["x": true, "y": 2, "width": 2, "height": 20],
++            ["x": 1, "y": 2, "width": 2, "height": 0],
++        ] {
++            XCTAssertThrowsError(try RequestCoordinates.point(
++                body, "x", "y", screenSize: CGSize(width: 100, height: 200), screenName: "phone"))
++        }
+     }
+ }
+ 
+@@ -253,7 +258,7 @@ final class SwipeRequestTests: XCTestCase {
+             MCPToolRequest.action(
+                 named: "swipe",
+                 arguments: [
+-                    "points": [["x": 0, "y": 1000], ["x": 500, "y": 500], ["x": 0, "y": 0]],
++                    "points": [["x": 0, "y": 800], ["x": 400, "y": 500], ["x": 0, "y": 0]],
+                     "duration": 0.12, "device": "phone",
+                 ], longEdge: MCPServer.longEdge))
+         let json = try JSONSerialization.data(withJSONObject: action.body)
+@@ -278,11 +283,11 @@ final class SwipeRequestTests: XCTestCase {
+         XCTAssertEqual(reports[0].0, .absolutePointer)
+         XCTAssertEqual(reports[0].1[0], 0)
+         XCTAssertNotEqual(Array(reports[0].1[1...2]), [0, 0])
+-        XCTAssertNotEqual(Array(reports[0].1[3...4]), [255, 127])
++        XCTAssertNotEqual(Array(reports[0].1[3...4]), [102, 102])
+         XCTAssertEqual(reports[1].0, .relativeMouse)
+         XCTAssertEqual(reports[1].1, [0, 0, 0, 0])
+         XCTAssertEqual(reports[2].0, .absolutePointer)
+-        XCTAssertEqual(reports[2].1, [0, 0, 0, 255, 127])
++        XCTAssertEqual(reports[2].1, [0, 0, 0, 102, 102])
+         XCTAssertEqual(reports.filter { $0.0 == .absolutePointer }.count, 2)
+         XCTAssertEqual(reports[3].0, .relativeMouse)
+         XCTAssertEqual(reports[3].1, [1, 0, 0, 0])
+@@ -300,29 +305,29 @@ final class SwipeRequestTests: XCTestCase {
+     }
+ 
+     func testJSONPathUsesOriginalScreenPixelsAndPreservesPointOrder() throws {
+-        let json = #"{"points":[{"x":0,"y":200},{"x":100,"y":100},{"x":50,"y":0}],"duration":0.6}"#
++        let json = #"{"points":[{"x":0,"y":160},{"x":80,"y":100},{"x":50,"y":0}],"duration":0.6}"#
+         let wire = Data("POST /swipe HTTP/1.1\r\nContent-Length: \(json.utf8.count)\r\n\r\n\(json)".utf8)
+         let request = try XCTUnwrap(HTTPRequest.parse(wire))
+         let swipe = try SwipeRequest(request.body, screenSize: CGSize(width: 100, height: 200), screenName: "phone")
+ 
+-        XCTAssertEqual(swipe.points.map { $0.0 }, [0, 1, 0.5])
+-        XCTAssertEqual(swipe.points.map { $0.1 }, [1, 0.5, 0])
++        XCTAssertEqual(swipe.points.map { $0.0 }, [0, 0.8, 0.5])
++        XCTAssertEqual(swipe.points.map { $0.1 }, [0.8, 0.5, 0])
+         XCTAssertEqual(swipe.duration, 0.6)
+     }
+ 
+     func testScreenshotScalingAppliesToEveryPointAndExplicitDimensionsOverrideIt() throws {
+         let body: [String: Any] = [
+-            "points": [["x": 337.5, "y": 600], ["x": 675, "y": 1200]], "maxEdge": 1200,
++            "points": [["x": 337.5, "y": 600], ["x": 540, "y": 960]], "maxEdge": 1200,
+         ]
+         let scaled = try SwipeRequest(body, screenSize: CGSize(width: 750, height: 1334), screenName: "phone")
+-        XCTAssertEqual(scaled.points.map { $0.0 }, [0.5, 1])
+-        XCTAssertEqual(scaled.points.map { $0.1 }, [0.5, 1])
++        XCTAssertEqual(scaled.points.map { $0.0 }, [0.5, 0.8])
++        XCTAssertEqual(scaled.points.map { $0.1 }, [0.5, 0.8])
+ 
+         var resizedBody = body
+         resizedBody["width"] = 1350
+         let resized = try SwipeRequest(resizedBody, screenSize: CGSize(width: 750, height: 1334), screenName: "phone")
+-        XCTAssertEqual(resized.points.map { $0.0 }, [0.25, 0.5])
+-        XCTAssertEqual(resized.points.map { $0.1 }, [0.5, 1])
++        XCTAssertEqual(resized.points.map { $0.0 }, [0.25, 0.4])
++        XCTAssertEqual(resized.points.map { $0.1 }, [0.5, 0.8])
+     }
+ 
+     func testFractionPathNeedsNoFrameAndUsesDefaultDuration() throws {
+@@ -624,7 +629,7 @@ final class TypeTextRequestTests: XCTestCase {
+             var reports: [[UInt8]] = []
+             let input = DeviceInput(
+                 host: UUID(), session: UUID(), screenSize: { nil }, sleep: { _ in },
+-                reportSender: { _, bytes in reports.append(bytes) })
++                reportSender: { _, bytes in reports.append(bytes) }, reportReadiness: { _, _, _ in true })
+             let body: [String: Any] = [
+                 "text": "a", "clear_before": mask & 1 != 0, "commit_ime": mask & 2 != 0, "press_enter": mask & 4 != 0,
+             ]
+@@ -664,7 +669,7 @@ final class TypeTextRequestTests: XCTestCase {
+         var delays: [TimeInterval] = []
+         let input = DeviceInput(
+             host: UUID(), session: UUID(), screenSize: { nil }, sleep: { _ in },
+-            reportSender: { _, bytes in reports.append(bytes) })
++            reportSender: { _, bytes in reports.append(bytes) }, reportReadiness: { _, _, _ in true })
+         func result(_ labels: [String]) -> ScreenOCR.Result {
+             ScreenOCR.Result(
+                 width: 100, height: 100,
+@@ -700,7 +705,7 @@ final class TypeTextRequestTests: XCTestCase {
+         var reports = 0
+         let input = DeviceInput(
+             host: UUID(), session: UUID(), screenSize: { nil }, sleep: { _ in },
+-            reportSender: { _, _ in reports += 1 })
++            reportSender: { _, _ in reports += 1 }, reportReadiness: { _, _, _ in true })
+         var invalid: [[String: Any]] = [["clear_before": true], ["text": "🙂", "clear_before": true]]
+         for option in MCPKeyboardSequence.textOptions {
+             for value: Any in [0, 1, "true", NSNull()] {
+diff --git a/Tests/iPhoneUseTests/API/Phase2Tests.swift b/Tests/iPhoneUseTests/API/Phase2Tests.swift
+index ab3e99f..5da6aa7 100644
+--- a/Tests/iPhoneUseTests/API/Phase2Tests.swift
++++ b/Tests/iPhoneUseTests/API/Phase2Tests.swift
+@@ -206,7 +206,7 @@ final class Phase2Tests: XCTestCase {
+             host: UUID(), session: UUID(), sleep: { _ in },
+             reportSender: { _, bytes in
+                 reports.append(bytes)
+-            })
++            }, reportReadiness: { _, _, _ in true })
+         input.step = 0
+         let request = try TypeTextRequest(["text": "重庆🙂", "use_clipboard": true])
+         XCTAssertFalse(request.ensureChineseIME)
+@@ -231,7 +231,7 @@ final class Phase2Tests: XCTestCase {
+ 
+     func testClipboardFailureCannotClearFocusedField() throws {
+         var reports = 0
+-        let input = DeviceInput(host: UUID(), session: UUID(), sleep: { _ in }, reportSender: { _, _ in reports += 1 })
++        let input = DeviceInput(host: UUID(), session: UUID(), sleep: { _ in }, reportSender: { _, _ in reports += 1 }, reportReadiness: { _, _, _ in true })
+         let request = try TypeTextRequest(["text": "中文", "use_clipboard": true, "clear_before": true])
+         XCTAssertThrowsError(try request.perform(on: input, clipboard: { _ in throw DeviceError("clipboard failed") }))
+         XCTAssertEqual(reports, 0)
+diff --git a/Tests/iPhoneUseTests/Input/DeviceClipboardTests.swift b/Tests/iPhoneUseTests/Input/DeviceClipboardTests.swift
+index fff7168..6743237 100644
+--- a/Tests/iPhoneUseTests/Input/DeviceClipboardTests.swift
++++ b/Tests/iPhoneUseTests/Input/DeviceClipboardTests.swift
+@@ -70,7 +70,7 @@ final class DeviceClipboardTests: XCTestCase {
+     func testHelperFailurePrecedesClearAndPasteReports() throws {
+         let environment = try helper("printf 'service unavailable' >&2\nexit 7\n", in: temporary())
+         var reports = 0
+-        let input = DeviceInput(host: UUID(), session: UUID(), sleep: { _ in }, reportSender: { _, _ in reports += 1 })
++        let input = DeviceInput(host: UUID(), session: UUID(), sleep: { _ in }, reportSender: { _, _ in reports += 1 }, reportReadiness: { _, _, _ in true })
+         let request = try TypeTextRequest(
+             ["text": "中文 🧩", "clear_before": true, "press_enter": true], deviceClipboardConfigured: true)
+         XCTAssertThrowsError(
+diff --git a/Tests/iPhoneUseTests/Input/DeviceInputAbsoluteResetTests.swift b/Tests/iPhoneUseTests/Input/DeviceInputAbsoluteResetTests.swift
+index d7c01f9..00e8dec 100644
+--- a/Tests/iPhoneUseTests/Input/DeviceInputAbsoluteResetTests.swift
++++ b/Tests/iPhoneUseTests/Input/DeviceInputAbsoluteResetTests.swift
+@@ -73,7 +73,7 @@ private final class AbsoluteResetHost {
+         DeviceInput(
+             host: host, session: session, screenSize: { CGSize(width: 1179, height: 2556) },
+             inputIsAllowed: { [unowned self] in allowed }, sleep: sleep,
+-            reportSender: { [unowned self] in send($0, $1) })
++            reportSender: { [unowned self] in send($0, $1) }, reportReadiness: { _, _, _ in true })
+     }
+ }
+ 
+diff --git a/Tests/iPhoneUseTests/Input/DeviceInputDisplayMappingTests.swift b/Tests/iPhoneUseTests/Input/DeviceInputDisplayMappingTests.swift
+index 4bcf907..22a985a 100644
+--- a/Tests/iPhoneUseTests/Input/DeviceInputDisplayMappingTests.swift
++++ b/Tests/iPhoneUseTests/Input/DeviceInputDisplayMappingTests.swift
+@@ -167,7 +167,7 @@ final class DeviceInputDisplayMappingTests: XCTestCase {
+         let input = DeviceInput(
+             host: UUID(), session: UUID(), screenSize: { phone.captureSize }, heldDragProfile: .notConfigured,
+             displayMappingProvider: { queries += 1; return try phone.mapping() },
+-            sleep: { _ in }, reportSender: phone.send)
++            sleep: { _ in }, reportSender: phone.send, reportReadiness: { _, _, _ in true })
+         input.press(x: 0.2, y: 0.3)
+         try input.type("")
+         input.drag(x: 0.21, y: 0.31)
+@@ -193,7 +193,7 @@ final class DeviceInputDisplayMappingTests: XCTestCase {
+             displayMappingProvider: {
+                 queries += 1
+                 return try phone.mapping()
+-            }, sleep: { _ in }, reportSender: phone.send)
++            }, sleep: { _ in }, reportSender: phone.send, reportReadiness: { _, _, _ in true })
+         input.press(x: 0.2, y: 0.3)
+         try input.type("")
+         XCTAssertEqual(phone.presses.count, 1)
+@@ -218,7 +218,7 @@ final class DeviceInputDisplayMappingTests: XCTestCase {
+                 queries += 1
+                 if queries > 1 { throw DeviceError("display unavailable") }
+                 return try phone.mapping()
+-            }, sleep: { _ in }, reportSender: phone.send)
++            }, sleep: { _ in }, reportSender: phone.send, reportReadiness: { _, _, _ in true })
+         input.press(x: 0.2, y: 0.3)
+         try input.type("")
+         let before = phone.reports.count
+@@ -253,7 +253,7 @@ final class DeviceInputDisplayMappingTests: XCTestCase {
+                         waiting.signal()
+                         XCTAssertTrue(resume.wait(timeout: .now() + 2) == .success)
+                     }
+-                }, reportSender: phone.send)
++                }, reportSender: phone.send, reportReadiness: { _, _, _ in true })
+             input.press(x: 0.2, y: 0.3)
+             XCTAssertTrue(waiting.wait(timeout: .now() + 2) == .success)
+             input.cancelPointer()
+@@ -280,7 +280,7 @@ final class DeviceInputDisplayMappingTests: XCTestCase {
+                     throw DeviceError("test display read was not released")
+                 }
+                 return try phone.mapping()
+-            }, sleep: { _ in }, reportSender: phone.send)
++            }, sleep: { _ in }, reportSender: phone.send, reportReadiness: { _, _, _ in true })
+         input.press(x: 0.2, y: 0.3)
+         XCTAssertTrue(waiting.wait(timeout: .now() + 2) == .success)
+         input.release(x: 0.2, y: 0.3)
+diff --git a/Tests/iPhoneUseTests/Input/DeviceInputKeyboardTests.swift b/Tests/iPhoneUseTests/Input/DeviceInputKeyboardTests.swift
+index 5610db6..d76ab8a 100644
+--- a/Tests/iPhoneUseTests/Input/DeviceInputKeyboardTests.swift
++++ b/Tests/iPhoneUseTests/Input/DeviceInputKeyboardTests.swift
+@@ -7,7 +7,7 @@ import XCTest
+ final class DeviceInputKeyboardTests: XCTestCase {
+     func testTypingPreservesShiftPressAndReleaseReports() throws {
+         var reports: [(ReportID, [UInt8])] = []
+-        let input = DeviceInput(host: UUID(), session: UUID(), reportSender: { reports.append(($0, $1)) })
++        let input = DeviceInput(host: UUID(), session: UUID(), reportSender: { reports.append(($0, $1)) }, reportReadiness: { _, _, _ in true })
+         input.step = 0
+ 
+         try input.type("aA!\n")
+@@ -27,7 +27,7 @@ final class DeviceInputKeyboardTests: XCTestCase {
+ 
+     func testWindowTypingCombinesCharacterAndExplicitModifiers() throws {
+         var reports: [(ReportID, [UInt8])] = []
+-        let input = DeviceInput(host: UUID(), session: UUID(), reportSender: { reports.append(($0, $1)) })
++        let input = DeviceInput(host: UUID(), session: UUID(), reportSender: { reports.append(($0, $1)) }, reportReadiness: { _, _, _ in true })
+         input.step = 0
+ 
+         XCTAssertTrue(input.typeFromKeyboard("A", modifiers: ["CMD", "shift"]))
+@@ -48,7 +48,7 @@ final class DeviceInputKeyboardTests: XCTestCase {
+ 
+     func testInvalidKeyboardInputSendsNoPartialTextOrModifierReports() throws {
+         var reports: [(ReportID, [UInt8])] = []
+-        let input = DeviceInput(host: UUID(), session: UUID(), reportSender: { reports.append(($0, $1)) })
++        let input = DeviceInput(host: UUID(), session: UUID(), reportSender: { reports.append(($0, $1)) }, reportReadiness: { _, _, _ in true })
+         input.step = 0
+ 
+         XCTAssertThrowsError(try input.type("a🙂")) { error in
+@@ -70,7 +70,7 @@ final class DeviceInputKeyboardTests: XCTestCase {
+ 
+     func testNamedKeyKeepsExplicitModifierMask() throws {
+         var reports: [(ReportID, [UInt8])] = []
+-        let input = DeviceInput(host: UUID(), session: UUID(), reportSender: { reports.append(($0, $1)) })
++        let input = DeviceInput(host: UUID(), session: UUID(), reportSender: { reports.append(($0, $1)) }, reportReadiness: { _, _, _ in true })
+         input.step = 0
+ 
+         try input.key("A", modifiers: ["CMD", "command"])
+@@ -86,7 +86,7 @@ final class DeviceInputKeyboardTests: XCTestCase {
+ 
+     func testLargeRelativeNudgeChunksSignedCountsBeforeClicking() throws {
+         var reports: [(ReportID, [UInt8])] = []
+-        let input = DeviceInput(host: UUID(), session: UUID(), reportSender: { reports.append(($0, $1)) })
++        let input = DeviceInput(host: UUID(), session: UUID(), reportSender: { reports.append(($0, $1)) }, reportReadiness: { _, _, _ in true })
+         input.step = 0
+ 
+         try input.nudge(dx: 300, dy: -130, click: true)
+@@ -102,7 +102,7 @@ final class DeviceInputKeyboardTests: XCTestCase {
+ 
+     func testConsumerUsageIsLittleEndianAndReleased() {
+         var reports: [(ReportID, [UInt8])] = []
+-        let input = DeviceInput(host: UUID(), session: UUID(), reportSender: { reports.append(($0, $1)) })
++        let input = DeviceInput(host: UUID(), session: UUID(), reportSender: { reports.append(($0, $1)) }, reportReadiness: { _, _, _ in true })
+         input.step = 0
+ 
+         input.consumer(0x0223)
+@@ -121,7 +121,7 @@ final class DeviceInputKeyboardTests: XCTestCase {
+             reportSender: { id, bytes in
+                 reports.append((id, bytes))
+                 if bytes == [0x30, 0] { allowed = false }
+-            })
++            }, reportReadiness: { _, _, _ in true })
+         input.step = 0
+ 
+         input.consumer(0x0030)
+diff --git a/Tests/iPhoneUseTests/Input/DeviceInputPointerTests.swift b/Tests/iPhoneUseTests/Input/DeviceInputPointerTests.swift
+index 06caa89..85b581e 100644
+--- a/Tests/iPhoneUseTests/Input/DeviceInputPointerTests.swift
++++ b/Tests/iPhoneUseTests/Input/DeviceInputPointerTests.swift
+@@ -36,7 +36,7 @@ final class DeviceInputPointerTests: XCTestCase {
+         XCTAssertTrue(input.isBluetoothReady)
+         XCTAssertFalse(input.isPointerReady)
+         XCTAssertThrowsError(try input.move(x: 0.5, y: 0.5))
+-        try input.key("enter", modifiers: [])
++        XCTAssertThrowsError(try input.key("enter", modifiers: []))
+         XCTAssertTrue(reports.allSatisfy { $0.1.allSatisfy { $0 == 0 } })
+         allowed = true
+         try input.move(x: 0.5, y: 0.5)
+@@ -48,12 +48,12 @@ final class DeviceInputPointerTests: XCTestCase {
+         var reports: [(ReportID, [UInt8])] = []
+         let input = DeviceInput(
+             host: UUID(), session: UUID(), inputIsAllowed: { false }, sleep: { _ in },
+-            reportSender: { reports.append(($0, $1)) })
++            reportSender: { reports.append(($0, $1)) }, reportReadiness: { _, _, _ in true })
+ 
+         XCTAssertThrowsError(try input.tap(x: 0.5, y: 0.5))
+-        try input.nudge(dx: 32, dy: 0, click: true)
++        XCTAssertThrowsError(try input.nudge(dx: 32, dy: 0, click: true))
+         input.positionPointer(x: 0.8, y: 0.3)
+-        try input.nudge(dx: 0, dy: 0, click: false)
++        XCTAssertThrowsError(try input.nudge(dx: 0, dy: 0, click: false))
+ 
+         XCTAssertFalse(input.isPointerReady)
+         // A harmless neutral release may pass; no movement or press may pass.
+@@ -68,16 +68,17 @@ final class DeviceInputPointerTests: XCTestCase {
+             reportSender: { id, bytes in
+                 reports.append((id, bytes))
+                 if id == .relativeMouse && bytes[0] == 1 { allowed = false }
+-            })
++            }, reportReadiness: { _, _, _ in true })
+ 
+         input.press(x: 0.5, y: 0.5)
+         // This case starts with an accepted touch. Cancelling an unsent press
+         // is a separate contract and may correctly suppress every report.
+-        try input.type("")
++        // Drain the queue; association loss now explicitly rejects this new action.
++        XCTAssertThrowsError(try input.type(""))
+         XCTAssertEqual(reports.last?.1, [1, 0, 0, 0])
+         XCTAssertFalse(allowed, "the accepted press must invalidate capture before cancellation")
+         input.cancelPointer()
+-        try input.nudge(dx: 0, dy: 0, click: false)
++        XCTAssertThrowsError(try input.nudge(dx: 0, dy: 0, click: false))
+ 
+         removeInitialAbsolutePrime(&reports)
+         XCTAssertEqual(reports.map { $0.0 }, [.absolutePointer, .relativeMouse, .relativeMouse])
+@@ -137,7 +138,7 @@ final class DeviceInputPointerTests: XCTestCase {
+             reportSender: { id, bytes in
+                 reports.append((id, bytes))
+                 if id == .relativeMouse { XCTAssertTrue(input.keyFromKeyboard("a")) }
+-            })
++            }, reportReadiness: { _, _, _ in true })
+         XCTAssertThrowsError(
+             try input.measureRelativePointer(
+                 screenID: "phone", size: CGSize(width: 750, height: 1334), isReady: { true },
+@@ -254,13 +255,13 @@ final class DeviceInputPointerTests: XCTestCase {
+         var reports: [(ReportID, [UInt8])] = []
+         let input = DeviceInput(
+             host: UUID(), session: UUID(), sleep: { _ in },
+-            reportSender: { reports.append(($0, $1)) })
++            reportSender: { reports.append(($0, $1)) }, reportReadiness: { _, _, _ in true })
+         try input.retireForCalibrationReload()
+         XCTAssertTrue(input.isRetired)
+         XCTAssertFalse(input.isCurrentSession)
+         XCTAssertFalse(input.isPointerReady)
+         XCTAssertThrowsError(try input.move(x: 0.5, y: 0.5))
+-        try input.nudge(dx: 8, dy: 0, click: false)
++        XCTAssertThrowsError(try input.nudge(dx: 8, dy: 0, click: false))
+         XCTAssertTrue(reports.isEmpty)
+     }
+ 
+@@ -626,7 +627,7 @@ final class DeviceInputPointerTests: XCTestCase {
+ 
+     func testCoordinateTapAfterWindowMovementUsesRequestedPixels() throws {
+         var reports: [(ReportID, [UInt8])] = []
+-        let input = DeviceInput(host: UUID(), session: UUID(), reportSender: { reports.append(($0, $1)) })
++        let input = DeviceInput(host: UUID(), session: UUID(), reportSender: { reports.append(($0, $1)) }, reportReadiness: { _, _, _ in true })
+ 
+         input.positionPointer(x: 1, y: 1)
+         try input.nudge(dx: 0, dy: 0, click: false)
+@@ -652,7 +653,7 @@ final class DeviceInputPointerTests: XCTestCase {
+ 
+     func testWindowClickPositionsAtMouseDownEvenWithoutHover() throws {
+         var reports: [(ReportID, [UInt8])] = []
+-        let input = DeviceInput(host: UUID(), session: UUID(), reportSender: { reports.append(($0, $1)) })
++        let input = DeviceInput(host: UUID(), session: UUID(), reportSender: { reports.append(($0, $1)) }, reportReadiness: { _, _, _ in true })
+ 
+         try input.tap(x: 1, y: 0)
+         input.press(x: 0, y: 1)
+@@ -677,7 +678,7 @@ final class DeviceInputPointerTests: XCTestCase {
+         var reports: [(ReportID, [UInt8])] = []
+         let input = DeviceInput(
+             host: UUID(), session: UUID(), screenSize: { CGSize(width: 750, height: 1334) },
+-            reportSender: { reports.append(($0, $1)) })
++            reportSender: { reports.append(($0, $1)) }, reportReadiness: { _, _, _ in true })
+ 
+         input.press(x: 0, y: 0)
+         input.drag(x: 0.5, y: 0.5)
+@@ -706,7 +707,7 @@ final class DeviceInputPointerTests: XCTestCase {
+     func testWindowDragReleasesButtonStateForEveryPointerReport() throws {
+         var reports: [(ReportID, [UInt8])] = []
+         let input = DeviceInput(
+-            host: UUID(), session: UUID(), sleep: { _ in }, reportSender: { reports.append(($0, $1)) })
++            host: UUID(), session: UUID(), sleep: { _ in }, reportSender: { reports.append(($0, $1)) }, reportReadiness: { _, _, _ in true })
+ 
+         input.press(x: 0.2, y: 0.4)
+         input.drag(x: 0.6, y: 0.4)
+@@ -733,7 +734,7 @@ final class DeviceInputPointerTests: XCTestCase {
+ 
+     func testCoordinateGestureCannotInterruptHeldWindowButton() throws {
+         var reports: [(ReportID, [UInt8])] = []
+-        let input = DeviceInput(host: UUID(), session: UUID(), reportSender: { reports.append(($0, $1)) })
++        let input = DeviceInput(host: UUID(), session: UUID(), reportSender: { reports.append(($0, $1)) }, reportReadiness: { _, _, _ in true })
+ 
+         input.press(x: 0.5, y: 0.5)
+         for gesture in [
+@@ -761,7 +762,7 @@ final class DeviceInputPointerTests: XCTestCase {
+ 
+     func testFocusCancellationReleasesWindowButtonAndAllowsAPITap() throws {
+         var reports: [(ReportID, [UInt8])] = []
+-        let input = DeviceInput(host: UUID(), session: UUID(), reportSender: { reports.append(($0, $1)) })
++        let input = DeviceInput(host: UUID(), session: UUID(), reportSender: { reports.append(($0, $1)) }, reportReadiness: { _, _, _ in true })
+         input.press(x: 0, y: 0)
+         try input.type("")
+         XCTAssertEqual(reports.last?.1, [1, 0, 0, 0], "focus loss must occur after the touch was accepted")
+@@ -796,7 +797,7 @@ final class DeviceInputPointerTests: XCTestCase {
+                     XCTAssertEqual(id, .relativeMouse)
+                     XCTAssertEqual(bytes, [0, 0, 0, 0])
+                 }
+-            })
++            }, reportReadiness: { _, _, _ in true })
+         input.positionPointer(x: 0, y: 0)
+         input.positionPointer(x: 0.5, y: 0.5)
+         input.positionPointer(x: 1, y: 1)
+@@ -813,7 +814,7 @@ final class DeviceInputPointerTests: XCTestCase {
+         var reports: [[UInt8]] = []
+         let input = DeviceInput(
+             host: calibration.host, session: UUID(), calibration: calibration,
+-            reportSender: { _, bytes in reports.append(bytes) })
++            reportSender: { _, bytes in reports.append(bytes) }, reportReadiness: { _, _, _ in true })
+ 
+         input.positionPointer(x: 0.5, y: 0.5)
+         try input.nudge(dx: 0, dy: 0, click: false)
+diff --git a/Tests/iPhoneUseTests/Input/DeviceInputRotatedHeldDragTests.swift b/Tests/iPhoneUseTests/Input/DeviceInputRotatedHeldDragTests.swift
+index 77982b9..03fbd30 100644
+--- a/Tests/iPhoneUseTests/Input/DeviceInputRotatedHeldDragTests.swift
++++ b/Tests/iPhoneUseTests/Input/DeviceInputRotatedHeldDragTests.swift
+@@ -47,7 +47,7 @@ private final class RotatingHeldHost {
+             host: host, session: UUID(), calibration: calibration, screenID: captureID ?? screenID,
+             screenSize: { self.captureSize }, heldDragProfile: selection ?? .loaded(profile()),
+             displayMappingProvider: provider, inputIsAllowed: { self.allowed },
+-            sleep: { _ in }, reportSender: receive)
++            sleep: { _ in }, reportSender: receive, reportReadiness: { _, _, _ in true })
+     }
+ 
+     func receive(_ id: ReportID, _ bytes: [UInt8]) {
+@@ -251,7 +251,10 @@ final class DeviceInputRotatedHeldDragTests: XCTestCase {
+             else { phone.captureOverride = CGSize(width: 1180, height: 2556) }
+             if interruption == "cancel" { input.cancelPointer() }
+             else { input.release(x: 0.8, y: 0.7) }
+-            try input.type("")
++            // A barrier still drains the queue, but association loss now makes
++            // the new keyboard action explicitly unavailable.
++            if interruption == "association" { XCTAssertThrowsError(try input.type("")) }
++            else { try input.type("") }
+             let released = Array(phone.reports.dropFirst(before))
+             XCTAssertEqual(released.map(\.0), [.relativeMouse])
+             XCTAssertEqual(released.map(\.1), [[0, 0, 0, 0]])
+diff --git a/Tests/iPhoneUseTests/Input/DeviceInputTrackingTests.swift b/Tests/iPhoneUseTests/Input/DeviceInputTrackingTests.swift
+index 1e6f4d3..a2bfbb7 100644
+--- a/Tests/iPhoneUseTests/Input/DeviceInputTrackingTests.swift
++++ b/Tests/iPhoneUseTests/Input/DeviceInputTrackingTests.swift
+@@ -64,7 +64,7 @@ final class DeviceInputTrackingTests: XCTestCase {
+         let pointer = SimulatedPointer(calibration: calibration)
+         let input = DeviceInput(
+             host: calibration.host, session: UUID(), calibration: calibration,
+-            reportSender: pointer.receive)
++            reportSender: pointer.receive, reportReadiness: { _, _, _ in true })
+         input.step = 0
+         return (input, pointer)
+     }
+diff --git a/Tests/iPhoneUseTests/Input/HeldDragProfileTests.swift b/Tests/iPhoneUseTests/Input/HeldDragProfileTests.swift
+index 4acb58e..4caaed7 100644
+--- a/Tests/iPhoneUseTests/Input/HeldDragProfileTests.swift
++++ b/Tests/iPhoneUseTests/Input/HeldDragProfileTests.swift
+@@ -29,7 +29,7 @@ private final class HeldDragRecorder {
+         DeviceInput(
+             host: host, session: UUID(), screenID: screenID ?? self.screenID,
+             screenSize: { self.size }, heldDragProfile: selection ?? .loaded(profile),
+-            sleep: sleep, monotonicNow: monotonicNow, reportSender: receive)
++            sleep: sleep, monotonicNow: monotonicNow, reportSender: receive, reportReadiness: { _, _, _ in true })
+     }
+ 
+     func receive(_ id: ReportID, _ bytes: [UInt8]) {
+diff --git a/Tests/iPhoneUseTests/Input/RelativePointerCalibrationTests.swift b/Tests/iPhoneUseTests/Input/RelativePointerCalibrationTests.swift
+index 408eb9c..4a0391e 100644
+--- a/Tests/iPhoneUseTests/Input/RelativePointerCalibrationTests.swift
++++ b/Tests/iPhoneUseTests/Input/RelativePointerCalibrationTests.swift
+@@ -182,7 +182,7 @@ final class RelativePointerCalibrationTests: XCTestCase {
+         var reports = 0
+         let input = DeviceInput(
+             host: UUID(), session: UUID(), calibrationRequired: true,
+-            reportSender: { _, _ in reports += 1 })
++            reportSender: { _, _ in reports += 1 }, reportReadiness: { _, _, _ in true })
+         XCTAssertThrowsError(try input.tap(x: 0.5, y: 0.5))
+         XCTAssertEqual(reports, 0)
+         try input.nudge(dx: 1, dy: 0, click: false)
+diff --git a/Tests/iPhoneUseTests/Localization/LocalizationTests.swift b/Tests/iPhoneUseTests/Localization/LocalizationTests.swift
+index d96d042..fff7bbe 100644
+--- a/Tests/iPhoneUseTests/Localization/LocalizationTests.swift
++++ b/Tests/iPhoneUseTests/Localization/LocalizationTests.swift
+@@ -125,7 +125,10 @@ final class LocalizationTests: XCTestCase {
+         XCTAssertThrowsError(
+             try RequestCoordinates.point(["x": 1], "x", "y", screenSize: nil, screenName: "phone")
+         ) { error in
+-            XCTAssertEqual(String(describing: error), StringsAPI.zh.coordinatesRequired("x", "y"))
++            // Pure shared leaf diagnostics are language-independent; localized
++            // API descriptions and capture errors retain their separate contract.
++            XCTAssertTrue(error is InputRequestError)
++            XCTAssertEqual(String(describing: error), "y must be a finite number")
+         }
+         let zhCaptureError = StringsAPI.zh.captureFailedFromDevice("iPhone", "cannot open (-11800)")
+         let enCaptureError = StringsAPI.en.captureFailedFromDevice("iPhone", "cannot open (-11800)")
+@@ -206,11 +209,11 @@ final class LocalizationTests: XCTestCase {
+             XCTAssertEqual(String(describing: error), StringsAPI.zh.ocrParameterInvalid("text"))
+         }
+         XCTAssertNotEqual(StringsAPI.en.ocrTextNotFound, StringsAPI.zh.ocrTextNotFound)
+-        // Default-parameter callers keep the stable English contract.
++        // The MCP coordinate context remains localized for default callers.
+         XCTAssertThrowsError(
+             try MCPToolRequest.action(named: "move_pointer", arguments: ["x": -1, "y": 2], longEdge: 1200)
+         ) { error in
+-            XCTAssertEqual(String(describing: error), "x must be a finite, nonnegative screenshot coordinate")
++            XCTAssertEqual(String(describing: error), StringsMCP(language: .en).coordinateFinite("x"))
+         }
+     }
+ }
+diff --git a/Tests/iPhoneUseTests/MCP/MCPProtocolTests.swift b/Tests/iPhoneUseTests/MCP/MCPProtocolTests.swift
+index 637a024..9e62bb2 100644
+--- a/Tests/iPhoneUseTests/MCP/MCPProtocolTests.swift
++++ b/Tests/iPhoneUseTests/MCP/MCPProtocolTests.swift
+@@ -201,24 +201,22 @@ final class MCPProtocolTests: XCTestCase {
+         }
+     }
+ 
+-    func testMissingCoordinatesReportTheFirstMissingKeyButPresentNullIsForwarded() throws {
++    func testMissingCoordinatesReportTheFirstMissingKeyAndPresentNullIsRejected() {
+         XCTAssertThrowsError(try MCPToolRequest.action(named: "tap", arguments: ["x": 1], longEdge: 1000)) { error in
+             XCTAssertEqual(String(describing: error), "y is required")
+         }
+-        let action = try XCTUnwrap(
+-            MCPToolRequest.action(
+-                named: "tap", arguments: ["x": NSNull(), "y": "unchecked"], longEdge: 1000))
+-        XCTAssertTrue(action.body["x"] is NSNull)
+-        XCTAssertEqual(action.body["y"] as? String, "unchecked")
++        XCTAssertThrowsError(try MCPToolRequest.action(
++            named: "tap", arguments: ["x": NSNull(), "y": "unchecked"], longEdge: 1000))
+     }
+ 
+     func testKeyboardAndHomeDefaultsKeepTheirHTTPMappings() throws {
+         let type = try XCTUnwrap(MCPToolRequest.action(named: "type_text", arguments: [:], longEdge: 1000))
+         XCTAssertEqual(type.path, "/type")
+         XCTAssertEqual(type.body["text"] as? String, "")
+-        let key = try XCTUnwrap(MCPToolRequest.action(named: "press_key", arguments: [:], longEdge: 1000))
++        XCTAssertThrowsError(try MCPToolRequest.action(named: "press_key", arguments: [:], longEdge: 1000))
++        let key = try XCTUnwrap(MCPToolRequest.action(named: "press_key", arguments: ["key": "enter"], longEdge: 1000))
+         XCTAssertEqual(key.path, "/key")
+-        XCTAssertEqual(key.body["key"] as? String, "")
++        XCTAssertEqual(key.body["key"] as? String, "enter")
+         XCTAssertEqual(key.body["modifiers"] as? [String], [])
+         let home = try XCTUnwrap(MCPToolRequest.action(named: "home", arguments: ["device": "phone"], longEdge: 1000))
+         XCTAssertEqual(home.path, "/home")
+diff --git a/Tests/iPhoneUseTests/UI/ControlWindowTests.swift b/Tests/iPhoneUseTests/UI/ControlWindowTests.swift
+index 88c2f91..ea14f21 100644
+--- a/Tests/iPhoneUseTests/UI/ControlWindowTests.swift
++++ b/Tests/iPhoneUseTests/UI/ControlWindowTests.swift
+@@ -297,10 +297,10 @@ final class MultiDeviceWindowInputTests: XCTestCase {
+         var secondReports: [[UInt8]] = []
+         let first = DeviceInput(
+             host: UUID(), session: UUID(), sleep: { _ in },
+-            reportSender: { _, bytes in firstReports.append(bytes) })
++            reportSender: { _, bytes in firstReports.append(bytes) }, reportReadiness: { _, _, _ in true })
+         let second = DeviceInput(
+             host: UUID(), session: UUID(), sleep: { _ in },
+-            reportSender: { _, bytes in secondReports.append(bytes) })
++            reportSender: { _, bytes in secondReports.append(bytes) }, reportReadiness: { _, _, _ in true })
+ 
+         first.press(x: 0.25, y: 0.25)
+         second.press(x: 0.75, y: 0.75)

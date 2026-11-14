@@ -1,0 +1,636 @@
+diff --git a/Sources/iPhoneUse/API/ControlAPI.swift b/Sources/iPhoneUse/API/ControlAPI.swift
+index 767fe69..41e220b 100644
+--- a/Sources/iPhoneUse/API/ControlAPI.swift
++++ b/Sources/iPhoneUse/API/ControlAPI.swift
+@@ -16,11 +16,12 @@ enum ControlAPI {
+         case key = "/key"
+         case home = "/home"
+         case power = "/power"
++        case touch = "/touch"
+ 
+         var requiresPointer: Bool {
+             switch self {
+             case .tap, .swipe, .move: true
+-            case .nudge, .type, .key, .home, .power: false
++            case .nudge, .type, .key, .home, .power, .touch: false
+             }
+         }
+     }
+@@ -64,8 +65,8 @@ enum ControlAPI {
+         }
+         do {
+             if body["frame_id"] != nil {
+-                guard request.method == "POST", ["/tap", "/move", "/swipe"].contains(request.path) else {
+-                    throw ScreenshotReferences.Rejected("frame_id is supported only by POST tap, move and swipe")
++                guard request.method == "POST", ["/tap", "/move", "/swipe", "/touch"].contains(request.path) else {
++                    throw ScreenshotReferences.Rejected("frame_id is supported only by POST tap, move, swipe and touch")
+                 }
+             }
+             switch (request.method, request.path) {
+@@ -172,6 +173,8 @@ enum ControlAPI {
+                     $0.id == target.screen.id && $0.size != nil
+                 }
+                 guard controlPaths.contains(request.path) else { return frameReady }
++                if CoreDeviceTouch.isConfigured, request.body["frame_id"] != nil,
++                    ["/tap", "/swipe"].contains(request.path) { return frameReady }
+                 return frameReady && target.host != nil
+                     && (try? DeviceRegistry.shared.input(for: target).isPointerReady) == true
+             }
+@@ -229,6 +232,7 @@ enum ControlAPI {
+             "bluetooth": HIDPeripheral.shared.state,
+             "bluetoothHosts": hosts,
+             "bluetoothHostSelection": HIDPeripheral.shared.selectedHostDescription,
++            "directTouch": CoreDeviceTouch.isConfigured,
+             "capture": captureStatus(),
+             "devices": DeviceRegistry.shared.status(),
+             "unmatchedHosts": DeviceRegistry.shared.unmatchedHosts().map(\.uuidString),
+@@ -332,6 +336,8 @@ enum ControlAPI {
+ 
+     private static func tapTextPoint(_ id: String, _ x: Double, _ y: Double, _ hold: Double) throws {
+         let device = try DeviceRegistry.shared.find(id)
++        let commandLock = DeviceCommandLocks.acquire(device.id)
++        defer { commandLock.unlock() }
+         DeviceRegistry.shared.cancelBackgroundMotion(for: device)
+         let input = try DeviceRegistry.shared.input(for: device)
+         guard input.isPointerReady else {
+@@ -345,11 +351,13 @@ enum ControlAPI {
+         _ action: Action, body: [String: Any], deviceQuery: String?
+     ) throws -> HTTPResponse {
+         let device = try DeviceRegistry.shared.find(deviceQuery)
++        let commandLock = DeviceCommandLocks.acquire(device.id)
++        defer { commandLock.unlock() }
+         var body = body
+         var reference: ScreenshotReferences.Reference?
+         if let raw = body["frame_id"] {
+-            guard action.requiresPointer else {
+-                throw ScreenshotReferences.Rejected("frame_id is supported only by tap, move and swipe")
++            guard action.requiresPointer || action == .touch else {
++                throw ScreenshotReferences.Rejected("frame_id is supported only by tap, move, swipe and touch")
+             }
+             let bound = try ScreenshotReferences.shared.consume(
+                 raw, device: device.id, source: device.screen.sourceInstanceID.uuidString, screenSize: device.screen.size)
+@@ -368,6 +376,28 @@ enum ControlAPI {
+             }
+         }
+         try validateLeaf(path: action.rawValue, body: body, screenSize: device.screen.size)
++        // The configured direct route handles only explicitly frame-bound touch
++        // gestures. Legacy unbound calls and mouse hover retain their own path.
++        if action == .touch || (CoreDeviceTouch.isConfigured && reference != nil && (action == .tap || action == .swipe)) {
++            guard CoreDeviceTouch.isConfigured, let reference else {
++                throw InputRequestError("Direct touch requires its configured backend and a fresh frame_id")
++            }
++            let program = try action == .touch ? TouchSequenceRequest(body, image: (reference.width, reference.height))
++                : TouchSequenceRequest.gesture(path: action.rawValue, body: body)
++            DeviceRegistry.shared.cancelBackgroundMotion(for: device)
++            let receipt: [String: Any]
++            do {
++                receipt = try CoreDeviceTouch.perform(program, reference: reference) { _ in
++                    try validateReference?()
++                }
++            } catch let error as ScreenshotReferences.Rejected {
++                throw error
++            } catch {
++                // The helper wrapper never throws after committing input.
++                return .json(["error": "\(error)", "input_sent": false], status: 400)
++            }
++            return .json(["ok": receipt["input_status"] as? String == "sent_unverified", "device": device.id, "touch_receipt": receipt])
++        }
+         // Real input takes priority over background probes and measurement.
+         // Cancel before resolving/queuing input, so it cannot wait behind the
+         // very measurement that the user is trying to interrupt.
+@@ -413,6 +443,7 @@ enum ControlAPI {
+             // Consumer Power is a short, state-dependent key press. Never
+             // retry it automatically or claim that an accepted report locked iOS.
+             guard input.consumer(0x0030) else { throw DeviceError("Consumer channel is not ready; no input sent") }
++        case .touch: throw InputRequestError("Direct touch backend is unavailable")
+         }
+         return .json(["ok": true, "device": device.id])
+     }
+@@ -429,6 +460,7 @@ enum ControlAPI {
+         case "/key": _ = try KeyRequest(body)
+         case "/nudge": _ = try NudgeRequest(body)
+         case "/type": _ = try TypeTextRequest(body)
++        case "/touch": _ = try TouchSequenceRequest(body)
+         default: break
+         }
+     }
+diff --git a/Sources/iPhoneUse/API/ScreenshotReferences.swift b/Sources/iPhoneUse/API/ScreenshotReferences.swift
+index 06e7c1d..e25e552 100644
+--- a/Sources/iPhoneUse/API/ScreenshotReferences.swift
++++ b/Sources/iPhoneUse/API/ScreenshotReferences.swift
+@@ -34,7 +34,15 @@ final class ScreenshotReferences {
+                     else { throw Rejected("\(key) must be inside the referenced \(width)x\(height) image") }
+                 }
+             }
+-            if let raw = body["points"] {
++            if let samples = body["samples"] as? [[String: Any]] {
++                guard body["x"] == nil, body["y"] == nil, body["points"] == nil else {
++                    throw Rejected("Use a contact timeline without a second coordinate representation")
++                }
++                _ = try TouchSequenceRequest(body, image: (width, height))
++                for sample in samples {
++                    for contact in sample["contacts"] as! [[String: Any]] { try point(contact) }
++                }
++            } else if let raw = body["points"] {
+                 guard body["x"] == nil, body["y"] == nil else {
+                     throw Rejected("use points or x/y, not both")
+                 }
+diff --git a/Sources/iPhoneUse/Input/CoreDeviceTouch.swift b/Sources/iPhoneUse/Input/CoreDeviceTouch.swift
+new file mode 100644
+index 0000000..d0d040f
+--- /dev/null
++++ b/Sources/iPhoneUse/Input/CoreDeviceTouch.swift
+@@ -0,0 +1,212 @@
++import Darwin
++import Foundation
++
++/// Serialize HTTP input for one phone across transports. Observation remains
++/// independent so the helper can be checked against the resident capture.
++enum DeviceCommandLocks {
++    private static let lock = NSLock()
++    private static var devices: [String: NSLock] = [:]
++    static func acquire(_ device: String) -> NSLock {
++        let selected = lock.withLock { () -> NSLock in
++            if let existing = devices[device] { return existing }
++            let created = NSLock(); devices[device] = created; return created
++        }
++        selected.lock()
++        return selected
++    }
++}
++
++/// A finite full-contact program, validated before either the helper or input
++/// transport is opened. Pixel bounds are supplied by the consumed frame.
++struct TouchSequenceRequest {
++    let samples: [[String: Any]]
++
++    init(_ body: [String: Any], image: (Int, Int)? = nil) throws {
++        guard let samples = body["samples"] as? [[String: Any]], (2...256).contains(samples.count) else {
++            throw InputRequestError("samples must contain 2...256 contact frames")
++        }
++        var previous = -1.0
++        for sample in samples {
++            guard Set(sample.keys) == ["at_ms", "contacts"],
++                let contacts = sample["contacts"] as? [[String: Any]], contacts.count <= 5
++            else { throw InputRequestError("Each sample requires at_ms and at most five contacts") }
++            let at = try InputRequestValue.number(sample["at_ms"], field: "at_ms")
++            guard (0...6000).contains(at), at > previous else {
++                throw InputRequestError("Sample times must strictly increase within 0...6000 ms")
++            }
++            previous = at
++            var used: Set<Int> = []
++            for contact in contacts {
++                guard Set(contact.keys) == ["id", "x", "y"] else { throw InputRequestError("Expected id, x and y") }
++                let id = try InputRequestValue.number(contact["id"], field: "id")
++                guard (0...4).contains(id), id.rounded() == id, used.insert(Int(id)).inserted else {
++                    throw InputRequestError("Contact IDs must be unique integers 0...4")
++                }
++                var point = contact
++                if let image { point["width"] = image.0; point["height"] = image.1 }
++                _ = try CoordinateRequest(point)
++            }
++        }
++        guard try InputRequestValue.number(samples[0]["at_ms"], field: "at_ms") == 0,
++            !(samples[0]["contacts"] as! [[String: Any]]).isEmpty,
++            (samples.last!["contacts"] as! [[String: Any]]).isEmpty
++        else { throw InputRequestError("Start with contact at zero; finish with all contacts lifted") }
++        self.samples = samples
++    }
++
++    static func gesture(path: String, body: [String: Any]) throws -> TouchSequenceRequest {
++        func frame(_ at: Double, _ x: Double, _ y: Double) -> [String: Any] {
++            ["at_ms": at, "contacts": [["id": 0, "x": x, "y": y]]]
++        }
++        if path == "/tap" {
++            let hold = try HoldRequest(body).seconds
++            guard hold > 0, hold <= 6 else { throw InputRequestError("Direct touch hold must be >0 and <=6 seconds") }
++            return try Self(["samples": [
++                frame(0, InputRequestValue.number(body["x"], field: "x"), InputRequestValue.number(body["y"], field: "y")),
++                ["at_ms": hold * 1000, "contacts": []],
++            ]])
++        }
++        guard path == "/swipe", let points = body["points"] as? [[String: Any]], points.count >= 2 else {
++            throw InputRequestError("Unsupported direct-touch gesture")
++        }
++        let duration = try InputRequestValue.number(body["duration"] ?? 0.3, field: "duration")
++        guard duration > 0, duration <= 5.999 else { throw InputRequestError("Direct swipe duration must be >0 and <=5.999 seconds") }
++        let xy = try points.map { (try InputRequestValue.number($0["x"], field: "x"), try InputRequestValue.number($0["y"], field: "y")) }
++        var distances = [0.0]
++        for i in 1..<xy.count { distances.append(distances.last! + hypot(xy[i].0-xy[i-1].0, xy[i].1-xy[i-1].1)) }
++        let count = min(254, max(1, Int(ceil(duration * 60))))
++        var samples: [[String: Any]] = []
++        for i in 0...count {
++            let fraction = Double(i) / Double(count), target = distances.last! * fraction
++            var segment = 1
++            while segment < distances.count - 1, distances[segment] < target { segment += 1 }
++            let length = distances[segment] - distances[segment-1]
++            let part = length > 0 ? (target - distances[segment-1]) / length : 0
++            let a = xy[segment-1], b = xy[segment]
++            samples.append(frame(duration * 1000 * fraction, a.0+(b.0-a.0)*part, a.1+(b.1-a.1)*part))
++        }
++        samples.append(["at_ms": duration * 1000 + 1, "contacts": []])
++        return try Self(["samples": samples])
++    }
++}
++
++/// The same owned child performs USB preflight and touch. It cannot send its
++/// first contact until the host rechecks the capture reference and commits.
++/// No media session, BLE fallback, automatic pairing or uncertain-action retry.
++enum CoreDeviceTouch {
++    static let helperKey = "IPHONE_USE_TOUCH_HELPER"
++    static var isConfigured: Bool { ProcessInfo.processInfo.environment[helperKey] != nil }
++
++    static func perform(
++        _ program: TouchSequenceRequest, reference: ScreenshotReferences.Reference,
++        environment: [String: String] = ProcessInfo.processInfo.environment,
++        beforeCommit: (DeviceDisplayMapping) throws -> Void
++    ) throws -> [String: Any] {
++        guard let helper = environment[helperKey], helper.hasPrefix("/"), !helper.contains("\0"),
++            environment["IPHONE_USE_DEVICE_ID"] == reference.device else {
++            throw InputRequestError("Direct touch requires the configured helper and exact capture device")
++        }
++        let configuration = try DeviceClipboard.Configuration(environment: environment)
++        _ = try TouchSequenceRequest(["samples": program.samples], image: (reference.width, reference.height))
++        let plan: [String: Any] = ["image": ["width": reference.width, "height": reference.height], "samples": program.samples]
++        let data = try JSONSerialization.data(withJSONObject: plan)
++        guard data.count <= 65536 else { throw InputRequestError("Touch program exceeds 64 KiB") }
++        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("iphone-use-touch-\(UUID().uuidString)")
++        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
++        defer { try? FileManager.default.removeItem(at: directory) }
++        let stdinURL = directory.appendingPathComponent("plan.json")
++        let stdoutURL = directory.appendingPathComponent("receipt.jsonl")
++        let commitURL = directory.appendingPathComponent("commit.json")
++        guard FileManager.default.createFile(atPath: stdinURL.path, contents: data, attributes: [.posixPermissions: 0o600]),
++            FileManager.default.createFile(atPath: stdoutURL.path, contents: nil, attributes: [.posixPermissions: 0o600]) else {
++            throw InputRequestError("Cannot prepare direct-touch helper files")
++        }
++        let input = try FileHandle(forReadingFrom: stdinURL), output = try FileHandle(forWritingTo: stdoutURL)
++        defer { try? input.close(); try? output.close() }
++        let process = Process(), finished = DispatchSemaphore(value: 0)
++        process.executableURL = configuration.python
++        process.arguments = ["-B", helper, "--commit-file", commitURL.path]
++        process.environment = configuration.childEnvironment(environment)
++        process.standardInput = input; process.standardOutput = output; process.standardError = FileHandle.nullDevice
++        process.terminationHandler = { _ in finished.signal() }
++        var committed = false
++        defer {
++            if process.isRunning {
++                process.terminate()
++                if finished.wait(timeout: .now() + 7) == .timedOut, process.isRunning {
++                    kill(process.processIdentifier, SIGKILL)
++                    _ = finished.wait(timeout: .now() + 1)
++                }
++            }
++        }
++        func failure(_ reason: String) -> [String: Any] {
++            ["backend": "coredevice", "input_status": committed ? "unconfirmed" : "not_sent", "reason": reason,
++             "frame_bound": true, "orientation_bound": false, "device_delivery": "unverified", "application_effect": "unverified"]
++        }
++        func messages() throws -> [[String: Any]] {
++            let file = try FileHandle(forReadingFrom: stdoutURL)
++            defer { try? file.close() }
++            let data = try file.read(upToCount: 65537) ?? Data()
++            guard data.count <= 65536 else { throw InputRequestError("Touch receipt exceeds byte limit") }
++            // The child flushes complete JSON lines; retain no partial tail.
++            guard let newline = data.lastIndex(of: 10) else { return [] }
++            let lines = data[..<newline].split(separator: 10, omittingEmptySubsequences: false)
++            return try lines.map {
++                guard let value = try JSONSerialization.jsonObject(with: Data($0)) as? [String: Any] else {
++                    throw InputRequestError("Invalid touch protocol record")
++                }
++                return value
++            }
++        }
++        func exchange() throws -> [String: Any] {
++        do { try process.run() } catch { return failure("Touch helper did not start") }
++        let readyDeadline = ProcessInfo.processInfo.systemUptime + 8
++        var ready: [String: Any]?
++        while ProcessInfo.processInfo.systemUptime < readyDeadline {
++            if let value = try messages().first(where: { $0["phase"] as? String == "ready" }) { ready = value; break }
++            if !process.isRunning { break }
++            Thread.sleep(forTimeInterval: 0.01)
++        }
++        if let ready, let display = ready["display"] as? [String: Any] {
++            let mapping = try DeviceDisplayMapping(result: ["schema_version": 1, "source": "ios-native-display", "status": "ok",
++                "device_id": configuration.deviceID, "display": display], deviceID: configuration.deviceID)
++            try mapping.validate(captureSize: CGSize(width: reference.screenWidth, height: reference.screenHeight))
++            try beforeCommit(mapping)
++            // Once offered, interruption is uncertain even if no final receipt arrives.
++            committed = true
++            let pending = directory.appendingPathComponent("commit.pending")
++            guard FileManager.default.createFile(atPath: pending.path, contents: Data("{\"commit\":true}".utf8),
++                attributes: [.posixPermissions: 0o600]), rename(pending.path, commitURL.path) == 0
++            else { return failure("Could not commit touch program") }
++            if finished.wait(timeout: .now() + 15) == .timedOut { return failure("Touch helper timed out after commit; do not replay") }
++        } else if process.isRunning {
++            return failure("Touch preflight did not become ready")
++        }
++        guard var receipt = try messages().last(where: { $0["schema_version"] as? Int == 1 }),
++            let status = receipt["input_status"] as? String, ["not_sent", "sent_unverified", "unconfirmed"].contains(status) else {
++            return failure("Touch helper ended without a valid receipt")
++        }
++        if !committed && (status != "not_sent" || (receipt["reports_attempted"] as? Int ?? 0) != 0) {
++            // A contradictory child cannot establish either validated input or
++            // absence of input. Preserve uncertainty rather than trust success.
++            var rejected = failure("Helper reported input without the host commit")
++            rejected["input_status"] = "unconfirmed"; rejected["frame_bound"] = false
++            return rejected
++        }
++        if status == "sent_unverified", receipt["host_commit_received"] as? Bool != true {
++            return failure("Helper did not confirm the host commit; do not replay")
++        }
++        if process.terminationReason != .exit || process.terminationStatus != 0 {
++            receipt["input_status"] = committed ? "unconfirmed" : "not_sent"
++        }
++        receipt.removeValue(forKey: "reports")
++        receipt["backend"] = "coredevice"; receipt["frame_bound"] = true; receipt["orientation_bound"] = false
++        return receipt
++        }
++        do { return try exchange() }
++        catch {
++            if committed { return failure("Touch receipt failed after commit; do not replay") }
++            throw error
++        }
++    }
++}
+diff --git a/Sources/iPhoneUse/MCP/MCPContextStore.swift b/Sources/iPhoneUse/MCP/MCPContextStore.swift
+index 2d34c40..4cb93f4 100644
+--- a/Sources/iPhoneUse/MCP/MCPContextStore.swift
++++ b/Sources/iPhoneUse/MCP/MCPContextStore.swift
+@@ -272,6 +272,8 @@ final class MCPContextRecording {
+     private var rejectedBeforeInput = false
+     private var requestsStarted = 0
+     private var requestsAcknowledged = 0
++    private var transportReceipt: [String: Any]?
++    var transportStatus: String? { transportReceipt?["input_status"] as? String }
+     private let inputFrameID: String?
+     private let isInput: Bool
+ 
+@@ -291,9 +293,14 @@ final class MCPContextRecording {
+ 
+     func requestStarted() { requestsStarted += 1; update { $0.requests_started += 1; $0.state = "request_started" } }
+     func requestAcknowledged() { requestsAcknowledged += 1; update { $0.requests_acknowledged += 1; $0.state = "acknowledged" } }
++    func recordTransport(_ response: Data) {
++        guard let body = (try? JSONSerialization.jsonObject(with: response)) as? [String: Any],
++            let receipt = body["touch_receipt"] as? [String: Any] else { return }
++        transportReceipt = receipt
++    }
+     func finish(_ observation: MCPServer.ObservationResult? = nil) {
+         update {
+-            $0.state = "finished"
++            $0.state = transportReceipt.map { "input_" + ($0["input_status"] as? String ?? "unconfirmed") } ?? "finished"
+             $0.finished_at = Date()
+             $0.observation = observation.map(MCPContextStore.Observation.init)
+         }
+@@ -347,6 +354,13 @@ final class MCPContextRecording {
+                 "hid_delivery": "unverified", "app_completion": "unverified",
+             ]
+             if let inputFrameID { receipt["based_on_frame_id"] = inputFrameID }
++            if let transportReceipt {
++                receipt["status"] = transportReceipt["input_status"] ?? "unconfirmed"
++                receipt["transport"] = transportReceipt
++                if transportReceipt["input_status"] as? String != "sent_unverified" {
++                    result["isError"] = true
++                }
++            }
+             metadata["input_receipt"] = receipt
+         }
+         result["structuredContent"] = metadata
+diff --git a/Sources/iPhoneUse/MCP/MCPServer.swift b/Sources/iPhoneUse/MCP/MCPServer.swift
+index 8fbd61c..4a2cea5 100644
+--- a/Sources/iPhoneUse/MCP/MCPServer.swift
++++ b/Sources/iPhoneUse/MCP/MCPServer.swift
+@@ -114,8 +114,8 @@ enum MCPServer {
+         do {
+             if name == "session_context" { return try sessionContext(arguments) }
+             if name == "accessibility_tree" { return try accessibilityTree(arguments) }
+-            if arguments["frame_id"] != nil, !["tap", "long_press", "move_pointer", "swipe"].contains(name) {
+-                throw MCPError("frame_id is supported only by tap, long_press, move_pointer and swipe")
++            if arguments["frame_id"] != nil, !["tap", "long_press", "move_pointer", "swipe", "touch_sequence"].contains(name) {
++                throw MCPError("frame_id is supported only by tap, long_press, move_pointer, swipe and touch_sequence")
+             }
+             let burstOptions = name == "screenshot_burst" ? try MCPScreenshotBurst.Options(arguments) : nil
+             let observe = arguments["observe"] as? String ?? "full"
+@@ -210,8 +210,9 @@ enum MCPServer {
+                                     var body = request.body
+                                     body["device"] = device
+                                     recording.requestStarted()
+-                                    try client.post(request.path, body)
++                                    let response = try client.post(request.path, body)
+                                     recording.requestAcknowledged()
++                                    recording.recordTransport(response)
+                                 }
+                             } catch {
+                                 guard name == "keyboard_sequence" else { throw error }
+@@ -237,7 +238,7 @@ enum MCPServer {
+                             let observation = ObservationResult(status: .unobserved, reason: "disabled")
+                             recording.finish(observation)
+                             return recording.attach(
+-                                to: observationContent(observation, includeImage: false, diff: false))
++                                to: observationContent(observation, includeImage: false, diff: false, inputStatus: recording.transportStatus))
+                         }
+                         // HTTP acknowledgement is not a HID drain or application-completion signal.
+                         // Keep the device lock until the exact returned frame has been observed.
+@@ -256,7 +257,7 @@ enum MCPServer {
+                         if observation.status == .unobserved { observation.detail = captureError }
+                         recording.finish(observation)
+                         return recording.attach(
+-                            to: observationContent(observation, includeImage: includeImage, diff: observe == "ocr_diff")
++                            to: observationContent(observation, includeImage: includeImage, diff: observe == "ocr_diff", inputStatus: recording.transportStatus)
+                         )
+                     } catch {
+                         devicesCache.invalidate()
+@@ -627,12 +628,13 @@ enum MCPServer {
+     }
+ 
+     static func observationContent(
+-        _ observation: ObservationResult, includeImage: Bool, diff: Bool
++        _ observation: ObservationResult, includeImage: Bool, diff: Bool, inputStatus: String? = nil
+     ) -> [String: Any] {
+         var metadata: [String: Any] = [
+-            "ok": true, "action_acknowledged": true, "hid_delivery": "unverified",
++            "ok": inputStatus == nil || inputStatus == "sent_unverified", "action_acknowledged": true, "hid_delivery": "unverified",
+             "app_completion": "unverified", "observation": observation.json,
+         ]
++        if let inputStatus { metadata["input_status"] = inputStatus }
+         if let reference = observation.frame?.referenceJSON { metadata["frame"] = reference }
+         var result =
+             observation.frame.map { screenshotContent($0, includeImage: includeImage, diff: diff) }
+diff --git a/Sources/iPhoneUse/MCP/MCPTools.swift b/Sources/iPhoneUse/MCP/MCPTools.swift
+index c1de9ea..aabec3b 100644
+--- a/Sources/iPhoneUse/MCP/MCPTools.swift
++++ b/Sources/iPhoneUse/MCP/MCPTools.swift
+@@ -60,6 +60,20 @@ enum MCPToolCatalog {
+                     "interval_ms": ["type": "integer", "minimum": 100, "maximum": 1000, "default": 300],
+                 ], readOnly: true),
+             tool("ocr_screen", table.toolOCRScreen, ["device": device, "maxEdge": maxEdge], readOnly: true),
++            tool(
++                "touch_sequence",
++                language == .zh
++                    ? "用 frame_id 对应截图的像素发送有限 USB 多触点序列。每个采样列出仍按住的全部触点，ID 为 0..4；移除 ID 即抬起。0ms 起始须有触点，最后为空；时间严格递增，最多 6 秒、256 个采样。不自动重放或回退蓝牙；请检查返回的新画面，本地发送不代表应用完成。"
++                    : "Send a finite USB multitouch program using pixels of frame_id. Each sample lists ALL contacts still held (stable IDs 0..4); removing one lifts it. Start at 0 ms with contact, end empty; strictly increasing times, at most 6 seconds/256 samples. No automatic replay or BLE fallback. Observe the returned frame; local delivery is not app completion.",
++                ["frame_id": frameID, "device": device, "include_image": includeImage,
++                 "samples": ["type": "array", "minItems": 2, "maxItems": 256, "items": [
++                    "type": "object", "additionalProperties": false, "required": ["at_ms", "contacts"],
++                    "properties": ["at_ms": ["type": "number", "minimum": 0, "maximum": 6000],
++                        "contacts": ["type": "array", "maxItems": 5, "items": [
++                            "type": "object", "additionalProperties": false, "required": ["id", "x", "y"],
++                            "properties": ["id": ["type": "integer", "minimum": 0, "maximum": 4],
++                                "x": ["type": "number", "minimum": 0], "y": ["type": "number", "minimum": 0]]]]]]]],
++                required: ["frame_id", "samples"]),
+             tool(
+                 "tap_text", table.toolTapText,
+                 [
+@@ -220,7 +234,7 @@ enum MCPToolCatalog {
+             ]
+         }
+         var schema: [String: Any] = ["type": "object", "properties": properties, "required": required]
+-        if ["session_context", "accessibility_tree", "screenshot_burst"].contains(name) { schema["additionalProperties"] = false }
++        if ["session_context", "accessibility_tree", "screenshot_burst", "touch_sequence"].contains(name) { schema["additionalProperties"] = false }
+         if name == "keyboard_sequence" {
+             schema["anyOf"] = [["required": ["steps"]], ["required": ["actions"]]]
+         }
+@@ -248,6 +262,15 @@ struct MCPToolRequest {
+     ) throws -> MCPToolRequest? {
+         let device = (arguments["device"] as? String) ?? (arguments["device_id"] as? String)
+         switch name {
++        case "touch_sequence":
++            guard Set(arguments.keys).isSubset(of: ["frame_id", "samples", "device", "device_id", "include_image", "observe", "observation_timeout"]) else {
++                throw InputRequestError("touch_sequence accepts frame_id, samples and ordinary observation options only")
++            }
++            guard let id = arguments["frame_id"] as? String, UUID(uuidString: id) != nil else {
++                throw InputRequestError("touch_sequence requires a returned frame.id")
++            }
++            let program = try TouchSequenceRequest(arguments)
++            return MCPToolRequest(path: "/touch", body: withDevice(["frame_id": id, "samples": program.samples], device))
+         case "act":
+             let batch = try ActRequest(arguments)
+             let steps = try batch.steps.map { step -> [String: Any] in
+diff --git a/Tests/PythonTests/test_mcp_stdio.py b/Tests/PythonTests/test_mcp_stdio.py
+index e8ec9bb..59e68c7 100644
+--- a/Tests/PythonTests/test_mcp_stdio.py
++++ b/Tests/PythonTests/test_mcp_stdio.py
+@@ -111,6 +111,10 @@ class MockApp(BaseHTTPRequestHandler):
+         if self.server.frame_rejection:
+             self.send(409, b'{"error":"frame consumed","frame_rejected":true,"input_sent":false}')
+             return
++        if self.server.touch_receipt is not None:
++            self.send(200, json.dumps({"ok": self.server.touch_receipt["input_status"] == "sent_unverified",
++                                      "touch_receipt": self.server.touch_receipt}).encode())
++            return
+         if self.server.fail_actions:
+             self.send(503, b'{"error":"pointer is not ready"}')
+         else:
+@@ -133,6 +137,7 @@ class MCPStdioTests(unittest.TestCase):
+         self.server.stability_events = []
+         self.server.fail_actions = False
+         self.server.frame_rejection = False
++        self.server.touch_receipt = None
+         self.server.act_failure = None
+         self.server.language = "en"
+         self.server.devices = [{"id": "phone-1", "name": "First", "bluetooth": True}]
+@@ -174,6 +179,47 @@ class MCPStdioTests(unittest.TestCase):
+         self.assertEqual([reply["id"] for reply in replies], ["init"] + list(range(1, len(calls) + 1)))
+         return [reply["result"] for reply in replies[1:]]
+ 
++    def test_direct_touch_receipt_preserves_uncertainty_and_still_observes(self):
++        frame_id = "00000000-0000-4000-8000-000000000001"
++        sequence = 0
++        def screenshot(path):
++            nonlocal sequence
++            sequence += 1
++            return identified_capture_reply(160, sequence, capture_uptime())
++        self.server.screenshot_response = screenshot
++        samples = [{"at_ms": 0, "contacts": [{"id": 0, "x": 7, "y": 9}]},
++                   {"at_ms": 70, "contacts": []}]
++        for status in ("sent_unverified", "unconfirmed", "not_sent"):
++            with self.subTest(status=status):
++                self.server.touch_receipt = {"backend": "coredevice", "input_status": status,
++                    "frame_bound": True, "orientation_bound": False, "device_delivery": "unverified"}
++                result, context = self.exchange([
++                    ("touch_sequence", {"frame_id": frame_id, "samples": samples, "observation_timeout": 0.3}),
++                    ("session_context", {"device": "phone-1"})])
++                self.assertEqual(bool(result.get("isError")), status != "sent_unverified")
++                self.assertEqual(result["structuredContent"]["ok"], status == "sent_unverified")
++                if status != "sent_unverified":
++                    self.assertFalse(any('"ok":true' in c.get("text", "") for c in result["content"]))
++                receipt = result["structuredContent"]["input_receipt"]
++                self.assertEqual(receipt["status"], status)
++                self.assertEqual(receipt["based_on_frame_id"], frame_id)
++                self.assertEqual(receipt["transport"]["backend"], "coredevice")
++                self.assertTrue(result["structuredContent"]["observation"]["fresh"])
++                self.assertTrue(any(c["type"] == "image" for c in result["content"]))
++                self.assertEqual(context["structuredContent"]["recent"][-1]["state"], "input_" + status)
++        posts = [event for event in self.server.events if event[0] == "POST"]
++        self.assertEqual(len(posts), 3)
++        self.assertTrue(all(event[1] == "/touch" and event[2]["samples"] == samples for event in posts))
++
++    def test_bad_touch_tail_is_rejected_before_discovery_or_post(self):
++        result, = self.exchange([("touch_sequence", {
++            "frame_id": "00000000-0000-4000-8000-000000000001",
++            "samples": [{"at_ms": 0, "contacts": [{"id": 0, "x": 7, "y": 9}]},
++                        {"at_ms": 20, "contacts": [{"id": True, "x": 7, "y": 9}]},
++                        {"at_ms": 70, "contacts": []}]} )])
++        self.assertTrue(result["isError"])
++        self.assertEqual(self.server.events, [("GET", "/config?wake=0")])
++
+     def test_frame_reference_round_trip_uses_exact_image_and_fresh_action_receipt(self):
+         frame_id = "00000000-0000-4000-8000-000000000001"
+         sequence = 0
+@@ -750,7 +796,7 @@ class MCPStdioTests(unittest.TestCase):
+                 capture_output=True, text=True, timeout=15,
+             )
+         self.assertEqual(process.returncode, 0, process.stderr)
+-        self.assertIn("18 tools", process.stdout)
++        self.assertIn("19 tools", process.stdout)
+         # The checker's initialize fetches /config; tools/list reuses the value.
+         self.assertEqual(self.server.events, [("GET", "/config?wake=0")])
+ 
+@@ -1139,7 +1185,7 @@ class MCPStdioTests(unittest.TestCase):
+         self.assertIn("控制真实 iPhone", replies[0]["result"]["instructions"])
+         tools = replies[1]["result"]["tools"]
+         # Tool and parameter names are the client contract and stay English.
+-        self.assertEqual(len(tools), 18)
++        self.assertEqual(len(tools), 19)
+         home = next(tool for tool in tools if tool["name"] == "home")
+         self.assertEqual(home["description"], "回到主屏幕。")
+         error = replies[2]["result"]["content"][0]["text"]
+diff --git a/Tests/iPhoneUseTests/Localization/LocalizationTests.swift b/Tests/iPhoneUseTests/Localization/LocalizationTests.swift
+index fff7bbe..bdc2374 100644
+--- a/Tests/iPhoneUseTests/Localization/LocalizationTests.swift
++++ b/Tests/iPhoneUseTests/Localization/LocalizationTests.swift
+@@ -143,7 +143,7 @@ final class LocalizationTests: XCTestCase {
+         let zhTools = MCPToolCatalog.tools(for: .zh)
+         let required: Set<String> = [
+             "session_context", "accessibility_tree",
+-            "list_devices", "screenshot", "screenshot_burst", "ocr_screen", "tap_text",
++            "list_devices", "screenshot", "screenshot_burst", "ocr_screen", "touch_sequence", "tap_text",
+             "move_pointer", "adjust_pointer", "click_pointer",
+             "tap", "long_press", "swipe", "type_text", "press_key", "keyboard_sequence", "home", "act",
+         ]
+diff --git a/Tests/iPhoneUseTests/MCP/MCPProtocolTests.swift b/Tests/iPhoneUseTests/MCP/MCPProtocolTests.swift
+index 9e62bb2..650aa3c 100644
+--- a/Tests/iPhoneUseTests/MCP/MCPProtocolTests.swift
++++ b/Tests/iPhoneUseTests/MCP/MCPProtocolTests.swift
+@@ -297,7 +297,7 @@ final class MCPOCRTests: XCTestCase {
+ final class MCPKeyboardAliasTests: XCTestCase {
+     func testEveryToolAdvertisesDeviceAliasAndOriginalWins() throws {
+         let tools = MCPToolCatalog.tools(for: .en)
+-        XCTAssertEqual(tools.count, 18)
++        XCTAssertEqual(tools.count, 19)
+         for tool in tools {
+             let schema = try XCTUnwrap(tool["inputSchema"] as? [String: Any])
+             let properties = try XCTUnwrap(schema["properties"] as? [String: Any])
+diff --git a/scripts/check-mcp.py b/scripts/check-mcp.py
+index 6e25468..4d35a4a 100755
+--- a/scripts/check-mcp.py
++++ b/scripts/check-mcp.py
+@@ -43,7 +43,7 @@ def check(command, live=False):
+     if "tools" not in initialized.get("capabilities", {}):
+         raise ValueError("Server did not advertise tools")
+     tools = replies[1]["result"].get("tools", [])
+-    required = {"session_context", "accessibility_tree", "list_devices", "screenshot", "screenshot_burst", "move_pointer", "adjust_pointer", "click_pointer",
++    required = {"touch_sequence", "session_context", "accessibility_tree", "list_devices", "screenshot", "screenshot_burst", "move_pointer", "adjust_pointer", "click_pointer",
+                 "tap", "long_press", "swipe", "type_text", "press_key", "keyboard_sequence", "home"}
+     if not required.issubset({tool.get("name") for tool in tools}):
+         raise ValueError("Server is missing iPhone Use tools")

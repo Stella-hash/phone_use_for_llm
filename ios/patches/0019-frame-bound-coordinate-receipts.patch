@@ -1,0 +1,1086 @@
+diff --git a/Sources/iPhoneUse/API/ControlAPI.swift b/Sources/iPhoneUse/API/ControlAPI.swift
+index af90d9e..f2b5028 100644
+--- a/Sources/iPhoneUse/API/ControlAPI.swift
++++ b/Sources/iPhoneUse/API/ControlAPI.swift
+@@ -47,6 +47,11 @@ enum ControlAPI {
+                 wasSuspended: wasSuspended || activity.isWithinWakeGraceWindow)
+         }
+         do {
++            if body["frame_id"] != nil {
++                guard request.method == "POST", ["/tap", "/move", "/swipe"].contains(request.path) else {
++                    throw ScreenshotReferences.Rejected("frame_id is supported only by POST tap, move and swipe")
++                }
++            }
+             switch (request.method, request.path) {
+             case ("GET", "/viewer"), ("GET", "/viewer/"):
+                 return WebPreview.response(for: viewerLanguage(request.query))
+@@ -111,6 +116,8 @@ enum ControlAPI {
+                 }
+                 return try perform(action, body: body, deviceQuery: deviceQuery)
+             }
++        } catch let error as ScreenshotReferences.Rejected {
++            return .json(["error": error.description, "frame_rejected": true, "input_sent": false], status: 409)
+         } catch DeviceInput.InputError.pointerBusy {
+             return .error("\(DeviceInput.InputError.pointerBusy)", status: 409)
+         } catch {
+@@ -272,7 +279,10 @@ enum ControlAPI {
+         }
+         let size = CGSize(width: CVPixelBufferGetWidth(frame.buffer), height: CVPixelBufferGetHeight(frame.buffer))
+         let image = RequestCoordinates.imageSize(size, maxWidth: maxWidth, maxEdge: maxEdge)
++        let reference = ScreenshotReferences.shared.issue(
++            device: device.id, source: device.screen.sourceInstanceID.uuidString, screenSize: size, imageSize: image)
+         var headers = [
++            "X-Frame-ID": reference.id,
+             "X-Device": device.id,
+             "X-Screen-Width": "\(Int(size.width))", "X-Screen-Height": "\(Int(size.height))",
+             "X-Image-Width": "\(image.0)", "X-Image-Height": "\(image.1)",
+@@ -316,6 +326,28 @@ enum ControlAPI {
+         _ action: Action, body: [String: Any], deviceQuery: String?
+     ) throws -> HTTPResponse {
+         let device = try DeviceRegistry.shared.find(deviceQuery)
++        var body = body
++        var reference: ScreenshotReferences.Reference?
++        if let raw = body["frame_id"] {
++            guard action.requiresPointer else {
++                throw ScreenshotReferences.Rejected("frame_id is supported only by tap, move and swipe")
++            }
++            let bound = try ScreenshotReferences.shared.consume(
++                raw, device: device.id, source: device.screen.sourceInstanceID.uuidString, screenSize: device.screen.size)
++            body = try bound.coordinateBody(body)
++            reference = bound
++        }
++        let validateReference: (() throws -> Void)? = reference.map { bound in
++            {
++                // Read the current registry entry after the potentially slow USB lookup.
++                guard let current = try? DeviceRegistry.shared.find(device.id) else {
++                    throw ScreenshotReferences.Rejected("device is no longer available")
++                }
++                try ScreenshotReferences.validate(
++                    bound, device: current.id, source: current.screen.sourceInstanceID.uuidString,
++                    screenSize: current.screen.size)
++            }
++        }
+         // Real input takes priority over background probes and measurement.
+         // Cancel before resolving/queuing input, so it cannot wait behind the
+         // very measurement that the user is trying to interrupt.
+@@ -331,13 +363,13 @@ enum ControlAPI {
+         switch action {
+         case .tap:
+             let (x, y) = try point(body, "x", "y", on: device)
+-            try input.tap(x: x, y: y, hold: (body["hold"] as? Double) ?? 0.08)
++            try input.tap(x: x, y: y, hold: (body["hold"] as? Double) ?? 0.08, beforeInput: validateReference)
+         case .swipe:
+             let swipe = try SwipeRequest(body, screenSize: device.screen.size, screenName: device.screen.name)
+-            try input.swipe(points: swipe.points, duration: swipe.duration)
++            try input.swipe(points: swipe.points, duration: swipe.duration, beforeInput: validateReference)
+         case .move:
+             let (x, y) = try point(body, "x", "y", on: device)
+-            try input.move(x: x, y: y)
++            try input.move(x: x, y: y, beforeInput: validateReference)
+         case .nudge:
+             try input.nudge(
+                 dx: (body["dx"] as? Int) ?? 0, dy: (body["dy"] as? Int) ?? 0,
+diff --git a/Sources/iPhoneUse/Input/DeviceInput.swift b/Sources/iPhoneUse/Input/DeviceInput.swift
+index c7e95fe..aa80a51 100644
+--- a/Sources/iPhoneUse/Input/DeviceInput.swift
++++ b/Sources/iPhoneUse/Input/DeviceInput.swift
+@@ -219,8 +219,8 @@ final class DeviceInput {
+ 
+ extension DeviceInput {
+     /// Coordinates are fractions of the screen, 0...1 from the top-left corner.
+-    func tap(x: Double, y: Double, hold: TimeInterval = 0.08) throws {
+-        try performCoordinateGesture {
++    func tap(x: Double, y: Double, hold: TimeInterval = 0.08, beforeInput: (() throws -> Void)? = nil) throws {
++        try performCoordinateGesture(beforeInput: beforeInput) {
+             pointer(x, y)
+             pause(step * 2)
+             button(down: true)
+@@ -235,8 +235,8 @@ extension DeviceInput {
+     /// toward each interval. Positioning, button pacing and legacy calibrated
+     /// reports retain their own waits, so total wall time may exceed `duration`.
+     /// Segment timing follows physical screen distance.
+-    func swipe(points: [(Double, Double)], duration: TimeInterval) throws {
+-        try performCoordinateGesture {
++    func swipe(points: [(Double, Double)], duration: TimeInterval, beforeInput: (() throws -> Void)? = nil) throws {
++        try performCoordinateGesture(beforeInput: beforeInput) {
+             let table = StringsAPI.current
+             guard points.count >= 2,
+                 points.allSatisfy({ x, y in
+@@ -316,8 +316,8 @@ extension DeviceInput {
+         return lengths.map { duration * (total > 0 ? $0 / total : 1 / Double(lengths.count)) }
+     }
+ 
+-    func move(x: Double, y: Double) throws {
+-        try performCoordinateGesture {
++    func move(x: Double, y: Double, beforeInput: (() throws -> Void)? = nil) throws {
++        try performCoordinateGesture(beforeInput: beforeInput) {
+             pointer(x, y)
+             pause(step)
+         }
+@@ -1107,13 +1107,14 @@ extension DeviceInput {
+ 
+     /// Coordinate APIs share the same validation order and queue boundary.
+     /// Keep pacing inside the operation so a complete gesture stays serialized.
+-    fileprivate func performCoordinateGesture(_ gesture: () throws -> Void) throws {
++    fileprivate func performCoordinateGesture(beforeInput: (() throws -> Void)? = nil, _ gesture: () throws -> Void) throws {
+         // Supersede background probes before waiting on their input queue.
+         discardPendingMotion()
+         try queue.sync {
+             try requireIdlePointer()
+             try requireCoordinateMapping()
+             try refreshDisplayMapping()
++            try beforeInput?()
+             try gesture()
+         }
+     }
+diff --git a/Sources/iPhoneUse/MCP/MCPContextStore.swift b/Sources/iPhoneUse/MCP/MCPContextStore.swift
+index 9eb19ab..2d34c40 100644
+--- a/Sources/iPhoneUse/MCP/MCPContextStore.swift
++++ b/Sources/iPhoneUse/MCP/MCPContextStore.swift
+@@ -269,8 +269,15 @@ final class MCPContextRecording {
+     private let store: MCPContextStore?
+     private var event: MCPContextStore.Event?
+     private var diagnostic: String?
++    private var rejectedBeforeInput = false
++    private var requestsStarted = 0
++    private var requestsAcknowledged = 0
++    private let inputFrameID: String?
++    private let isInput: Bool
+ 
+     init(device: String, tool: String, arguments: [String: Any], kind: String) {
++        inputFrameID = arguments["frame_id"] as? String
++        isInput = kind == "input"
+         do {
+             let store = try MCPContextStore(device: device)
+             let event = try store.begin(tool: tool, arguments: arguments, kind: kind)
+@@ -282,8 +289,8 @@ final class MCPContextRecording {
+         }
+     }
+ 
+-    func requestStarted() { update { $0.requests_started += 1; $0.state = "request_started" } }
+-    func requestAcknowledged() { update { $0.requests_acknowledged += 1; $0.state = "acknowledged" } }
++    func requestStarted() { requestsStarted += 1; update { $0.requests_started += 1; $0.state = "request_started" } }
++    func requestAcknowledged() { requestsAcknowledged += 1; update { $0.requests_acknowledged += 1; $0.state = "acknowledged" } }
+     func finish(_ observation: MCPServer.ObservationResult? = nil) {
+         update {
+             $0.state = "finished"
+@@ -299,6 +306,8 @@ final class MCPContextRecording {
+         }
+     }
+     func fail(_ error: Error) {
++        rejectedBeforeInput = (error as? MCPServer.MCPError)?.inputNotSent == true
++            && requestsStarted == 1 && requestsAcknowledged == 0
+         update {
+             let failure = error as? MCPServer.MCPError
+             $0.state = failure?.httpStatus != nil ? "http_error"
+@@ -330,9 +339,24 @@ final class MCPContextRecording {
+             activity["note"] = "Context recording is unavailable. The action result is unchanged; do not repeat input to repair history."
+         }
+         metadata["session_activity"] = activity
++        if isInput {
++            var receipt: [String: Any] = [
++                "status": rejectedBeforeInput || requestsStarted == 0 ? "not_sent"
++                    : requestsStarted == requestsAcknowledged ? "acknowledged" : "unconfirmed",
++                "requests_started": requestsStarted, "requests_acknowledged": requestsAcknowledged,
++                "hid_delivery": "unverified", "app_completion": "unverified",
++            ]
++            if let inputFrameID { receipt["based_on_frame_id"] = inputFrameID }
++            metadata["input_receipt"] = receipt
++        }
+         result["structuredContent"] = metadata
+         // Preserve existing OCR/action text exactly; context is a distinct data block.
+         var content = result["content"] as? [[String: Any]] ?? []
++        if inputFrameID != nil, let receipt = metadata["input_receipt"],
++            let data = try? JSONSerialization.data(withJSONObject: ["input_receipt": receipt], options: [.sortedKeys])
++        {
++            content.append(["type": "text", "text": String(decoding: data, as: UTF8.self)])
++        }
+         if includeCheckpoint || diagnostic != nil {
+             var extra: [String: Any] = ["session_activity": activity]
+             extra["session_resume"] = metadata["session_resume"]
+diff --git a/Sources/iPhoneUse/MCP/MCPServer.swift b/Sources/iPhoneUse/MCP/MCPServer.swift
+index 94ca01a..e3373a7 100644
+--- a/Sources/iPhoneUse/MCP/MCPServer.swift
++++ b/Sources/iPhoneUse/MCP/MCPServer.swift
+@@ -114,6 +114,9 @@ enum MCPServer {
+         do {
+             if name == "session_context" { return try sessionContext(arguments) }
+             if name == "accessibility_tree" { return try accessibilityTree(arguments) }
++            if arguments["frame_id"] != nil, !["tap", "long_press", "move_pointer", "swipe"].contains(name) {
++                throw MCPError("frame_id is supported only by tap, long_press, move_pointer and swipe")
++            }
+             let burstOptions = name == "screenshot_burst" ? try MCPScreenshotBurst.Options(arguments) : nil
+             let observe = arguments["observe"] as? String ?? "full"
+             guard arguments["observe"] == nil || arguments["observe"] is String,
+@@ -264,7 +267,7 @@ enum MCPServer {
+             }
+         } catch {
+             devicesCache.invalidate()
+-            return failure("\(error)")
++            return failure("\(error)", inputNotSent: arguments["frame_id"] != nil)
+         }
+     }
+ 
+@@ -421,6 +424,14 @@ enum MCPServer {
+         let identity: FrameIdentity?
+         let signature: String
+         var ocr: ScreenOCR.Result?
++        var frameID: String? = nil
++
++        var referenceJSON: [String: Any]? {
++            guard let frameID, let width = Int(width), let height = Int(height) else { return nil }
++            return ["id": frameID, "width": width, "height": height,
++                "coordinates": "image-pixels", "one_use": true, "orientation_bound": false,
++                "ui_unchanged": "unverified"]
++        }
+     }
+ 
+     enum ObservationStatus: String { case changed, stable, unobserved, timeout }
+@@ -583,34 +594,46 @@ enum MCPServer {
+         return ObservationFrame(
+             image: image, device: id, width: width, height: height,
+             mimeType: response.value(forHTTPHeaderField: "Content-Type") ?? "image/jpeg",
+-            identity: FrameIdentity.parse(response), signature: ScreenOCR.stabilitySignature(image), ocr: serverOCR)
++            identity: FrameIdentity.parse(response), signature: ScreenOCR.stabilitySignature(image), ocr: serverOCR,
++            frameID: response.value(forHTTPHeaderField: "X-Frame-ID"))
+     }
+ 
+-    private static func screenshotContent(
++    static func screenshotContent(
+         _ frame: ObservationFrame, includeImage: Bool, diff: Bool
+     ) -> [String: Any] {
+         let ocr = frame.ocr ?? ScreenOCR.recognize(frame.image, device: frame.device)
++        var result: [String: Any]
+         if diff {
+             let text =
+                 ocr.screenHash.isEmpty
+                 ? "OCR observation unavailable"
+                 : ScreenOCR.summaryDiff(for: ocr, device: frame.device)
+-            return ["content": [["type": "text", "text": text]]]
++            result = ["content": [["type": "text", "text": text]]]
++        } else {
++            if !ocr.screenHash.isEmpty { _ = ScreenOCR.diff(device: frame.device, current: ocr) }
++            result = screenshotContent(
++                image: frame.image, device: frame.device, width: frame.width, height: frame.height,
++                includeImage: includeImage, ocr: ocr, mimeType: frame.mimeType)
++        }
++        if let reference = frame.referenceJSON {
++            result["structuredContent"] = ["frame": reference]
++            var content = result["content"] as? [[String: Any]] ?? []
++            if let data = try? JSONSerialization.data(withJSONObject: ["frame": reference], options: [.sortedKeys]) {
++                content.append(["type": "text", "text": String(decoding: data, as: UTF8.self)])
++            }
++            result["content"] = content
+         }
+-        if !ocr.screenHash.isEmpty { _ = ScreenOCR.diff(device: frame.device, current: ocr) }
+-        return screenshotContent(
+-            image: frame.image, device: frame.device, width: frame.width, height: frame.height,
+-            includeImage: includeImage, ocr: ocr,
+-            mimeType: frame.mimeType)
++        return result
+     }
+ 
+     static func observationContent(
+         _ observation: ObservationResult, includeImage: Bool, diff: Bool
+     ) -> [String: Any] {
+-        let metadata: [String: Any] = [
++        var metadata: [String: Any] = [
+             "ok": true, "action_acknowledged": true, "hid_delivery": "unverified",
+             "app_completion": "unverified", "observation": observation.json,
+         ]
++        if let reference = observation.frame?.referenceJSON { metadata["frame"] = reference }
+         var result =
+             observation.frame.map { screenshotContent($0, includeImage: includeImage, diff: diff) }
+             ?? ["content": [["type": "text", "text": "Action acknowledged; no screen observation."]]]
+@@ -647,8 +670,14 @@ enum MCPServer {
+         FileHandle.standardOutput.write(data + Data("\n".utf8))
+     }
+ 
+-    private static func failure(_ message: String) -> [String: Any] {
+-        ["content": [["type": "text", "text": message]], "isError": true]
++    private static func failure(_ message: String, inputNotSent: Bool = false) -> [String: Any] {
++        var result: [String: Any] = ["content": [["type": "text", "text": message]], "isError": true]
++        if inputNotSent {
++            result["structuredContent"] = ["input_receipt": [
++                "status": "not_sent", "requests_started": 0, "requests_acknowledged": 0,
++            ]]
++        }
++        return result
+     }
+ 
+     struct MCPError: Error, CustomStringConvertible {
+@@ -656,11 +685,13 @@ enum MCPServer {
+         let httpStatus: Int?
+         let completedSteps: Int?
+         let failedStep: Int?
+-        init(_ description: String, httpStatus: Int? = nil, completedSteps: Int? = nil, failedStep: Int? = nil) {
++        let inputNotSent: Bool
++        init(_ description: String, httpStatus: Int? = nil, completedSteps: Int? = nil, failedStep: Int? = nil, inputNotSent: Bool = false) {
+             self.description = description
+             self.httpStatus = httpStatus
+             self.completedSteps = completedSteps
+             self.failedStep = failedStep
++            self.inputNotSent = inputNotSent
+         }
+     }
+ }
+@@ -689,7 +720,8 @@ private struct MCPHTTPClient {
+         let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+         let message = body?["error"] as? String ?? "HTTP \(status)"
+         guard let body, body["failed_step"] != nil || body["completed"] != nil else {
+-            return MCPServer.MCPError(message, httpStatus: status)
++            return MCPServer.MCPError(message, httpStatus: status,
++                inputNotSent: body?["frame_rejected"] as? Bool == true && body?["input_sent"] as? Bool == false)
+         }
+         var progress: [String: Any] = ["error": message]
+         progress["failed_step"] = body["failed_step"]
+diff --git a/Sources/iPhoneUse/MCP/MCPTools.swift b/Sources/iPhoneUse/MCP/MCPTools.swift
+index 9c761ef..b5a6153 100644
+--- a/Sources/iPhoneUse/MCP/MCPTools.swift
++++ b/Sources/iPhoneUse/MCP/MCPTools.swift
+@@ -12,6 +12,8 @@ enum MCPToolCatalog {
+         let table = StringsMCP(language: language)
+         let device = device(for: table)
+         let normalized: [String: Any] = ["type": "boolean", "description": table.normalizedParam]
++        let frameID: [String: Any] = ["type": "string", "description":
++            "Optional one-use frame.id from a returned screenshot. Binds image pixels to that device/capture and size; use normalized=false. Unknown/consumed/restarted or resized references are rejected before input. Does not guarantee unchanged UI, orientation or target hit."]
+         let includeImage: [String: Any] = ["type": "boolean", "default": true, "description": table.includeImage]
+         let maxEdge: [String: Any] = ["type": "integer", "minimum": 1, "default": MCPServer.longEdge]
+         return [
+@@ -69,7 +71,7 @@ enum MCPToolCatalog {
+             tool(
+                 "move_pointer",
+                 table.toolMovePointer,
+-                ["x": number(table.xPixels), "y": number(table.yPixels), "normalized": normalized, "device": device],
++                ["x": number(table.xPixels), "y": number(table.yPixels), "normalized": normalized, "frame_id": frameID, "device": device],
+                 required: ["x", "y"]),
+             tool(
+                 "adjust_pointer",
+@@ -84,13 +86,13 @@ enum MCPToolCatalog {
+                 ["device": device]),
+             tool(
+                 "tap", table.toolTap,
+-                ["x": number(table.xPixels), "y": number(table.yPixels), "normalized": normalized, "device": device],
++                ["x": number(table.xPixels), "y": number(table.yPixels), "normalized": normalized, "frame_id": frameID, "device": device],
+                 required: ["x", "y"]),
+             tool(
+                 "long_press", table.toolLongPress,
+                 [
+                     "x": number(table.xPixels), "y": number(table.yPixels),
+-                    "seconds": number(table.holdSeconds), "normalized": normalized, "device": device,
++                    "seconds": number(table.holdSeconds), "normalized": normalized, "frame_id": frameID, "device": device,
+                 ], required: ["x", "y"]),
+             tool(
+                 "swipe",
+@@ -110,6 +112,7 @@ enum MCPToolCatalog {
+                         "description": table.swipeDurationDesc,
+                     ],
+                     "normalized": normalized,
++                    "frame_id": frameID,
+                     "device": device,
+                 ], required: ["points"]),
+             tool(
+@@ -339,6 +342,12 @@ struct MCPToolRequest {
+             }
+             normalized = value.boolValue
+         }
++        if let raw = arguments["frame_id"] {
++            guard let id = raw as? String, UUID(uuidString: id) != nil, !normalized else {
++                throw MCPServer.MCPError("frame_id requires a returned frame.id and screenshot pixel coordinates")
++            }
++            body["frame_id"] = id
++        }
+         func coordinate(_ value: Any?, key: String) throws -> Double {
+             guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+                 number.doubleValue.isFinite, (0...1000).contains(number.doubleValue)
+diff --git a/Tests/PythonTests/test_mcp_stdio.py b/Tests/PythonTests/test_mcp_stdio.py
+index 89d1ef0..e8ec9bb 100644
+--- a/Tests/PythonTests/test_mcp_stdio.py
++++ b/Tests/PythonTests/test_mcp_stdio.py
+@@ -54,6 +54,18 @@ def capture_reply(gray, sequence, received_at, source="capture-1"):
+     }
+ 
+ 
++def identified_capture_reply(gray, sequence, received_at):
++    """Distinguish encoded frames without changing their decoded pixels."""
++    status, image, headers = capture_reply(gray, sequence, received_at)
++    payload = b"frame-sequence\0" + str(sequence).encode()
++    marker = (struct.pack(">I", len(payload)) + b"tEXt" + payload
++              + struct.pack(">I", zlib.crc32(b"tEXt" + payload)))
++    # The existing fixture ends with the standard 12-byte IEND chunk.
++    image = image[:-12] + marker + image[-12:]
++    headers["X-Frame-ID"] = "00000000-0000-4000-8000-%012d" % sequence
++    return status, image, headers
++
++
+ class MockApp(BaseHTTPRequestHandler):
+     def log_message(self, *args):
+         pass
+@@ -96,6 +108,9 @@ class MockApp(BaseHTTPRequestHandler):
+         if self.path == "/act" and self.server.act_failure is not None:
+             self.send(400, json.dumps(self.server.act_failure).encode())
+             return
++        if self.server.frame_rejection:
++            self.send(409, b'{"error":"frame consumed","frame_rejected":true,"input_sent":false}')
++            return
+         if self.server.fail_actions:
+             self.send(503, b'{"error":"pointer is not ready"}')
+         else:
+@@ -117,6 +132,7 @@ class MCPStdioTests(unittest.TestCase):
+         self.server.events = []
+         self.server.stability_events = []
+         self.server.fail_actions = False
++        self.server.frame_rejection = False
+         self.server.act_failure = None
+         self.server.language = "en"
+         self.server.devices = [{"id": "phone-1", "name": "First", "bluetooth": True}]
+@@ -158,6 +174,75 @@ class MCPStdioTests(unittest.TestCase):
+         self.assertEqual([reply["id"] for reply in replies], ["init"] + list(range(1, len(calls) + 1)))
+         return [reply["result"] for reply in replies[1:]]
+ 
++    def test_frame_reference_round_trip_uses_exact_image_and_fresh_action_receipt(self):
++        frame_id = "00000000-0000-4000-8000-000000000001"
++        sequence = 0
++
++        def screenshot(path):
++            nonlocal sequence
++            sequence += 1
++            status, image, headers = capture_reply(80 if sequence == 1 else 160, sequence, capture_uptime())
++            headers["X-Frame-ID"] = frame_id if sequence == 1 else "00000000-0000-4000-8000-%012d" % sequence
++            return status, image, headers
++
++        self.server.screenshot_response = screenshot
++        first, action = self.exchange([
++            ("screenshot", {}),
++            ("tap", {"frame_id": frame_id, "x": 7, "y": 12, "observation_timeout": 0.3}),
++        ])
++        self.assertEqual(first["structuredContent"]["frame"]["id"], frame_id)
++        self.assertEqual(first["structuredContent"]["frame"]["width"], 16)
++        self.assertFalse(first["structuredContent"]["frame"]["orientation_bound"])
++        posts = [event for event in self.server.events if event[0] == "POST"]
++        self.assertEqual(len(posts), 1)
++        self.assertEqual(posts[0][2]["frame_id"], frame_id)
++        self.assertEqual(posts[0][2]["x"], 7)
++        receipt = action["structuredContent"]
++        self.assertEqual(receipt["input_receipt"]["status"], "acknowledged")
++        self.assertEqual(receipt["input_receipt"]["based_on_frame_id"], frame_id)
++        self.assertTrue(receipt["observation"]["fresh"])
++        self.assertNotEqual(receipt["frame"]["id"], frame_id)
++        images = [b for b in action["content"] if b["type"] == "image"]
++        self.assertEqual(len(images), 1)
++        self.assertEqual(base64.b64decode(images[0]["data"]), capture_reply(160, 1, 0)[1])
++
++    def test_frame_rejection_is_not_sent_but_other_http_errors_stay_unconfirmed(self):
++        args = {"frame_id": "00000000-0000-4000-8000-000000000001", "x": 7, "y": 12}
++        self.server.frame_rejection = True
++        rejected, = self.exchange([("tap", args)])
++        self.assertTrue(rejected["isError"])
++        self.assertEqual(rejected["structuredContent"]["input_receipt"]["status"], "not_sent")
++        self.server.frame_rejection = False
++        self.server.fail_actions = True
++        uncertain, = self.exchange([("tap", args)])
++        self.assertTrue(uncertain["isError"])
++        self.assertEqual(uncertain["structuredContent"]["input_receipt"]["status"], "unconfirmed")
++        self.assertEqual(len([e for e in self.server.events if e[0] == "POST"]), 2)
++
++    def test_acknowledged_frame_action_with_failed_capture_does_not_retry(self):
++        self.server.screenshot_response = lambda path: (503, b'{"error":"capture absent"}', None)
++        result, = self.exchange([("tap", {"frame_id": "00000000-0000-4000-8000-000000000001", "x": 7, "y": 12})])
++        self.assertFalse(result.get("isError", False))
++        metadata = result["structuredContent"]
++        self.assertTrue(metadata["action_acknowledged"])
++        self.assertEqual(metadata["input_receipt"]["status"], "acknowledged")
++        self.assertEqual(metadata["observation"]["status"], "unobserved")
++        self.assertNotIn("frame", metadata)
++        self.assertEqual(len([e for e in self.server.events if e[0] == "POST"]), 1)
++
++    def test_frame_id_is_never_silently_ignored_or_used_with_normalized_coordinates(self):
++        frame_id = "00000000-0000-4000-8000-000000000001"
++        for name, args in [
++            ("tap", {"x": 4, "y": 5, "normalized": True}),
++            ("press_key", {"key": "tab"}),
++            ("act", {"steps": [{"type": "tap", "x": 4, "y": 5}]}),
++        ]:
++            with self.subTest(name=name):
++                result, = self.exchange([(name, dict(args, frame_id=frame_id))])
++                self.assertTrue(result["isError"])
++                self.assertEqual(result["structuredContent"]["input_receipt"]["status"], "not_sent")
++        self.assertFalse(any(e[0] == "POST" for e in self.server.events))
++
+     def test_screenshot_burst_returns_ordered_fresh_images_using_only_capture_gets(self):
+         sequence = 0
+ 
+@@ -346,6 +431,7 @@ class MCPStdioTests(unittest.TestCase):
+         self.assertNotIn("isError", result)
+         self.assertTrue(result["structuredContent"]["action_acknowledged"])
+         self.assertEqual(result["structuredContent"]["session_activity"]["recording"], "unavailable")
++        self.assertEqual(result["structuredContent"]["input_receipt"]["status"], "acknowledged")
+         self.assertTrue(any("do not repeat input" in block.get("text", "") for block in result["content"]))
+         self.assertEqual(sum(event[0] == "POST" for event in self.server.events), 1)
+ 
+@@ -536,24 +622,35 @@ class MCPStdioTests(unittest.TestCase):
+         self.assertGreaterEqual(observation["elapsed_ms"], 500)
+         sequence = [0]
+         posted = threading.Event()
+-        fresh_times = []
++        produced = []
+         self.server.before_post = lambda body: posted.set()
+ 
+         def fresh(path):
+             sequence[0] += 1
+-            if posted.is_set() and not fresh_times:
++            current_sequence = sequence[0]
++            if posted.is_set() and not any(frame["post_action"] for frame in produced):
+                 # A bounded first-frame delay leaves too few samples in a 0.5s
+                 # window. Fresh pixels alone do not establish the required 160ms
+                 # stability span; allow the normal observation budget to do so.
+                 time.sleep(0.28)
+             received_at = capture_uptime()
+-            if posted.is_set():
+-                fresh_times.append(received_at)
+-            return capture_reply(0, sequence[0], received_at)
++            reply = identified_capture_reply(0, current_sequence, received_at)
++            produced.append({"sequence": current_sequence, "received_at": received_at,
++                             "post_action": posted.is_set(), "reply": reply})
++            return reply
+ 
+         self.server.screenshot_response = fresh
+         unchanged = self.exchange([("home", {"observation_timeout": 1.5})])[0]
+         observation = unchanged["structuredContent"]["observation"]
++        selected = int(observation["frame"]["sequence"])
++        frames = {frame["sequence"]: frame for frame in list(produced)}
++        self.assertIn(selected, frames)
++        selected_frame = frames[selected]
++        # A server can generate the next reply after the client's remaining
++        # HTTP budget expires. Compare to the identified returned snapshot,
++        # not the counter of every request received by the mock server.
++        fresh_times = [frame["received_at"] for number, frame in sorted(frames.items())
++                       if frame["post_action"] and number <= selected]
+         evidence = {"observation": observation, "post_action_frame_times": fresh_times}
+         self.assertGreaterEqual(len(fresh_times), 2, evidence)
+         self.assertGreaterEqual(fresh_times[-1] - fresh_times[0], 0.16, evidence)
+@@ -562,9 +659,64 @@ class MCPStdioTests(unittest.TestCase):
+         self.assertTrue(observation["visually_stable"])
+         self.assertFalse(observation["changed_from_baseline"])
+         self.assertGreaterEqual(observation["elapsed_ms"], 1500)
+-        self.assertEqual(observation["frame"]["sequence"], str(sequence[0]))
++        self.assertEqual(observation["frame"]["received_at_uptime"], selected_frame["received_at"])
++        self.assertEqual(unchanged["structuredContent"]["frame"]["id"],
++                         selected_frame["reply"][2]["X-Frame-ID"])
++        self.assertEqual(unchanged["content"][0]["data"],
++                         base64.b64encode(selected_frame["reply"][1]).decode())
+         self.assertEqual(sum(event[0] == "POST" for event in self.server.events), 2)
+ 
++    def test_timed_out_final_capture_keeps_last_received_frame_and_payload(self):
++        state = {"posted_at": None, "sequence": 0}
++        produced = []
++        late_finished = threading.Event()
++        self.server.before_post = lambda body: state.update(posted_at=time.monotonic())
++        # A cancelled HTTP client may close before the intentional late write.
++        original_handle_error = self.server.handle_error
++
++        def handle_error(request, address):
++            if not isinstance(sys.exc_info()[1], (BrokenPipeError, ConnectionResetError)):
++                original_handle_error(request, address)
++
++        self.server.handle_error = handle_error
++
++        def screenshot(path):
++            state["sequence"] += 1
++            sequence = state["sequence"]
++            received_at = capture_uptime()
++            late = (state["posted_at"] is not None
++                    and time.monotonic() - state["posted_at"] >= 1.0)
++            reply = identified_capture_reply(0, sequence, received_at)
++            produced.append({"sequence": sequence, "received_at": received_at,
++                             "late": late, "reply": reply})
++            if late:
++                time.sleep(0.8)  # Exceeds the remaining portion of the 1.5s window.
++                late_finished.set()
++            return reply
++
++        self.server.screenshot_response = screenshot
++        result = self.exchange([("home", {"observation_timeout": 1.5})])[0]
++        frames = list(produced)
++        self.assertNotIn("isError", result)
++        observation = result["structuredContent"]["observation"]
++        self.assertTrue(frames[-1]["late"], observation)
++        selected_frame = frames[-2]
++        late_frame = frames[-1]
++        self.assertEqual(observation["frame"]["sequence"], str(selected_frame["sequence"]))
++        self.assertEqual(observation["frame"]["received_at_uptime"], selected_frame["received_at"])
++        self.assertEqual(result["structuredContent"]["frame"]["id"],
++                         selected_frame["reply"][2]["X-Frame-ID"])
++        self.assertEqual(result["content"][0]["data"], base64.b64encode(selected_frame["reply"][1]).decode())
++        self.assertNotEqual(selected_frame["reply"][1], late_frame["reply"][1])
++        self.assertEqual(observation["status"], "stable")
++        self.assertTrue(observation["fresh"])
++        self.assertTrue(observation["visually_stable"])
++        self.assertFalse(observation["changed_from_baseline"])
++        self.assertGreaterEqual(observation["elapsed_ms"], 1500)
++        self.assertTrue(result["structuredContent"]["action_acknowledged"])
++        self.assertEqual(sum(event[0] == "POST" for event in self.server.events), 1)
++        self.assertTrue(late_finished.wait(timeout=2))
++
+     def test_failed_capture_does_not_turn_acknowledged_input_into_a_retryable_action_error(self):
+         self.server.screenshot_response = lambda path: (503, b'{"error":"capture unavailable"}', None)
+         result = self.exchange([("home", {"observation_timeout": 0.3})])[0]
+diff --git a/Tests/iPhoneUseTests/API/HTTPAPITests.swift b/Tests/iPhoneUseTests/API/HTTPAPITests.swift
+index 56823fe..e263826 100644
+--- a/Tests/iPhoneUseTests/API/HTTPAPITests.swift
++++ b/Tests/iPhoneUseTests/API/HTTPAPITests.swift
+@@ -67,6 +67,53 @@ final class HTTPMessageTests: XCTestCase {
+     }
+ }
+ 
++final class ScreenshotReferenceRoutingTests: XCTestCase {
++    func testUnsupportedFrameReferenceRejectsBeforeSpecialRouteDispatch() throws {
++        // Leave this isolated controller stopped: request dispatch must not wake
++        // capture, discover a real phone, or require a running resident host.
++        let activity = QuietModeActivityController(environment: [:])
++        let reference = ScreenshotReferences.shared.issue(
++            device: "frame-routing-test-device", source: "frame-routing-test-source",
++            screenSize: CGSize(width: 2556, height: 1180), imageSize: (1000, 462))
++        var captures = 0
++        var taps = 0
++        for path in ["/act", "/tap_text", "/calibration/auto", "/calibration/reload", "/ocr", "/type"] {
++            let body: [String: Any] = [
++                "frame_id": reference.id, "device": reference.device,
++                "steps": [["type": "home"]], "text": "Confirm",
++            ]
++            let response = ControlAPI.handle(
++                HTTPRequest(method: "POST", path: path, query: [:], body: body),
++                ocrCapture: { _, _ in
++                    captures += 1
++                    XCTFail("unsupported frame_id must reject before capture: \(path)")
++                    return ("frame-routing-test-device", Data())
++                },
++                ocrTap: { _, _, _, _ in
++                    taps += 1
++                    XCTFail("unsupported frame_id must reject before tap: \(path)")
++                }, activity: activity)
++            XCTAssertEqual(response.status, 409, path)
++            let result = try XCTUnwrap(JSONSerialization.jsonObject(with: response.body) as? [String: Any])
++            XCTAssertEqual(result["frame_rejected"] as? Bool, true, path)
++            XCTAssertEqual(result["input_sent"] as? Bool, false, path)
++            XCTAssertTrue((result["error"] as? String)?.contains("frame_id") == true, path)
++            XCTAssertNil(result["completed"], path)
++            XCTAssertNil(result["failed_step"], path)
++        }
++        XCTAssertEqual(captures, 0)
++        XCTAssertEqual(taps, 0)
++        // Unsupported routes have not attempted the coordinate action, so they
++        // must not spend a token that a subsequent supported route can use.
++        XCTAssertEqual(
++            try ScreenshotReferences.shared.consume(
++                reference.id, device: reference.device, source: reference.source,
++                screenSize: CGSize(width: 2556, height: 1180)
++            ).id,
++            reference.id)
++    }
++}
++
+ final class RequestCoordinatesTests: XCTestCase {
+     private var previousLanguage: AppLanguage = .en
+ 
+diff --git a/Tests/iPhoneUseTests/Input/DeviceInputDisplayMappingTests.swift b/Tests/iPhoneUseTests/Input/DeviceInputDisplayMappingTests.swift
+index d84c4a0..4bcf907 100644
+--- a/Tests/iPhoneUseTests/Input/DeviceInputDisplayMappingTests.swift
++++ b/Tests/iPhoneUseTests/Input/DeviceInputDisplayMappingTests.swift
+@@ -37,6 +37,35 @@ private final class RotatingAbsoluteHost {
+ }
+ 
+ final class DeviceInputDisplayMappingTests: XCTestCase {
++    func testFrameGuardRunsAfterUSBLookupBeforeAnyReportForEveryCoordinateAction() throws {
++        for kind in ["tap", "move", "swipe"] {
++            let phone = RotatingAbsoluteHost()
++            let store = ScreenshotReferences()
++            let reference = store.issue(device: "phone", source: "old", screenSize: phone.captureSize, imageSize: (462, 1000))
++            var source = "old"
++            var queried = false
++            let input = DeviceInput(
++                host: UUID(), session: UUID(), screenSize: { phone.captureSize }, heldDragProfile: .notConfigured,
++                displayMappingProvider: {
++                    queried = true
++                    source = "new"
++                    return try phone.mapping()
++                }, sleep: { _ in }, reportSender: phone.send)
++            let guardFrame: () throws -> Void = {
++                XCTAssertTrue(queried)
++                try ScreenshotReferences.validate(reference, device: "phone", source: source, screenSize: phone.captureSize)
++            }
++            XCTAssertThrowsError(try {
++                switch kind {
++                case "tap": try input.tap(x: 0.2, y: 0.3, beforeInput: guardFrame)
++                case "move": try input.move(x: 0.2, y: 0.3, beforeInput: guardFrame)
++                default: try input.swipe(points: [(0.2, 0.3), (0.3, 0.3)], duration: 0.2, beforeInput: guardFrame)
++                }
++            }())
++            XCTAssertTrue(phone.reports.isEmpty, "\(kind) must send nothing if capture changes during preflight")
++        }
++    }
++
+     func testAllQuarterTurnsLandAtAsymmetricVisibleTargets() throws {
+         for rotation in [0, 90, 180, 270] {
+             let phone = RotatingAbsoluteHost()
+diff --git a/Sources/iPhoneUse/API/ScreenshotReferences.swift b/Sources/iPhoneUse/API/ScreenshotReferences.swift
+new file mode 100644
+index 0000000..06e7c1d
+--- /dev/null
++++ b/Sources/iPhoneUse/API/ScreenshotReferences.swift
+@@ -0,0 +1,101 @@
++import CoreFoundation
++import Foundation
++
++/// A bounded coordinate reference, not a claim that the app has stopped changing.
++/// Metadata only; tokens live in this resident host and survive stdio reconnects.
++final class ScreenshotReferences {
++    static let shared = ScreenshotReferences()
++
++    struct Rejected: Error, CustomStringConvertible {
++        let description: String
++        init(_ reason: String) { description = "Frame reference rejected before input: " + reason }
++    }
++
++    struct Reference {
++        let id: String
++        let device: String
++        let source: String
++        let width: Int
++        let height: Int
++        let screenWidth: Int
++        let screenHeight: Int
++
++        func coordinateBody(_ body: [String: Any]) throws -> [String: Any] {
++            if let raw = body["fraction"] {
++                guard let value = raw as? NSNumber, CFGetTypeID(value) == CFBooleanGetTypeID(), !value.boolValue else {
++                    throw Rejected("frame_id requires screenshot pixels, not fractions")
++                }
++            }
++            func point(_ point: [String: Any]) throws {
++                for (key, limit) in [("x", width), ("y", height)] {
++                    guard let number = point[key] as? NSNumber,
++                        CFGetTypeID(number) != CFBooleanGetTypeID(), number.doubleValue.isFinite,
++                        number.doubleValue >= 0, number.doubleValue < Double(limit)
++                    else { throw Rejected("\(key) must be inside the referenced \(width)x\(height) image") }
++                }
++            }
++            if let raw = body["points"] {
++                guard body["x"] == nil, body["y"] == nil else {
++                    throw Rejected("use points or x/y, not both")
++                }
++                guard let points = raw as? [[String: Any]], points.count >= 2 else {
++                    throw Rejected("points must contain at least two image-pixel positions")
++                }
++                for p in points { try point(p) }
++            } else {
++                try point(body)
++            }
++            var bound = body
++            bound["width"] = width
++            bound["height"] = height
++            bound.removeValue(forKey: "maxEdge")
++            bound["fraction"] = false
++            return bound
++        }
++    }
++
++    private let lock = NSLock()
++    private let capacity: Int
++    private var references: [String: Reference] = [:]
++    private var order: [String] = []
++
++    init(capacity: Int = 128) { self.capacity = max(1, capacity) }
++
++    func issue(device: String, source: String, screenSize: CGSize, imageSize: (Int, Int)) -> Reference {
++        let reference = Reference(
++            id: UUID().uuidString, device: device, source: source,
++            width: imageSize.0, height: imageSize.1,
++            screenWidth: Int(screenSize.width), screenHeight: Int(screenSize.height))
++        lock.lock()
++        defer { lock.unlock() }
++        references[reference.id] = reference
++        order.append(reference.id)
++        while order.count > capacity { references.removeValue(forKey: order.removeFirst()) }
++        return reference
++    }
++
++    /// A valid selected-device token is consumed once, including failed attempts.
++    /// A new observation is the recovery path; this never replays an input.
++    func consume(_ raw: Any, device: String, source: String, screenSize: CGSize?) throws -> Reference {
++        lock.lock()
++        defer { lock.unlock() }
++        guard let id = raw as? String, let reference = references[id] else {
++            throw Rejected("unknown, consumed or evicted frame_id; observe again")
++        }
++        guard reference.device == device else { throw Rejected("frame_id belongs to another device") }
++        references.removeValue(forKey: id)
++        order.removeAll { $0 == id }
++        try Self.validate(reference, device: device, source: source, screenSize: screenSize)
++        return reference
++    }
++
++    /// Repeat on the input queue after USB orientation lookup, before the first HID report.
++    static func validate(_ reference: Reference, device: String, source: String, screenSize: CGSize?) throws {
++        guard reference.device == device, reference.source == source else {
++            throw Rejected("device or capture session changed; observe again")
++        }
++        guard let size = screenSize,
++            size.width == Double(reference.screenWidth), size.height == Double(reference.screenHeight)
++        else { throw Rejected("capture dimensions changed; observe again") }
++    }
++}
+diff --git a/Tests/iPhoneUseTests/API/ScreenshotReferencesTests.swift b/Tests/iPhoneUseTests/API/ScreenshotReferencesTests.swift
+new file mode 100644
+index 0000000..8aca529
+--- /dev/null
++++ b/Tests/iPhoneUseTests/API/ScreenshotReferencesTests.swift
+@@ -0,0 +1,227 @@
++import Foundation
++import XCTest
++
++@testable import iPhoneUse
++
++final class ScreenshotReferencesTests: XCTestCase {
++    private let screen = CGSize(width: 2556, height: 1180)
++
++    private func issue(
++        _ store: ScreenshotReferences, device: String = "phone-a", source: String = "capture-a",
++        imageSize: (Int, Int) = (1000, 462)
++    ) -> ScreenshotReferences.Reference {
++        store.issue(device: device, source: source, screenSize: screen, imageSize: imageSize)
++    }
++
++    private func consume(_ store: ScreenshotReferences, _ id: Any) throws -> ScreenshotReferences.Reference {
++        try store.consume(id, device: "phone-a", source: "capture-a", screenSize: screen)
++    }
++
++    func testNewObservationsKeepIndependentCoordinateReferences() throws {
++        let store = ScreenshotReferences()
++        let first = issue(store)
++        let second = issue(store, imageSize: (500, 231))
++        XCTAssertFalse(first.id.isEmpty)
++        XCTAssertNotEqual(first.id, second.id)
++        let a = try consume(store, first.id)
++        let b = try consume(store, second.id)
++        XCTAssertEqual(a.width, 1000)
++        XCTAssertEqual(a.height, 462)
++        XCTAssertEqual(b.width, 500)
++        XCTAssertEqual(b.height, 231)
++        XCTAssertEqual(a.screenWidth, 2556)
++        XCTAssertEqual(a.screenHeight, 1180)
++        XCTAssertEqual(a.source, "capture-a")
++        // A diagnostic baseline or another screenshot must not silently replace
++        // the coordinate space of a previously returned image.
++    }
++
++    func testUnknownAndMalformedIDsDoNotConsumeAValidReference() throws {
++        let store = ScreenshotReferences()
++        let reference = issue(store)
++        for invalid: Any in ["", "unknown", 7, true, NSNull(), ["id": reference.id]] {
++            XCTAssertThrowsError(try consume(store, invalid)) { error in
++                XCTAssertTrue(error is ScreenshotReferences.Rejected)
++            }
++        }
++        XCTAssertEqual(try consume(store, reference.id).id, reference.id)
++        XCTAssertThrowsError(try consume(store, reference.id), "A consumed token must never authorize replay")
++    }
++
++    func testAnotherDeviceCannotStealOrUseTheReference() throws {
++        let store = ScreenshotReferences()
++        let reference = issue(store)
++        XCTAssertThrowsError(
++            try store.consume(reference.id, device: "phone-b", source: "capture-a", screenSize: screen)
++        ) { error in XCTAssertTrue(error is ScreenshotReferences.Rejected) }
++        XCTAssertEqual(try consume(store, reference.id).device, "phone-a")
++    }
++
++    func testCaptureReplacementConsumesAndRejectsTheOldReference() {
++        let store = ScreenshotReferences()
++        let reference = issue(store)
++        XCTAssertThrowsError(
++            try store.consume(reference.id, device: "phone-a", source: "capture-b", screenSize: screen))
++        XCTAssertThrowsError(
++            try consume(store, reference.id),
++            "A selected-device failure requires a new observation even if the old source later returns")
++    }
++
++    func testMissingOrChangedGeometryRejectsTheReference() {
++        let store = ScreenshotReferences()
++        let changed: [CGSize?] = [
++            nil, CGSize(width: 1180, height: 2556), CGSize(width: 2555, height: 1180),
++            CGSize(width: 2556, height: 1179), CGSize(width: CGFloat.infinity, height: 1180),
++        ]
++        for size in changed {
++            let reference = issue(store)
++            XCTAssertThrowsError(
++                try store.consume(reference.id, device: "phone-a", source: "capture-a", screenSize: size))
++            XCTAssertThrowsError(try consume(store, reference.id))
++        }
++    }
++
++    func testValidationCanRunAgainAfterPreflightWithoutReusingTheStoreToken() throws {
++        let store = ScreenshotReferences()
++        let reference = try consume(store, issue(store).id)
++        XCTAssertNoThrow(
++            try ScreenshotReferences.validate(reference, device: "phone-a", source: "capture-a", screenSize: screen))
++        XCTAssertThrowsError(
++            try ScreenshotReferences.validate(reference, device: "phone-a", source: "replacement", screenSize: screen))
++        XCTAssertThrowsError(
++            try ScreenshotReferences.validate(reference, device: "phone-b", source: "capture-a", screenSize: screen))
++        XCTAssertThrowsError(
++            try ScreenshotReferences.validate(
++                reference, device: "phone-a", source: "capture-a", screenSize: CGSize(width: 1180, height: 2556)))
++        XCTAssertThrowsError(try consume(store, reference.id))
++    }
++
++    func testCapacityEvictsOldestUnconsumedReference() throws {
++        let store = ScreenshotReferences(capacity: 2)
++        let first = issue(store)
++        let second = issue(store)
++        let third = issue(store)
++        XCTAssertThrowsError(try consume(store, first.id))
++        XCTAssertEqual(try consume(store, second.id).id, second.id)
++        XCTAssertEqual(try consume(store, third.id).id, third.id)
++    }
++
++    func testConsumptionFreesCapacityWithoutEvictingAnotherLiveReference() throws {
++        let store = ScreenshotReferences(capacity: 2)
++        let first = issue(store)
++        let second = issue(store)
++        _ = try consume(store, first.id)
++        let third = issue(store)
++        XCTAssertEqual(try consume(store, second.id).id, second.id)
++        XCTAssertEqual(try consume(store, third.id).id, third.id)
++    }
++
++    func testNewResidentStoreDoesNotAcceptPreviousHostReferences() throws {
++        let oldHost = ScreenshotReferences()
++        let newHost = ScreenshotReferences()
++        let reference = issue(oldHost)
++        XCTAssertThrowsError(try consume(newHost, reference.id))
++        XCTAssertEqual(try consume(oldHost, reference.id).id, reference.id)
++    }
++
++    func testConcurrentConsumersCannotBothAuthorizeTheSameToken() {
++        let store = ScreenshotReferences()
++        let reference = issue(store)
++        let resultsLock = NSLock()
++        var successes = 0
++        var rejections = 0
++        var unexpectedErrors = 0
++        DispatchQueue.concurrentPerform(iterations: 24) { _ in
++            do {
++                _ = try store.consume(reference.id, device: "phone-a", source: "capture-a", screenSize: screen)
++                resultsLock.withLock { successes += 1 }
++            } catch is ScreenshotReferences.Rejected {
++                resultsLock.withLock { rejections += 1 }
++            } catch {
++                resultsLock.withLock { unexpectedErrors += 1 }
++            }
++        }
++        XCTAssertEqual(successes, 1)
++        XCTAssertEqual(rejections, 23)
++        XCTAssertEqual(unexpectedErrors, 0)
++    }
++
++    func testTokenDimensionsOverrideResizingAndReachTheActualCoordinateParser() throws {
++        let reference = issue(ScreenshotReferences())
++        let body = try reference.coordinateBody([
++            "x": 750, "y": 160, "width": 462, "height": 1000,
++            "maxEdge": Double.nan, "hold": 0.25, "frame_id": reference.id,
++        ])
++        XCTAssertEqual(body["width"] as? Int, 1000)
++        XCTAssertEqual(body["height"] as? Int, 462)
++        XCTAssertNil(body["maxEdge"], "Remove it before RequestCoordinates converts a malicious maxEdge to Int")
++        XCTAssertEqual(body["fraction"] as? Bool, false)
++        XCTAssertEqual(body["hold"] as? Double, 0.25)
++        let point = try RequestCoordinates.point(body, "x", "y", screenSize: screen, screenName: "phone")
++        XCTAssertEqual(point.0, 0.75, accuracy: 0.000_001)
++        XCTAssertEqual(point.1, 160.0 / 462.0, accuracy: 0.000_001)
++    }
++
++    func testPixelBoundsRejectInvalidValuesInsteadOfClamping() {
++        let reference = issue(ScreenshotReferences())
++        XCTAssertNoThrow(try reference.coordinateBody(["x": 0, "y": 0]))
++        XCTAssertNoThrow(try reference.coordinateBody(["x": 999.9, "y": 461.9]))
++        for invalid: Any in [-0.01, 1000, Double.nan, Double.infinity, -Double.infinity, true, "750", NSNull()] {
++            XCTAssertThrowsError(try reference.coordinateBody(["x": invalid, "y": 160]))
++        }
++        for invalid: Any in [-0.01, 462, Double.nan, Double.infinity, false, "160", NSNull()] {
++            XCTAssertThrowsError(try reference.coordinateBody(["x": 750, "y": invalid]))
++        }
++        XCTAssertThrowsError(try reference.coordinateBody(["x": 750]))
++        XCTAssertThrowsError(try reference.coordinateBody(["y": 160]))
++    }
++
++    func testFractionModeCannotBypassFramePixelValidation() {
++        let reference = issue(ScreenshotReferences())
++        XCTAssertNoThrow(try reference.coordinateBody(["x": 750, "y": 160, "fraction": false]))
++        for invalid: Any in [true, 1, 0, "false", NSNull()] {
++            XCTAssertThrowsError(try reference.coordinateBody(["x": 0.75, "y": 0.35, "fraction": invalid]))
++        }
++    }
++
++    func testEverySwipePointUsesTheReferencedImageDimensions() throws {
++        let reference = issue(ScreenshotReferences())
++        let body = try reference.coordinateBody([
++            "points": [["x": 100, "y": 46.2], ["x": 500, "y": 231], ["x": 750, "y": 369.6]],
++            "duration": 0.5, "width": 462, "height": 1000, "maxEdge": 200,
++        ])
++        let swipe = try SwipeRequest(body, screenSize: screen, screenName: "phone")
++        XCTAssertEqual(swipe.points.count, 3)
++        XCTAssertEqual(swipe.points[0].0, 0.1, accuracy: 0.000_001)
++        XCTAssertEqual(swipe.points[0].1, 0.1, accuracy: 0.000_001)
++        XCTAssertEqual(swipe.points[1].0, 0.5, accuracy: 0.000_001)
++        XCTAssertEqual(swipe.points[1].1, 0.5, accuracy: 0.000_001)
++        XCTAssertEqual(swipe.points[2].0, 0.75, accuracy: 0.000_001)
++        XCTAssertEqual(swipe.points[2].1, 0.8, accuracy: 0.000_001)
++        XCTAssertEqual(swipe.duration, 0.5)
++    }
++
++    func testMalformedOrLaterInvalidSwipePointsRejectTheWholePath() {
++        let reference = issue(ScreenshotReferences())
++        let malformed: [Any] = [[], [["x": 1, "y": 1]], NSNull(), "points", [1, 2]]
++        for points in malformed { XCTAssertThrowsError(try reference.coordinateBody(["points": points])) }
++        let badLater: [[String: Any]] = [
++            ["x": 1000, "y": 160], ["x": 750, "y": 462], ["x": Double.nan, "y": 160],
++            ["x": true, "y": 160], ["x": 750],
++        ]
++        for point in badLater {
++            XCTAssertThrowsError(try reference.coordinateBody(["points": [["x": 1, "y": 1], point]]))
++        }
++    }
++
++    func testValidSwipePointsCannotHideInvalidTopLevelTapCoordinates() {
++        let reference = issue(ScreenshotReferences())
++        for invalid: Any in [1200, true, Double.nan] {
++            XCTAssertThrowsError(
++                try reference.coordinateBody([
++                    "x": invalid, "y": 160, "points": [["x": 1, "y": 1], ["x": 2, "y": 2]],
++                ]),
++                "A /tap handler uses top-level x/y even when an unrelated points field is supplied")
++        }
++    }
++}
+diff --git a/Tests/iPhoneUseTests/MCP/MCPProtocolTests.swift b/Tests/iPhoneUseTests/MCP/MCPProtocolTests.swift
+index 20048f1..637a024 100644
+--- a/Tests/iPhoneUseTests/MCP/MCPProtocolTests.swift
++++ b/Tests/iPhoneUseTests/MCP/MCPProtocolTests.swift
+@@ -152,7 +152,7 @@ final class MCPProtocolTests: XCTestCase {
+         XCTAssertEqual(
+             Set(properties.keys),
+             [
+-                "points", "duration", "normalized", "device", "device_id", "include_image", "observe",
++                "points", "duration", "normalized", "frame_id", "device", "device_id", "include_image", "observe",
+                 "observation_timeout",
+             ])
+         let points = try XCTUnwrap(properties["points"])
+@@ -166,6 +166,7 @@ final class MCPProtocolTests: XCTestCase {
+         XCTAssertEqual(coordinates["y"]?["type"] as? String, "number")
+         XCTAssertEqual(properties["duration"]?["type"] as? String, "number")
+         XCTAssertEqual(properties["duration"]?["exclusiveMinimum"] as? Int, 0)
++        XCTAssertEqual(properties["frame_id"]?["type"] as? String, "string")
+     }
+ 
+     func testSwipePreservesPointOrderScalingDeviceAndExplicitDuration() throws {

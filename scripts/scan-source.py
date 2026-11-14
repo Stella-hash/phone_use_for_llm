@@ -31,7 +31,10 @@ with tempfile.TemporaryDirectory(prefix='source-scan-', dir=runtime) as tmp:
                 raise SystemExit('Unsafe source archive entry')
         zipped.extractall(source)
     report = directory / 'gitleaks.json'
-    leaks = subprocess.run([str(scanner), 'dir', str(source), '--no-banner', '--redact', '--report-format', 'json', '--report-path', str(report)], capture_output=True, text=True)
+    # Use only the reviewed tree's configuration, not unstaged working-copy rules.
+    config = source / '.gitleaks.toml'
+    config_args = ['--config', str(config)] if config.exists() else []
+    leaks = subprocess.run([str(scanner), 'dir', str(source), *config_args, '--no-banner', '--redact', '--report-format', 'json', '--report-path', str(report)], capture_output=True, text=True)
     findings = json.loads(report.read_text()) if report.exists() else []
     if leaks.returncode not in (0, 1):
         raise SystemExit('Gitleaks did not complete')

@@ -1,0 +1,151 @@
+diff --git a/Sources/iPhoneUse/MCP/MCPServer.swift b/Sources/iPhoneUse/MCP/MCPServer.swift
+index 4a39c49..0381aa3 100644
+--- a/Sources/iPhoneUse/MCP/MCPServer.swift
++++ b/Sources/iPhoneUse/MCP/MCPServer.swift
+@@ -112,6 +112,13 @@ enum MCPServer {
+     private static func call(_ name: String, _ arguments: [String: Any]) -> [String: Any] {
+         let table = StringsMCP(language: language)
+         do {
++            // The managed USB entry exposes exactly the advertised contract.
++            // Retained upstream handlers are not a second everyday input API.
++            if ProcessInfo.processInfo.environment["IPHONE_USE_BLUETOOTH_DISABLED"] == "1",
++                !["session_context", "list_devices", "screenshot", "screenshot_burst",
++                  "accessibility_tree", "ocr_screen", "act"].contains(name) {
++                throw MCPError("Unknown tool in USB mode; use the advertised tools and act for input")
++            }
+             if name == "session_context" { return try sessionContext(arguments) }
+             if name == "accessibility_tree" { return try accessibilityTree(arguments) }
+             if arguments["frame_id"] != nil, !["tap", "long_press", "swipe", "touch_sequence"].contains(name) {
+@@ -372,11 +379,7 @@ enum MCPServer {
+                         "reason": String(String(describing: error).prefix(1200)), "cleanup": "unknown",
+                         "note": "No OCR or screenshot substituted. Use those separately if needed.",
+                     ]
+-                    let data = try JSONSerialization.data(withJSONObject: unavailable, options: [.sortedKeys])
+-                    return recording.attach(to: [
+-                        "content": [["type": "text", "text": String(decoding: data, as: UTF8.self)]],
+-                        "structuredContent": unavailable, "isError": true,
+-                    ])
++                    return recording.attach(to: try accessibilityResult(unavailable))
+                 }
+                 let available = tree["status"] as? String == "ok"
+                 if available {
+@@ -384,15 +387,29 @@ enum MCPServer {
+                 } else {
+                     recording.fail(MCPError("Native accessibility unavailable"))
+                 }
+-                let data = try JSONSerialization.data(withJSONObject: tree, options: [.sortedKeys])
+-                return recording.attach(to: [
+-                    "content": [["type": "text", "text": String(decoding: data, as: UTF8.self)]],
+-                    "structuredContent": tree, "isError": !available,
+-                ])
++                return recording.attach(to: try accessibilityResult(tree))
+             }
+         }
+     }
+ 
++    /// Text-only clients receive the complete reading view once. Programmatic
++    /// consumers hydrate the same local archive from this small structured
++    /// envelope; node text is never duplicated in structuredContent.
++    static func accessibilityResult(_ tree: [String: Any]) throws -> [String: Any] {
++        var view = tree
++        if let archive = view.removeValue(forKey: "archive") as? [String: Any] {
++            view["archive_status"] = archive["status"] ?? "unknown"
++        }
++        view.removeValue(forKey: "selection")
++        var metadata: [String: Any] = ["payload_content_index": 0]
++        for key in ["source", "schema_version", "format", "status", "scope", "archive", "native_status", "selection"] {
++            metadata[key] = tree[key]
++        }
++        let data = try JSONSerialization.data(withJSONObject: view, options: [.sortedKeys, .withoutEscapingSlashes])
++        return ["content": [["type": "text", "text": String(decoding: data, as: UTF8.self)]],
++                "structuredContent": metadata, "isError": tree["status"] as? String != "ok"]
++    }
++
+     static func observationTimeout(_ raw: Any?) throws -> TimeInterval {
+         guard let raw else { return 1.5 }
+         guard let number = raw as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+diff --git a/Sources/iPhoneUse/MCP/MCPTools.swift b/Sources/iPhoneUse/MCP/MCPTools.swift
+index ca04c64..a67b212 100644
+--- a/Sources/iPhoneUse/MCP/MCPTools.swift
++++ b/Sources/iPhoneUse/MCP/MCPTools.swift
+@@ -35,8 +35,8 @@ enum MCPToolCatalog {
+             tool(
+                 "accessibility_tree",
+                 language == .zh
+-                    ? "按需读取指定 iPhone 的原生无障碍 JSON，不发送输入或遍历焦点。scope=app 读应用根，point 读选中点的进程子树；x/y 各为 0...1000，默认屏幕中心。节点保留原生坐标/可见性；center_normalized 仅提供位置线索，不是输入引用；触控须另取新截图的 frame.id 与像素坐标，不代表可点击或当前未被遮挡。游戏绘制、跨进程内容可能缺失；这不是完整/原子的当前屏幕，不会自动改用 OCR。"
+-                    : "Read native iPhone accessibility JSON on demand without input or focus traversal. scope=app reads the app root; point reads the selected process subtree. x/y each use 0...1000, default screen center. Nodes retain native frames/visibility; center_normalized is a location clue, not an input reference; touch requires a fresh screenshot frame.id and its pixels, not proof of clickability or lack of occlusion. Drawn game content and cross-process content may be absent. Coverage is incomplete/non-atomic; never silently substitutes OCR.",
++                    ? "按需读取指定 iPhone 的原生无障碍 JSON，不发送输入或遍历焦点。scope=app 读应用根，point 读选中点的进程子树；x/y 各为 0...1000，默认屏幕中心。文本返回紧凑阅读 JSON，结构化结果仅含状态/快照引用；nodes 行保留源 ID、父 ID 与原生字段。reader 可读取同一快照，追加 --node-id 源 ID 或 --offset next_offset 获取详情/后续页。触控仍须新截图的 frame.id 与像素坐标；原生可见性不代表可点击。游戏绘制、跨进程内容可能缺失；这不是完整/原子的当前屏幕，不会自动改用 OCR。"
++                    : "Read native iPhone accessibility JSON on demand without input or focus traversal. scope=app reads the app root; point reads the selected process subtree. x/y each use 0...1000, default screen center. Text returns compact reading JSON; structured content holds status/archive references. Node rows retain source IDs, parent IDs and native fields. Run reader.script with reader.args using Python; append --node-id a source ID or --offset next_offset for same-snapshot details/pages. Touch still requires a fresh screenshot frame.id and pixels; native visibility is not actionability. Drawn game content and cross-process content may be absent. Coverage is incomplete/non-atomic; never silently substitutes OCR.",
+                 [
+                     "scope": ["type": "string", "enum": ["app", "point"], "default": "app"],
+                     "x": ["type": "number", "minimum": 0, "maximum": 1000, "default": 500],
+@@ -60,8 +60,8 @@ enum MCPToolCatalog {
+             tool(
+                 "act",
+                 language == .zh
+-                    ? "顺序执行 tap（hold 可长按）、swipe、touch 多触点、type、key、home、delay 或 wait_text；失败立即停止，不重放。每批最多一个触控步骤且必须第一步，使用新截图的 frame_id 和像素；不支持归一化坐标或文字点按。触控须配置 USB，键盘沿已配置传输；Home 在配置 USB 键盘时使用 Cmd+H，否则使用 BLE consumer。最多16步；USB计划输入加延时/等待总预算30秒，执行窗口耗尽后不再启动后续步骤；不会取消已经执行中的步骤。检查返回观察，本地发送不代表应用完成。"
+-                    : "Execute ordered tap (hold for long press), swipe, touch multitouch, type, key, home, delay or wait_text steps; stop on failure, never replay. At most one touch step, first in the batch, using a fresh screenshot frame_id and its pixels; no normalized or text-targeted touch. Touch requires configured USB; keyboard uses its configured transport. Home uses Cmd+H with configured USB keyboard, otherwise BLE consumer input. At most 16 steps; USB planned input plus delay/wait budget is 30 seconds. The execution window stops admission of later steps, not an already-running step. Inspect observations; local send is not app completion.",
++                    ? "顺序执行 tap（hold 可长按）、swipe、touch 多触点、type、key、home、delay 或 wait_text；失败立即停止，不重放。每批最多一个触控步骤且必须第一步，使用新截图的 frame_id 和像素；不支持归一化坐标或文字点按。触控、键盘与 Home 均走已配置 USB；Home 使用 Cmd+H。最多16步；USB计划输入加延时/等待总预算30秒，执行窗口耗尽后不再启动后续步骤；不会取消已经执行中的步骤。检查返回观察，本地发送不代表应用完成。"
++                    : "Execute ordered tap (hold for long press), swipe, touch multitouch, type, key, home, delay or wait_text steps; stop on failure, never replay. At most one touch step, first in the batch, using a fresh screenshot frame_id and its pixels; no normalized or text-targeted touch. Touch, keyboard and Home use configured USB; Home uses Cmd+H. At most 16 steps; USB planned input plus delay/wait budget is 30 seconds. The execution window stops admission of later steps, not an already-running step. Inspect observations; local send is not app completion.",
+                 [
+                     "steps": actSteps(for: table),
+                     "device": device,
+diff --git a/Tests/PythonTests/test_mcp_stdio.py b/Tests/PythonTests/test_mcp_stdio.py
+index c2fd5df..c28284f 100644
+--- a/Tests/PythonTests/test_mcp_stdio.py
++++ b/Tests/PythonTests/test_mcp_stdio.py
+@@ -686,12 +686,52 @@ class MCPStdioTests(unittest.TestCase):
+         result, context = self.exchange([("accessibility_tree", {"scope": "point", "x": 250, "y": 750}),
+                                          ("session_context", {})])
+         self.assertFalse(result["isError"])
+-        self.assertEqual(result["structuredContent"]["nodes"], [{"label": "private-AX-value-741"}])
+-        self.assertFalse(result["structuredContent"]["coverage"]["complete"])
++        view = json.loads(result["content"][0]["text"])
++        self.assertEqual(view["nodes"], [{"label": "private-AX-value-741"}])
++        self.assertFalse(view["coverage"]["complete"])
++        self.assertEqual(result["structuredContent"]["payload_content_index"], 0)
++        self.assertNotIn("nodes", result["structuredContent"])
++        self.assertEqual(json.dumps(result).count("private-AX-value-741"), 1)
+         self.assertNotIn("private-AX-value-741", json.dumps(context))
+         self.assertEqual(context["structuredContent"]["recent"][-1]["state"], "finished")
+         self.assertEqual(self.server.events, [("GET", "/config?wake=0"), ("GET", "/status?wake=0")])
+ 
++    def test_usb_mode_rejects_hidden_input_aliases_before_device_access(self):
++        self.env["IPHONE_USE_BLUETOOTH_DISABLED"] = "1"
++        results = self.exchange([(name, {}) for name in
++                                ("tap", "long_press", "swipe", "touch_sequence", "type_text",
++                                 "press_key", "home", "keyboard_sequence", "tap_text", "future_tool")])
++        self.assertTrue(all(result["isError"] for result in results))
++        self.assertTrue(all("use the advertised tools and act" in json.dumps(result) for result in results))
++        self.assertEqual(self.server.events, [("GET", "/config?wake=0")])
++
++    def test_native_accessibility_reading_retains_archive_reference_without_payload_duplication(self):
++        self.env["IPHONE_USE_DEVICE_ID"] = "phone-1"
++        self.env["IPHONE_USE_USB_DEVICE_ID"] = "00000000-0000000000000000"
++        self.env["IPHONE_USE_USB_CLIPBOARD_PYTHON"] = sys.executable
++        helper = Path(self.state.name) / "reading-ax.py"
++        self.env["IPHONE_USE_AX_HELPER"] = str(helper)
++        for status in ("ok", "unavailable"):
++            payload = {"schema_version": 1, "source": "ios-native-ax", "format": "ios-ax-reading-v1",
++                       "status": status, "scope": "point", "nodes": [["n1", None, {"label": "only-once-741"}]],
++                       "selection": {"request_process_id": 17},
++                       "archive": {"status": "saved", "snapshot_id": "fixture", "raw_path": "/private/source.json"}}
++            if status == "unavailable":
++                payload["nodes"] = []
++                payload["reason"] = {"code": "timeout", "message": "only-once-741"}
++            helper.write_text("import json\nprint(" + repr(json.dumps(payload)) + ")\n")
++            result = self.exchange([("accessibility_tree", {})])[0]
++            view = json.loads(result["content"][0]["text"])
++            metadata = result["structuredContent"]
++            self.assertEqual(metadata["archive"], payload["archive"])
++            self.assertEqual(metadata["selection"], payload["selection"])
++            self.assertEqual(metadata["format"], "ios-ax-reading-v1")
++            self.assertEqual(view["archive_status"], "saved")
++            self.assertNotIn("archive", view)
++            self.assertNotIn("selection", view)
++            self.assertEqual(json.dumps(result).count("only-once-741"), 1)
++            self.assertEqual(result["isError"], status != "ok")
++
+     def test_act_posts_once_and_none_avoids_observation(self):
+         steps = [{"type": "home"}, {"type": "delay", "seconds": 0.01},
+                  {"type": "type", "text": "重庆", "use_clipboard": True},

@@ -1,0 +1,50 @@
+name: iOS source preview
+on:
+  push:
+    branches: [main]
+    paths: ['ios/**', '.github/workflows/ios.yml']
+  pull_request:
+    paths: ['ios/**', '.github/workflows/ios.yml']
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  ios-source:
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: '0.12.18'
+          enable-cache: false
+      - name: Install hash-locked USB dependencies
+        run: node ios/phone.mjs setup-usb
+      - name: Test launcher and USB helper contracts
+        run: |
+          node --test ios/phone.test.mjs
+          .runtime/iphone-use/usb-venv/bin/python -I -B -m unittest discover -s ios/accessibility -p 'test_*.py'
+          .runtime/iphone-use/usb-venv/bin/python -I -B -m unittest discover -s ios/coredevice -p 'test_*.py'
+      - name: Build pinned native recipe without a phone
+        run: node ios/phone.mjs build
+      - name: Test native driver
+        working-directory: .runtime/iphone-use/source
+        run: swift test
+      - name: Test all native acceptance overlays
+        run: node ios/check-native-input.mjs
+      - name: Test actual release MCP and HTTP protocol
+        working-directory: .runtime/iphone-use/source
+        run: |
+          IPHONE_USE_TEST_CONFIG=release python3 -B -m unittest discover -s Tests/PythonTests -p 'test_*.py'
+          python3 -B scripts/check-mcp.py -- build/iPhoneUse.app/Contents/MacOS/iphone-use mcp

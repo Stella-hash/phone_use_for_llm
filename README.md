@@ -27,6 +27,16 @@ without real accounts or irreplaceable data, and an isolated host/network. Here,
 This repository contains code and synthetic fixtures, with a fresh Git history;
 it does not import private device data, credentials or activity logs.
 
+## iPhone USB preview
+
+A separate [iPhone USB source preview](ios/README.md) is available under `ios/`
+for macOS. It uses seven native tools and one USB input route. The Android
+instructions and permission controls below apply to Android. The iOS host trusts
+the local Mac/client and does **not** implement Android owner tokens, app/domain
+scopes or signed input approvals; read its [security boundary](ios/SECURITY.md)
+and [dependency licenses](ios/THIRD_PARTY_NOTICES.md) first. Neither runtime is
+bundled or published to npm by this source addition.
+
 ## Find your way in
 
 - **Why give an LLM a phone?** Read [A small place to explore together](docs/WHY-A-PHONE.md)
