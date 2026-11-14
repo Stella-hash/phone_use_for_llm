@@ -89,6 +89,17 @@ this service are disabled.
 
 Optional summaries and explicitly invoked visual judging send additional data
 to an external model provider. A key alone never enables background summaries.
+
+Optional short delegation also requires separate owner enablement, model-egress
+consent and retained observation text. It sends goals and selected evidence;
+images require an additional opt-in. It never inherits permission from a summary
+key. Its in-process worker submits each phone action through the same public
+Executor and cannot sign approvals. Host start/update/stop receipts describe
+job lifecycle, not completed phone goals. Findings are bounded in-memory
+interpretations; only compact recovery metadata persists. Job evidence follows
+source retention and input digests remain subject to the disclosure above.
+See [delegation boundaries and retention](docs/SHORT-DELEGATION.md).
+
 Derived summary checkpoints have no seven-day age expiry: maintenance keeps the
 newest eight, and later summaries may carry older milestones forward. Turning
 summaries off stops generation but does not remove existing checkpoints. Review

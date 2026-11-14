@@ -15,9 +15,9 @@ frame, and recover a dropped response without repeating the touch.
 This is a self-hosted developer project, not a one-click companion app. You need
 a trusted computer, a USB-connected Android phone, and a client able to reach the
 computer's authenticated local MCP endpoint. It does not include a language
-model, a hosted connector, or an unattended controller.
+model, a hosted connector, or a continuously running autonomous controller.
 
-**0.11 is available as public GitHub source.** Check the
+**This branch prepares 0.12; main remains the reviewed release.** Check the
 [validation runs](https://github.com/Stella-hash/phone_use_for_llm/actions)
 attached to the exact commit you deploy. It defaults to one
 authenticated owner and per-input approval, with explicit opt-in grants for
@@ -68,6 +68,8 @@ permission for an agent to widen its own access.
 | Keep a moment | Optional named screenshot keepsakes in host storage, with a separate budget and owner export |
 | Inspect an animation | Optional 1–5 second silent clips, actual frame timestamps and copied clip/frame keepsakes |
 | Monitor | Power, battery temperature and framework thermal status without waking or reading UI |
+| Understand delay | Passive host latency profiles, with source events and separate failed samples; no calibration input or automatic compensation |
+| Delegate briefly | Optional finite local navigation/reading with a separately configured model; versioned goals, bounded evidence and explicit takeover |
 
 Reading cursors do not choose interests, scroll automatically, or nag about unseen
 pictures. Games still need an operator to choose moves and judge outcomes. The
@@ -419,14 +421,21 @@ The experimental visual judge is a library plus an explicitly invoked local
 or an automatic controller. Its selected images leave the host. Core tests mock
 model transport; no model quality or current endpoint availability is claimed.
 
+Optional [short delegation](docs/SHORT-DELEGATION.md) can answer a small question,
+return evidence, or pause for the main operator. It requires its own explicit
+model-egress configuration and reuses the same input permissions; a summary key
+alone never enables it. The [passive latency profile](docs/LATENCY-PROFILES.md)
+requires no extra model or key. Both features leave ordinary direct use available.
+
 ## Expert sandbox: broader owner authorization
 
 This optional interface is for people who trust the operators, use an empty
 disposable phone, understand the ADB/host/network boundary, and accept the risk.
 The recommended starting point remains the strict configuration above.
 
-The 32-tool catalog covers status, apps, native and Chrome observations, all the
-touch/gesture/text/key/orientation controls, and four activity/reading endpoints.
+The 36-tool catalog covers status, apps, native and Chrome observations,
+touch/gesture/text/key/orientation controls, activity/reading, host keepsakes and
+clips, passive latency and optional delegation lifecycle tools.
 The owner can grant exposed input tools except `android_press_key` for exact allowed packages through
 `expertSandbox.grants`, for example:
 

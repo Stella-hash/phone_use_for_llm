@@ -45,6 +45,15 @@
 - Optional service-side summaries and visual judging require explicit owner
   configuration/invocation before model egress. Read source text and deterministic
   overlap directly when that is sufficient.
+- Optional delegation requires its own owner egress/retention configuration;
+  start/update are host mutations, not input approvals. Treat findings as
+  source-bound model interpretations. Use versioned update/stop and wait for
+  `handoffReady` before direct UI work. A stale decision, uncertain receipt or
+  missing evidence is not permission to retry, change IDs, or widen grants.
+  Text evidence and visual interpretation remain distinct. No restart resumes
+  a worker. See [short delegation](docs/SHORT-DELEGATION.md).
+- Latency profiles are measured host work, not input acceptance or action
+  completion. They do not justify extra taps, longer gestures or hidden waits.
 
 This contract complements technical enforcement. It does not claim that a prompt
 can replace the security boundary described in [SAFETY.md](SAFETY.md).

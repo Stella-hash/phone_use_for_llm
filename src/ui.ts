@@ -111,11 +111,35 @@ const collectElements = (node: UiNode, out: ScreenElement[], groups = { next: 0,
 };
 
 export class UiInspector {
-
-	constructor(private adb: AdbClient, private maxDumpAttempts = 2, private dumpTimeoutMs = 8000) {
+	private captureInfo: Record<string, unknown> | undefined;
+	constructor(private adb: AdbClient, private maxDumpAttempts = 2, private dumpTimeoutMs = 8000,
+		private snapshotPackages: string[] = []) {
+	}
+	public getLastCaptureInfo() { return this.captureInfo; }
+	private helperXml(deviceId: string, expectedPackage: string): string {
+		const payload = Buffer.from(JSON.stringify({ expectedPackage }), "utf8").toString("base64");
+		const seconds = (Math.max(1, remainingTime() - 100) / 1000).toFixed(3);
+		const raw = this.adb.adb(deviceId, "exec-out", "timeout", "-s", "KILL", seconds,
+			"am", "instrument", "-w", "-r", "-e", "payload", payload,
+			"dev.gc.agentphone.helper/.UiSnapshotInstrumentation").toString();
+		if (Buffer.byteLength(raw) > 2 * 1024 * 1024) throw new ActionableError("UI helper result limit");
+		const matches = [...raw.matchAll(/phone_result_b64=([A-Za-z0-9+/=]+)/g)];
+		if (matches.length !== 1) throw new ActionableError("UI snapshot unavailable; build and install the public companion with UiSnapshotInstrumentation. No fallback tree.");
+		const result = JSON.parse(Buffer.from(matches[0][1], "base64").toString("utf8"));
+		if (result.ok !== true || result.packageName !== expectedPackage || typeof result.xml !== "string"
+			|| !Number.isInteger(result.windowId) || !Number.isInteger(result.nodes) || result.nodes < 1 || result.nodes > 2048
+			|| !Number.isFinite(result.elapsedMs) || result.elapsedMs < 0 || result.elapsedMs > 4000
+			|| this.adb.getFocusedPackage(deviceId) !== expectedPackage) throw new ActionableError("UI snapshot identity or bounds unavailable");
+		this.captureInfo = { backend: "helper_active_root", idleWaited: false, nodes: result.nodes, traversalMs: result.elapsedMs,
+			scope: "Active-window traversal; not an atomic or idle-screen guarantee" };
+		return result.xml;
 	}
 
 	private dumpXml(deviceId: string): string {
+		if (this.snapshotPackages.length) {
+			const pkg = this.adb.getFocusedPackage(deviceId);
+			if (this.snapshotPackages.includes(pkg)) return this.helperXml(deviceId, pkg);
+		}
 		for (let tries = 0; tries < this.maxDumpAttempts; tries++) {
 			// The device-side watchdog also kills an abandoned dump if the host ADB client exits.
 			const seconds = (Math.max(1, remainingTime() - 100) / 1000).toFixed(3);
@@ -125,6 +149,7 @@ export class UiInspector {
 			}
 			const xmlStart = dump.indexOf("<?xml");
 			if (xmlStart >= 0) {
+				this.captureInfo = { backend: "uiautomator", idleWaited: true };
 				return dump.substring(xmlStart);
 			}
 		}
@@ -134,7 +159,9 @@ export class UiInspector {
 	}
 
 	public getElements(deviceId: string): ScreenElement[] {
-		return withDeadline(this.dumpTimeoutMs, () => this.readElements(deviceId));
+		this.captureInfo = undefined;
+		try { return withDeadline(this.dumpTimeoutMs, () => this.readElements(deviceId)); }
+		catch (error) { this.captureInfo = undefined; throw error; }
 	}
 
 	private readElements(deviceId: string): ScreenElement[] {

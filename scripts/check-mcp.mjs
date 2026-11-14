@@ -10,7 +10,7 @@ if (process.argv.includes('--wait')) {
     try {
       const response = await fetch(new URL('/healthz', endpoint), { signal: AbortSignal.timeout(1000), headers:config.headers });
       const health = await response.json();
-      assert(response.ok && health.service === 'phone-use' && health.tools === 32);
+      assert(response.ok && health.service === 'phone-use' && health.tools === 36);
       break;
     } catch {
       if (Date.now() >= deadline) throw new Error('Phone MCP did not become ready within 20 seconds');
@@ -22,7 +22,7 @@ const client = new Client({ name: 'phone-readiness-check', version: '0.2.0' });
 try {
   await client.connect(new StreamableHTTPClientTransport(new URL(endpoint),{requestInit:{headers:config.headers}}));
   const { tools } = await client.listTools();
-  assert.equal(tools.length, 32);
+  assert.equal(tools.length, 36);
   assert.equal(tools.find(t => t.name === 'android_screenshot_keep').annotations.readOnlyHint, false);
   assert.equal(tools.find(t => t.name === 'android_screenshot_keepsakes').annotations.readOnlyHint, true);
   assert.equal(tools.find(t => t.name === 'android_clip_open').annotations.readOnlyHint, true);

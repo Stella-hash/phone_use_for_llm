@@ -52,7 +52,11 @@ try{
   for(let n=0;;n++){try{assert((await fetch(`http://127.0.0.1:${port}/healthz`,{headers})).ok);break;}catch{if(n>160||child.exitCode!==null)throw Error(stderr);await new Promise(r=>setTimeout(r,50));}}
   assert.equal((await fetch(`http://127.0.0.1:${port}/healthz`)).status,401);
   stage='MCP connect';await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`),{requestInit:{headers}}));
-  assert.equal((await client.listTools()).tools.length,32);
+  assert.equal((await client.listTools()).tools.length,36);
+  stage='optional capabilities default';
+  assert(!(await client.callTool({name:'android_latency_profile',arguments:{}})).isError);
+  const disabled=await client.callTool({name:'android_delegate_start',arguments:{requestId:'clean-delegation-disabled',app:'org.example.game',goal:'Synthetic read'}});
+  assert(disabled.isError);assert.match(JSON.stringify(disabled),/DELEGATION_DISABLED_OR_CONSENT_MISSING/);
   stage='signed action';const result=await client.callTool(JSON.parse(readPrivate(approvedFile,65536)));assert(!result.isError,JSON.stringify(result));
   assert(!result.content.some(c=>c.type==='image'));
   stage='receipt';const receipt=await client.callTool({name:'android_activity_open',arguments:{requestId:request.arguments.requestId,receiptOnly:true}});
@@ -66,8 +70,9 @@ try{
   stage='final health';
   const health=await(await fetch(`http://127.0.0.1:${port}/healthz`,{headers})).json();
   assert.equal(health.summary.state,'not_configured');
-  console.log(JSON.stringify({defaultStartVerified:true,missingConfigRejected:true,ownerSetupAndApprovalVerified:true,authenticatedTools:32,
-    syntheticDevice:true,modelSummaries:health.summary.state,privateConfigurationLoaded:false,receiptRecovered:true,boundRecoveryClientVerified:true,privateExportVerified:true}));
+  console.log(JSON.stringify({defaultStartVerified:true,missingConfigRejected:true,ownerSetupAndApprovalVerified:true,authenticatedTools:36,
+    syntheticDevice:true,modelSummaries:health.summary.state,delegationDefaultDisabled:true,passiveLatencyAvailable:true,
+    privateConfigurationLoaded:false,receiptRecovered:true,boundRecoveryClientVerified:true,privateExportVerified:true}));
 }catch(error){
   throw new Error('Clean verification failed at '+stage,{cause:error});
 }finally{

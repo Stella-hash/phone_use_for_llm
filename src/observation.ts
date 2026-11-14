@@ -49,11 +49,13 @@ export function observePhone(adb: AdbClient, ui: UiInspector, device: string, ev
       observation.foregroundApp = timed("foregroundMs", () => adb.getCurrentApp(device));
       if (suppliedElements === null) throw new Error();
       elements = timed("uiMs", () => suppliedElements || ui.getElements(device));
+      observation.uiCapture = suppliedElements ? { backend: "supplied", source: "same-call upstream UI" }
+        : ui.getLastCaptureInfo?.() ?? { backend: "unreported" };
       guard();
       observation.passwordInputVisible = elements.some(e => e.password);
       observation.elements = !privateText && retainText ? elements.filter(e => !e.editable)
         : "[observation text retention disabled]";
-    } catch { elements = undefined; observation.errors.push("UI text unavailable; no image permitted"); }
+    } catch { elements = undefined; observation.uiCapture = { backend: "unreported" }; observation.errors.push("UI text unavailable; no image permitted"); }
     if (screenshot && !privateText && elements && !observation.passwordInputVisible) {
       try {
         guard();
