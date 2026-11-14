@@ -1,13 +1,59 @@
 # iOS USB source preview validation
 
 Codex-E · `Stella-hash/phone_use_for_llm` · 2026-11-14.
-Status: HOLD / draft after review of `7aff1e1`; repairs await independent review of the new PR head. No binary/package release.
+Status: HOLD / draft after review of `f5a4629`; timing repairs await independent review of the new PR head. No binary/package release.
 Initial review base: `41651b77369033958d551a73d43f571fcd92cfb8`; updated by a
 normal merge from `main@169cbb79ee4fdef54852c766f9179f4927b9e53c` after Android
 PR #13 landed. The iOS source recipe is unchanged by that merge.
 Native input: `YueChen-C/iPhone-use@577d5f2d0ec5831ed6e3e5d9c3ae482ee1dc4f5c`
-plus ordered patches 0001–0044. The PR head identifies the integration revision.
+plus ordered patches 0001–0045. The PR head identifies the integration revision.
 This page adds iOS evidence; it does not supersede the Android validation records.
+
+## Timing and identity follow-up after f5a4629
+
+Patch 0045 keeps managed USB screenshots and input under the same per-device
+recursive lock, including complete batches and text preflight screenshots. A
+timed-out HTTP response does not cancel the server helper: its lock remains held
+through helper exit and cleanup. Screenshot, touch, keyboard and clipboard child
+termination paths wait for actual process exit before returning ownership.
+`wait_text` uses an absolute monotonic deadline and checks it after capture and
+after OCR matching, before admitting subsequent input. Late matches stop the
+batch; this does not promise to cancel an in-flight capture at that deadline.
+
+The regression fixture uses the actual concurrent HTTP listener and MCP HTTP
+client: the client expires while a synthetic capture remains active, then a Home
+POST must wait until capture cleanup returns. It covers baseline, post-action,
+burst and capture-error cases, plus the reverse input-to-screenshot order and
+recursive batch/text preflight. The old tree fails these ordering assertions;
+the repair passes. Separate injected-clock tests cover matching frames at/after
+the deadline, timely success, expiration during OCR, delayed polling and zero timeout.
+
+Managed MCP uses `configured-usb-phone` or an omitted selector. Physical identity
+checks, host requests and private storage retain the exact UDID. Generated model
+metadata uses the alias, and wrong-device screenshot/OCR replies are rejected
+before presentation. Screenshot pixels, OCR/AX content and checkpoints are not
+redacted. Exactly one physical iPhone must remain attached. The public AX suite
+has 63 cases; the private retained-fixture case is not part of this export.
+
+The assembled native tree is `a8b477069b4a616ea6289afa204f62128900e409`.
+Local verification passed 150 Swift overlay tests in 20 suites and the seven-tool
+handshake. Of 122 release protocol cases, 121 passed in the full run; the final
+case expected an obsolete Chinese introduction and passed after its assertion was
+updated to the current single-USB-phone wording. Production code did not change
+for that correction. Full native XCTest remains a separate hosted check.
+
+A fresh matching client tested the rebuilt host with the dedicated phone. An
+actual cold USB screenshot was abandoned by its HTTP client while the helper was
+active; the subsequent Home completed and the phone was visibly at Home. Process
+samples recorded the screenshot child ending before the keyboard child appeared
+(no overlap observed; sampling is not a general proof). A 1 ms `wait_text` deadline
+expired during a roughly 1.6-second capture and did not start its following Home.
+The deterministic offline fixture, separately, establishes rejection of a late
+*matching* frame. Context, device-list and screenshot metadata contained no raw
+configured UDID. No AX tree was fetched. Phone evidence remains private.
+
+The final PR head and its hosted runs identify acceptance for this follow-up;
+the evidence below remains the earlier phase's history.
 
 ## Remediation after the 7aff1e1 review
 
@@ -27,12 +73,14 @@ The direct ungated touch helper path is removed. Python runs isolated with the
 complete hash locks; launcher/native UDID formats agree. Dynamic HTTP responses
 carry `Cache-Control: no-store`.
 
-Local acceptance: 23 launcher tests, 64 offline AX tests, 44 USB helper tests,
+Local acceptance: 23 launcher tests, 63 offline AX tests in the public export, 44 USB helper tests,
 and 142 isolated Swift tests in 18 suites passed. All seven physical-target tests
 passed, including capture A / USB B, wrong device, legacy AV token, changed USB
 attachment during capture/preflight, and a full 128-reference cache. Swift tests
 also cover clipboard uncertainty, same-call OCR and native Home commit/receipts.
 The final guide/skill edits do not change those tested production files.
+The earlier count of 64 included one private retained-device-fixture test that
+is excluded from this export; the 63 shared test methods are byte-identical.
 
 A dedicated USB iPhone on iOS 26.5 supplied real screenshots from the physical
 service (observed standalone calls approximately 0.75–1.47 seconds). A frame-bound
@@ -46,8 +94,10 @@ are exported. No native AX tree was fetched during this remediation.
 Some 3-second post-input observations timed out while returning a useful current
 image; that does not mean input failed or that the app completed. Action images
 contained no touch token. System paste permission remains an OS interaction and
-is not bypassed. Multi-iPhone operation, other iOS/device combinations and universal
-system-gesture behavior are not established by these observations.
+is not bypassed. Supported operation requires exactly one physical iPhone attached
+by USB throughout setup and use; multi-device selection is not supported. Other
+iOS/device combinations and universal system-gesture behavior are not established
+by these observations.
 
 Hosted CI now also invokes the complete isolated Swift overlay, runs only PR
 checks for task branches, and cancels obsolete runs. Full XCTest and release
@@ -77,7 +127,8 @@ no native executable, Python environment or combined runtime. See the separate
 Android authorization and owner-signing claims do not cover this host.
 
 The current managed configuration has one identity, `usbDeviceId`: a physical
-USB UDID shared by screenshots, AX and input. An old `captureId` is accepted only
+USB UDID shared by screenshots, AX and input. Exactly one physical iPhone must be
+attached by USB; this is not a selector among multiple attached devices. An old `captureId` is accepted only
 when it exactly equals that UDID; a different AV capture ID is rejected with
 migration instructions. Setup discovery enumerates physical USB devices and
 rechecks the sole matching IOKit pin. It does not discover AV capture IDs, infer

@@ -6,6 +6,9 @@ Home, clipboard, screenshots and native accessibility use the configured physica
 USB device. The desktop preview is observation only. This is a source preview; it is not
 Apple's iPhone Mirroring or an Android-to-iPhone adapter.
 
+Supported operation requires exactly one physical iPhone attached to the Mac by
+USB, during setup and throughout use. Multi-device selection is not supported.
+
 The iOS host trusts the local Mac and MCP client. Android's owner tokens,
 app/domain restrictions and signed input approvals do not apply to this host.
 Read [the iOS security boundary](SECURITY.md) before connecting a client. Use a
@@ -35,7 +38,7 @@ applies the ordered patches and builds an ad-hoc-signed app locally. Stop an
 existing managed host before rebuilding; unexpected dependency edits are
 preserved rather than reset.
 
-Connect only the intended phone, unlock it and establish USB trust manually.
+Connect only the intended physical iPhone, unlock it and establish USB trust manually.
 `discover` needs a current build but no local config, and refuses a running host.
 It enumerates physical USB UDIDs and prints a `config_candidate` only for a sole
 phone with a matching, rechecked IOKit pin. It never writes configuration or
@@ -91,6 +94,12 @@ the native executable; an already running client keeps its loaded code. Do not
 register the dependency checkout's raw binary or upstream installer as another
 entry point. The assembled skill and recovery script use the managed launcher.
 
+In MCP calls, omit `device` or use `device:"configured-usb-phone"`. The alias
+refers only to the configured phone. The exact raw UDID stays in internal host
+configuration and private local files, including setup discovery output; it is
+not the model-facing selector. This limits device-selection metadata only:
+screenshots and OCR content are not redacted and can contain private screen data.
+
 The catalog is also the callable MCP allowlist in every native mode. The old
 `tap`, `long_press`, `swipe`, `touch_sequence`, `type_text`, `press_key`, `home`,
 `keyboard_sequence` and `tap_text` tools and their compatibility executor have
@@ -104,7 +113,7 @@ Read `session_context` on resume, then inspect a fresh `screenshot`.
 | Tool | Purpose |
 | --- | --- |
 | `session_context` | Historical receipts, checkpoint and loaded native identity |
-| `list_devices` | USB inventory; screenshots and input stay bound to the configured phone |
+| `list_devices` | The configured USB phone through its alias; no multi-device selection |
 | `screenshot` | Current pixels and one-use touch frame |
 | `screenshot_burst` | Two to six animation samples; no input |
 | `accessibility_tree` | Bounded native text and control evidence |
@@ -147,12 +156,21 @@ input from the following observation. A fresh or changed image does not prove
 application completion. A later batch failure preserves the executed prefix;
 observe before deciding how to proceed and never replay an uncertain batch.
 
-The optional pre-input baseline has a separate two-second capture budget; a
-missing baseline does not block input. Post-input observation defaults to three
-seconds and can end when the image changes and stabilizes. `observe:"ocr_diff"`
+The optional pre-input baseline has a two-second MCP response-wait budget. A
+client timeout does not cancel an active host screenshot; the host waits for the
+screenshot helper to exit before admitting input and serializes each input batch.
+An unavailable baseline does not by itself block input. Post-input observation
+defaults to three seconds and can end when the image changes and stabilizes.
+An in-flight capture can extend elapsed time beyond these response-wait budgets.
+`observe:"ocr_diff"`
 compares OCR from this call's baseline with its returned observation, not earlier
 client history; missing baseline or current OCR is explicit. These observations
 do not establish semantic task completion or justify replaying input.
+
+Each `wait_text` step uses an absolute deadline measured by a monotonic clock.
+After capture and OCR, the host checks that deadline before accepting a match.
+A late match is a timeout and stops following steps. The deadline does not cancel
+an in-flight capture or establish a hard overall elapsed-time bound for a batch.
 
 The `home` step sends the native USB Home button through the same physical target
 and host commit guard. The earlier Command-H shortcut failed in a measured

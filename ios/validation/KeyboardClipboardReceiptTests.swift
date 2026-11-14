@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import Testing
 @testable import iPhoneUse
@@ -163,16 +164,23 @@ print(json.dumps({'schema_version':1, 'backend':'coredevice-keyboard',
 
     @Test func clipboardTimeoutIsUnconfirmedEvenWithUncommittedHID() throws {
         let harness = try Harness()
-        let environment = try harness.clipboardEnvironment("printf 'called' > \"$CLIPBOARD_TEST_MARKER\"\nexec /bin/sleep 5\n")
+        // Ignore TERM across exec so the real Swift wrapper must use its KILL
+        // path; exec keeps one PID and leaves no descendant sleep process.
+        let environment = try harness.clipboardEnvironment(
+            "trap '' TERM\nprintf '%s' \"$$\" > \"$CLIPBOARD_TEST_MARKER\"\nexec /bin/sleep 5\n")
         var failure: DeviceClipboard.WriteFailure?
         let receipt = try harness.perform(clipboard: {
-            do { try DeviceClipboard.write("synthetic", environment: environment, timeout: 0.2) }
+            do { try DeviceClipboard.write("synthetic", environment: environment, timeout: 0.5) }
             catch {
                 failure = error as? DeviceClipboard.WriteFailure
                 throw error
             }
         })
         #expect(failure?.status == .unconfirmed)
+        let pidText = try String(contentsOfFile: environment["CLIPBOARD_TEST_MARKER"]!, encoding: .utf8)
+        let pid = try #require(Int32(pidText))
+        let probe = kill(pid, 0), probeError = errno
+        #expect(probe == -1 && probeError == ESRCH)
         #expect(try harness.observedPhases() == ["ready"])
         try expectPartialClipboardEffect(receipt, clipboard: "unconfirmed", directory: harness.directory)
     }

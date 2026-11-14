@@ -1,7 +1,8 @@
 # iOS host trust boundary
 
-The iOS preview is for a dedicated USB-connected phone controlled from a trusted
-Mac and trusted local MCP client. It is a separate implementation from the
+The iOS preview requires exactly one physical iPhone attached by USB during setup
+and operation, controlled from a trusted Mac and trusted local MCP client.
+Multi-device selection is not supported. It is a separate implementation from the
 Android service. Android bearer tokens, app/domain scopes, owner signing keys
 and per-input approvals are not implemented by the native iOS host.
 
@@ -11,6 +12,11 @@ no independent AV capture selector or inferred capture-to-input mapping. It expo
 seven MCP tools; removed legacy input names are rejected before device access in
 all native modes. It does not pair a new device, choose another phone on failure, silently fall back to
 another input transport, or replay uncertain input.
+
+MCP device selection uses `configured-usb-phone` or an omitted selector. The raw
+UDID remains internal host/configuration data and belongs only in private local
+files and discovery output. The alias limits selection metadata; it does not
+redact screenshot pixels or OCR content, including identifiers visible on screen.
 
 The native HTTP listener is an internal loopback service on 127.0.0.1:7390 for
 MCP and the local read-only viewer. HTTP request admission checks loopback Host,

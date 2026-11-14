@@ -30,7 +30,9 @@ it does not import private device data, credentials or activity logs.
 ## iPhone USB preview
 
 A separate [iPhone USB source preview](ios/README.md) is available under `ios/`
-for macOS. It uses seven native tools and one USB input route. The Android
+for macOS, with exactly one physical iPhone attached by USB throughout setup and
+operation; multi-device selection is not supported. It uses seven native tools
+and one USB input route. The Android
 instructions and permission controls below apply to Android. The iOS host trusts
 the local Mac/client and does **not** implement Android owner tokens, app/domain
 scopes or signed input approvals; read its [security boundary](ios/SECURITY.md)

@@ -1,0 +1,1075 @@
+diff --git a/Sources/iPhoneUse/API/ControlAPI.swift b/Sources/iPhoneUse/API/ControlAPI.swift
+index df06d50..744d448 100644
+--- a/Sources/iPhoneUse/API/ControlAPI.swift
++++ b/Sources/iPhoneUse/API/ControlAPI.swift
+@@ -824,16 +824,18 @@ struct ActRequest {
+                 } else if type == "wait_text" {
+                     let match = try TextTapRequest(step)
+                     let timeout = (step["timeout"] as? NSNumber)?.doubleValue ?? 6
+-                    let start = now()
+-                    var elapsed = 0.0
++                    let waitDeadline = now() + timeout
+                     while true {
++                        guard now() < waitDeadline else { throw DeviceError("wait_text timed out") }
+                         let (id, data) = try capture(device, OCRRequest.maxEdge(step))
+-                        if (try? match.match(ScreenOCR.recognize(data, device: id))) != nil { break }
+-                        elapsed = max(elapsed, now() - start)
+-                        guard elapsed < timeout else { throw DeviceError("wait_text timed out") }
+-                        let delay = min(0.1, timeout - elapsed)
+-                        sleep(delay)
+-                        elapsed += delay
++                        // Capture and OCR can return late; a matching frame
++                        // does not extend this wait's admission window.
++                        guard now() < waitDeadline else { throw DeviceError("wait_text timed out") }
++                        let found = (try? match.match(ScreenOCR.recognize(data, device: id))) != nil
++                        let remaining = waitDeadline - now()
++                        guard remaining > 0 else { throw DeviceError("wait_text timed out") }
++                        if found { break }
++                        sleep(min(0.1, remaining))
+                     }
+                 } else {
+                     let response = try execute("/" + type, step, device)
+diff --git a/Sources/iPhoneUse/API/USBControlAPI.swift b/Sources/iPhoneUse/API/USBControlAPI.swift
+index a73d85b..6e67417 100644
+--- a/Sources/iPhoneUse/API/USBControlAPI.swift
++++ b/Sources/iPhoneUse/API/USBControlAPI.swift
+@@ -47,6 +47,10 @@ enum USBControlAPI {
+             }
+             let revalidate = { try binding.revalidate(environment: d.environment, pin: d.pin) }
+             func capture(_ maxWidth: Int?, _ maxEdge: Int?, png: Bool = true) throws -> USBScreenCapture.Image {
++                // Client cancellation cannot cancel this synchronous helper.
++                // Keep the same device lock as input until it has fully exited.
++                let lock = DeviceCommandLocks.acquire(binding.deviceID)
++                defer { lock.unlock() }
+                 try revalidate()
+                 let data = try d.capture(d.environment)
+                 try revalidate()
+@@ -91,6 +95,9 @@ enum USBControlAPI {
+                 let image = try capture(nil, OCRRequest.maxEdge(options))
+                 return .json(ScreenOCR.recognize(image.data, device: binding.deviceID).json(device: binding.deviceID))
+             case ("POST", "/act"):
++                let lock = DeviceCommandLocks.acquire(binding.deviceID)
++                defer { lock.unlock() }
++                try revalidate()
+                 return try ActRequest(request.body, directKeyboardConfigured: true, requireFrameTouch: true).perform(
+                     device: binding.deviceID, capture: captureText, execute: { path, body, _ in
+                         handle(HTTPRequest(method: "POST", path: path, query: [:], body: body), dependencies: d)
+diff --git a/Sources/iPhoneUse/Capture/USBScreenCapture.swift b/Sources/iPhoneUse/Capture/USBScreenCapture.swift
+index 5d5e24a..b7cd051 100644
+--- a/Sources/iPhoneUse/Capture/USBScreenCapture.swift
++++ b/Sources/iPhoneUse/Capture/USBScreenCapture.swift
+@@ -77,8 +77,10 @@ enum USBScreenCapture {
+             if process.isRunning { process.terminate() }
+             if finished.wait(timeout: .now() + 2) == .timedOut, process.isRunning {
+                 kill(process.processIdentifier, SIGKILL)
+-                _ = finished.wait(timeout: .now() + 1)
+             }
++            // Do not release the caller's lifecycle lock while an owned child
++            // can still hold a USB session, including after forced termination.
++            process.waitUntilExit()
+             throw DeviceError("Physical USB screenshot timed out; no fallback was used")
+         }
+         guard process.terminationReason == .exit, process.terminationStatus == 0 else {
+diff --git a/Sources/iPhoneUse/Input/CoreDeviceKeyboard.swift b/Sources/iPhoneUse/Input/CoreDeviceKeyboard.swift
+index ed21a0a..3099042 100644
+--- a/Sources/iPhoneUse/Input/CoreDeviceKeyboard.swift
++++ b/Sources/iPhoneUse/Input/CoreDeviceKeyboard.swift
+@@ -145,8 +145,10 @@ enum CoreDeviceKeyboard {
+                 process.terminate()
+                 if finished.wait(timeout: .now() + 7) == .timedOut, process.isRunning {
+                     kill(process.processIdentifier, SIGKILL)
+-                    _ = finished.wait(timeout: .now() + 1)
+                 }
++                // A kill request is not cleanup completion. Keep the caller's
++                // device lock until this owned helper has actually exited.
++                process.waitUntilExit()
+             }
+         }
+         func failure(_ reason: String) -> [String: Any] {
+diff --git a/Sources/iPhoneUse/Input/CoreDeviceTouch.swift b/Sources/iPhoneUse/Input/CoreDeviceTouch.swift
+index 1992c92..10cddcc 100644
+--- a/Sources/iPhoneUse/Input/CoreDeviceTouch.swift
++++ b/Sources/iPhoneUse/Input/CoreDeviceTouch.swift
+@@ -1,15 +1,16 @@
+ import Darwin
+ import Foundation
+ 
+-/// Serialize HTTP input for one phone across transports. Observation remains
+-/// independent so the helper can be checked against the resident capture.
++/// Serialize the host's owned device operations through helper cleanup, even
++/// when an HTTP client stops waiting. Recursive acquisition lets a managed batch
++/// or text preflight take a screenshot without dropping its device ownership.
+ enum DeviceCommandLocks {
+     private static let lock = NSLock()
+-    private static var devices: [String: NSLock] = [:]
+-    static func acquire(_ device: String) -> NSLock {
+-        let selected = lock.withLock { () -> NSLock in
++    private static var devices: [String: NSRecursiveLock] = [:]
++    static func acquire(_ device: String) -> NSRecursiveLock {
++        let selected = lock.withLock { () -> NSRecursiveLock in
+             if let existing = devices[device] { return existing }
+-            let created = NSLock(); devices[device] = created; return created
++            let created = NSRecursiveLock(); devices[device] = created; return created
+         }
+         selected.lock()
+         return selected
+@@ -138,8 +139,10 @@ enum CoreDeviceTouch {
+                 process.terminate()
+                 if finished.wait(timeout: .now() + 7) == .timedOut, process.isRunning {
+                     kill(process.processIdentifier, SIGKILL)
+-                    _ = finished.wait(timeout: .now() + 1)
+                 }
++                // A kill request is not cleanup completion. Keep the caller's
++                // device lock until this owned helper has actually exited.
++                process.waitUntilExit()
+             }
+         }
+         func failure(_ reason: String) -> [String: Any] {
+diff --git a/Sources/iPhoneUse/Input/DeviceClipboard.swift b/Sources/iPhoneUse/Input/DeviceClipboard.swift
+index d37e3ff..8f256ab 100644
+--- a/Sources/iPhoneUse/Input/DeviceClipboard.swift
++++ b/Sources/iPhoneUse/Input/DeviceClipboard.swift
+@@ -122,8 +122,10 @@ enum DeviceClipboard {
+             if process.isRunning { process.terminate() }
+             if finished.wait(timeout: .now() + 1) == .timedOut {
+                 if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+-                _ = finished.wait(timeout: .now() + 1)
+             }
++            // The input wrapper still owns the device lock. Do not let a
++            // later screenshot start until this clipboard child has exited.
++            process.waitUntilExit()
+             throw DeviceError("USB clipboard timed out; delivery is uncertain. No paste or clear keys were sent")
+         }
+         guard process.terminationReason == .exit, process.terminationStatus == 0 else {
+diff --git a/Sources/iPhoneUse/Localization/StringsMCP.swift b/Sources/iPhoneUse/Localization/StringsMCP.swift
+index c49af80..3a3b278 100644
+--- a/Sources/iPhoneUse/Localization/StringsMCP.swift
++++ b/Sources/iPhoneUse/Localization/StringsMCP.swift
+@@ -38,9 +38,9 @@ struct StringsMCP: LocalizedTable {
+ 
+     static let zh = StringsMCP(
+         instructions:
+-            "控制真实 iPhone。先读取 session_context，再观察当前界面：accessibility_tree 提供原生控件/文字证据；触控须取新 screenshot 的 frame.id 与像素坐标。只有 screenshot 提供触控引用；act 返回的观察和 screenshot_burst 不提供引用，下次触控前须重新调用 screenshot。用 act 执行输入；每批最多一个 tap、swipe 或 touch，且必须第一步，后续可输入文字/按键或等待。长按用 tap.hold，多触点用 touch.samples。触控只走已配置 USB；缺失 frame 或后端时明确拒绝，不切换 BLE、不重放。无障碍坐标不是触控引用，也不保证可点击；操作后检查返回观察，应用结果须另行核实。截图长边最多1000像素。连接多台时先用 list_devices 并传 device。操作和观察按手机串行，其他会话仍可能在调用之间改变屏幕。",
+-        deviceParam: "目标 iPhone（list_devices 返回的 id 或名称）。device_id 是 device 的别名；同时提供时优先 device。连接多台时才需要传入。",
+-        toolListDevices: "列出当前连接的 iPhone。",
++            "控制已配置的 USB iPhone。先读取 session_context，再观察当前界面：accessibility_tree 提供原生控件/文字证据；触控须取新 screenshot 的 frame.id 与像素坐标。只有 screenshot 提供触控引用；act 返回的观察和 screenshot_burst 不提供引用，下次触控前须重新调用 screenshot。用 act 执行输入；每批最多一个 tap、swipe 或 touch，且必须第一步，后续可输入文字/按键或等待。长按用 tap.hold，多触点用 touch.samples。触控只走已配置 USB；缺失 frame 或后端时明确拒绝，不切换 BLE、不重放。无障碍坐标不是触控引用，也不保证可点击；操作后检查返回观察，应用结果须另行核实。截图长边最多1000像素。须恰好连接已配置的那一台 USB 手机；device 可省略或使用 configured-usb-phone，不提供多设备选择。MCP 调用按手机串行；客户端超时不会取消仍在运行的宿主任务。其他会话仍可能在调用之间改变屏幕。",
++        deviceParam: "省略此项或使用 configured-usb-phone。device_id 同义；若同时提供，两者均须为该别名。只控制已配置且唯一连接的 USB iPhone，不提供多设备选择。",
++        toolListDevices: "返回唯一已配置 USB iPhone 的稳定别名；须恰好连接该一台手机。",
+         toolScreenshot: "截取 iPhone 当前屏幕，返回供下一次触控使用的单次 frame.id，附带 OCR 文字中心点（左上角原点像素坐标）。include_image=false 时仅返回文字。OCR 可能遗漏或误识别。",
+         toolOCRScreen: "识别屏幕文字，仅返回文字与左上角原点像素坐标，不含图片。maxEdge 默认为 1000。",
+         includeImage: "是否返回图片（默认 true；false 仅返回文字与 OCR）",
+@@ -64,10 +64,10 @@ struct StringsMCP: LocalizedTable {
+ 
+     static let en = StringsMCP(
+         instructions:
+-            "Controls real iPhones. Read session_context, then observe: accessibility_tree provides native control/text evidence; touch requires a fresh screenshot frame.id and its pixels. Only screenshot supplies a touch reference; act observations and screenshot_burst do not, so call screenshot again before the next touch. Use act for input. At most one tap, swipe or touch, first in each batch; subsequent steps may type, press keys or wait. Long press uses tap.hold; multitouch uses touch.samples. Touch requires configured USB and a frame; missing requirements fail explicitly without BLE fallback or replay. Accessibility coordinates are not touch references or proof of hittability. Inspect returned observations and verify app results separately. Screenshots have a maximum long edge of 1000 pixels. With several phones, use list_devices and pass device. Actions and observations are serialized per phone, but other sessions can change the screen between calls.",
++            "Controls the configured USB iPhone. Read session_context, then observe: accessibility_tree provides native control/text evidence; touch requires a fresh screenshot frame.id and its pixels. Only screenshot supplies a touch reference; act observations and screenshot_burst do not, so call screenshot again before the next touch. Use act for input. At most one tap, swipe or touch, first in each batch; subsequent steps may type, press keys or wait. Long press uses tap.hold; multitouch uses touch.samples. Touch requires configured USB and a frame; missing requirements fail explicitly without BLE fallback or replay. Accessibility coordinates are not touch references or proof of hittability. Inspect returned observations and verify app results separately. Screenshots have a maximum long edge of 1000 pixels. Exactly the configured USB phone must be attached; omit device or use configured-usb-phone. No multi-device selection is offered. MCP calls are serialized per phone; a client timeout does not cancel ongoing host work. Other sessions can change the screen between calls.",
+         deviceParam:
+-            "Which iPhone (id or name from list_devices). device_id aliases device; device takes precedence. Only needed when several are connected.",
+-        toolListDevices: "List the connected iPhones.",
++            "Omit or use configured-usb-phone. device_id is synonymous; when both are supplied, both must use that alias. Controls the single configured attached USB iPhone; no multi-device selection.",
++        toolListDevices: "Return the stable alias of the configured USB iPhone; exactly that one phone must be attached.",
+         toolScreenshot:
+             "Capture the screen and return a one-use frame.id for the next touch, with OCR text centers in top-left pixel coordinates. Set include_image=false for text only. OCR may miss or misread text.",
+         toolOCRScreen:
+diff --git a/Sources/iPhoneUse/MCP/MCPServer.swift b/Sources/iPhoneUse/MCP/MCPServer.swift
+index 571e175..2856c43 100644
+--- a/Sources/iPhoneUse/MCP/MCPServer.swift
++++ b/Sources/iPhoneUse/MCP/MCPServer.swift
+@@ -5,6 +5,7 @@ import Foundation
+ /// coordinates are read in that scaled image's pixels.
+ enum MCPServer {
+     static let longEdge = 1000
++    static let configuredDeviceAlias = "configured-usb-phone"
+     static var base = URL(string: "http://127.0.0.1:7390")!
+ 
+     /// This process's language, fetched from the app's /config because the stdio
+@@ -57,7 +58,9 @@ enum MCPServer {
+             {
+                 refreshLanguage()
+             }
+-            if let response = response(to: message, callTool: call) {
++            if let response = response(to: message, callTool: { name, arguments in
++                modelResult(call(name, arguments))
++            }) {
+                 write(response)
+             }
+         }
+@@ -120,6 +123,7 @@ enum MCPServer {
+             guard ["device", "device_id"].allSatisfy({ arguments[$0] == nil || arguments[$0] is String }) else {
+                 throw MCPError("device and device_id must be strings when supplied")
+             }
++            try validateManagedSelectors(arguments)
+             if name == "session_context" { return try sessionContext(arguments) }
+             if name == "accessibility_tree" { return try accessibilityTree(arguments) }
+             if arguments["frame_id"] != nil {
+@@ -151,7 +155,7 @@ enum MCPServer {
+                     try client.get("/devices").0
+                 }
+                 if name == "list_devices" {
+-                    return ["content": [["type": "text", "text": String(decoding: data, as: UTF8.self)]]]
++                    return try deviceListContent(data)
+                 }
+                 let query = (arguments["device"] as? String) ?? (arguments["device_id"] as? String)
+                 let device: String
+@@ -190,6 +194,12 @@ enum MCPServer {
+                             recording.requestStarted()
+                             let data = try client.post(action.path, body)
+                             recording.requestAcknowledged()
++                            if ProcessInfo.processInfo.environment["IPHONE_USE_DEVICE_ID"] != nil {
++                                let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
++                                guard (object?["device"] as? String)?.caseInsensitiveCompare(device) == .orderedSame else {
++                                    throw MCPError("OCR response did not match the configured phone")
++                                }
++                            }
+                             recording.finish()
+                             return recording.attach(to: [
+                                 "content": [["type": "text", "text": String(decoding: data, as: UTF8.self)]]
+@@ -233,7 +243,7 @@ enum MCPServer {
+                             do {
+                                 return try readScreenshot(device, observationOnly: true, timeout: remaining)
+                             } catch {
+-                                captureError = "\(error)"
++                                captureError = modelDiagnostic("\(error)")
+                                 return nil
+                             }
+                         }
+@@ -275,9 +285,7 @@ enum MCPServer {
+                 "session_context requires the configured device ID or an explicit exact device ID; it never discovers phones"
+             )
+         }
+-        if let configured, let query, configured.caseInsensitiveCompare(query) != .orderedSame {
+-            throw MCPError("This MCP entry is restricted to its configured iPhone device ID")
+-        }
++        try validateManagedSelectors(arguments, configuredDevice: configured)
+         if let raw = arguments["clear_checkpoint"], !TextEntry.isBoolean(raw) {
+             throw MCPError("clear_checkpoint must be a boolean")
+         }
+@@ -315,11 +323,7 @@ enum MCPServer {
+         guard let device = ProcessInfo.processInfo.environment["IPHONE_USE_DEVICE_ID"], !device.isEmpty else {
+             throw MCPError("accessibility_tree requires the configured iPhone and exact USB identity")
+         }
+-        for key in ["device", "device_id"] {
+-            if let query = arguments[key] as? String, query.caseInsensitiveCompare(device) != .orderedSame {
+-                throw MCPError("This MCP entry is restricted to its configured iPhone device ID")
+-            }
+-        }
++        try validateManagedSelectors(arguments, configuredDevice: device)
+         let scope = arguments["scope"] as? String ?? "app"
+         guard arguments["scope"] == nil || arguments["scope"] is String, ["app", "point"].contains(scope) else {
+             throw MCPError("scope must be app or point")
+@@ -350,7 +354,7 @@ enum MCPServer {
+                     recording.fail(error)
+                     let unavailable: [String: Any] = [
+                         "source": "ios-native-ax", "status": "unavailable",
+-                        "reason": String(String(describing: error).prefix(1200)), "cleanup": "unknown",
++                        "reason": modelDiagnostic(String(String(describing: error).prefix(1200))), "cleanup": "unknown",
+                         "note": "No OCR or screenshot substituted. Use those separately if needed.",
+                     ]
+                     return recording.attach(to: try accessibilityResult(unavailable))
+@@ -533,6 +537,116 @@ enum MCPServer {
+         return result
+     }
+ 
++    /// Managed callers name one configured phone without receiving its physical
++    /// identity. Locks, host requests and the private journal keep the exact ID.
++    static func validateManagedSelectors(
++        _ arguments: [String: Any],
++        configuredDevice: String? = ProcessInfo.processInfo.environment["IPHONE_USE_DEVICE_ID"]
++    ) throws {
++        guard let configuredDevice else { return }
++        guard !configuredDevice.isEmpty else { throw MCPError("Configured USB phone is unavailable") }
++        for key in ["device", "device_id"] {
++            if let raw = arguments[key] {
++                guard let value = raw as? String,
++                    value.caseInsensitiveCompare(configuredDeviceAlias) == .orderedSame else {
++                    throw MCPError("Use configured-usb-phone or omit the device selector; this entry controls one configured USB phone")
++                }
++            }
++        }
++    }
++
++    static func deviceListContent(
++        _ data: Data, configuredDevice: String? = ProcessInfo.processInfo.environment["IPHONE_USE_DEVICE_ID"]
++    ) throws -> [String: Any] {
++        let visible: Data
++        if let configuredDevice {
++            _ = try resolveDevice(nil, data: data, configuredDevice: configuredDevice)
++            visible = try JSONSerialization.data(withJSONObject: ["devices": [[
++                "id": configuredDeviceAlias, "name": "USB iPhone", "transport": "coredevice-usb",
++            ]]], options: [.sortedKeys])
++        } else {
++            // Native upstream fixtures remain usable; managed public launchers
++            // always supply the configured identity and never take this branch.
++            visible = data
++        }
++        return ["content": [["type": "text", "text": String(decoding: visible, as: UTF8.self)]]]
++    }
++
++    /// One outgoing model boundary, including JSON encoded in text blocks.
++    /// Only identity metadata and our generated caption change. Screen pixels,
++    /// OCR/AX text and saved agent notes remain source evidence, not redactions.
++    static func modelResult(
++        _ result: [String: Any],
++        configuredDevice: String? = ProcessInfo.processInfo.environment["IPHONE_USE_DEVICE_ID"]
++    ) -> [String: Any] {
++        guard let configuredDevice, !configuredDevice.isEmpty else { return result }
++        func project(_ value: Any) -> (Any, Bool) {
++            if var object = value as? [String: Any] {
++                if object["type"] as? String == "image" { return (object, false) }
++                var changed = false
++                for (key, item) in object {
++                    // These are source/agent payloads, even if a nested field
++                    // happens to be named device or device_id.
++                    if ["checkpoint", "items", "nodes", "ancestors", "parents", "parent_fields",
++                        "defaults", "node_defaults", "added", "removed"].contains(key) {
++                        continue
++                    }
++                    if ["device", "device_id", "source"].contains(key), let id = item as? String,
++                        id.caseInsensitiveCompare(configuredDevice) == .orderedSame {
++                        object[key] = configuredDeviceAlias
++                        changed = true
++                    } else if ["error", "reason", "detail", "message"].contains(key), let diagnostic = item as? String {
++                        let projected = modelDiagnostic(diagnostic, configuredDevice: configuredDevice)
++                        if projected != diagnostic { object[key] = projected; changed = true }
++                    } else if key == "text", object["type"] as? String == "text", let text = item as? String {
++                        if let data = text.data(using: .utf8),
++                            let json = try? JSONSerialization.jsonObject(with: data) {
++                            let (projected, updated) = project(json)
++                            if updated, let encoded = try? JSONSerialization.data(withJSONObject: projected,
++                                options: [.sortedKeys, .withoutEscapingSlashes]) {
++                                object[key] = String(decoding: encoded, as: UTF8.self)
++                                changed = true
++                            }
++                        } else {
++                            for (prefix, replacement) in [
++                                ("Screenshot of \(configuredDevice),", "Screenshot of \(configuredDeviceAlias),"),
++                                ("\(configuredDevice) 的截图，", "\(configuredDeviceAlias) 的截图，"),
++                            ] {
++                                if let range = text.range(of: prefix, options: [.anchored, .caseInsensitive]) {
++                                    object[key] = text.replacingCharacters(in: range, with: replacement)
++                                    changed = true
++                                    break
++                                }
++                            }
++                        }
++                    } else {
++                        let (projected, updated) = project(item)
++                        if updated { object[key] = projected; changed = true }
++                    }
++                }
++                return (object, changed)
++            }
++            if let values = value as? [Any] {
++                var changed = false
++                let projected = values.map { item -> Any in
++                    let (value, updated) = project(item)
++                    changed = changed || updated
++                    return value
++                }
++                return (projected, changed)
++            }
++            return (value, false)
++        }
++        return project(result).0 as! [String: Any]
++    }
++
++    static func modelDiagnostic(
++        _ message: String, configuredDevice: String? = ProcessInfo.processInfo.environment["IPHONE_USE_DEVICE_ID"]
++    ) -> String {
++        guard let configuredDevice, !configuredDevice.isEmpty else { return message }
++        return message.replacingOccurrences(of: configuredDevice, with: configuredDeviceAlias, options: [.caseInsensitive])
++    }
++
+     static func resolveDevice(
+         _ query: String?, data: Data,
+         configuredDevice: String? = ProcessInfo.processInfo.environment["IPHONE_USE_DEVICE_ID"]
+@@ -544,14 +658,12 @@ enum MCPServer {
+             guard !configuredDevice.isEmpty else {
+                 throw MCPError("IPHONE_USE_DEVICE_ID is empty; device input disabled")
+             }
+-            if let query, query.caseInsensitiveCompare(configuredDevice) != .orderedSame {
+-                throw MCPError("This MCP entry is restricted to its configured iPhone device ID")
+-            }
++            try validateManagedSelectors(query.map { ["device": $0] } ?? [:], configuredDevice: configuredDevice)
+             let exact = devices.filter {
+                 ($0["id"] as? String)?.caseInsensitiveCompare(configuredDevice) == .orderedSame
+             }
+-            guard exact.count == 1, let id = exact.first?["id"] as? String else {
+-                throw MCPError("Configured iPhone is unavailable; refusing to select another device")
++            guard devices.count == 1, exact.count == 1, let id = exact.first?["id"] as? String else {
++                throw MCPError("Exactly one configured USB phone must be attached; refusing another device")
+             }
+             return id
+         }
+@@ -592,8 +704,19 @@ enum MCPServer {
+         let width = response.value(forHTTPHeaderField: "X-Image-Width") ?? "?"
+         let height = response.value(forHTTPHeaderField: "X-Image-Height") ?? "?"
+         let id = response.value(forHTTPHeaderField: "X-Device") ?? ""
+-        let serverOCR = response.value(forHTTPHeaderField: "X-Screen-OCR")
+-            .flatMap { Data(base64Encoded: $0) }.flatMap(ScreenOCR.decode)
++        if ProcessInfo.processInfo.environment["IPHONE_USE_DEVICE_ID"] != nil {
++            guard let device, id.caseInsensitiveCompare(device) == .orderedSame else {
++                throw MCPError("Screenshot response did not match the configured phone; no frame returned")
++            }
++        }
++        let serverOCRData = response.value(forHTTPHeaderField: "X-Screen-OCR").flatMap { Data(base64Encoded: $0) }
++        if ProcessInfo.processInfo.environment["IPHONE_USE_DEVICE_ID"] != nil, let serverOCRData {
++            let object = try JSONSerialization.jsonObject(with: serverOCRData) as? [String: Any]
++            guard (object?["device"] as? String)?.caseInsensitiveCompare(id) == .orderedSame else {
++                throw MCPError("Screenshot OCR response did not match the configured phone; no frame returned")
++            }
++        }
++        let serverOCR = serverOCRData.flatMap(ScreenOCR.decode)
+         return ObservationFrame(
+             image: image, device: id, width: width, height: height,
+             mimeType: response.value(forHTTPHeaderField: "Content-Type") ?? "image/jpeg",
+@@ -712,6 +835,7 @@ enum MCPServer {
+     }
+ 
+     private static func failure(_ message: String, inputNotSent: Bool = false) -> [String: Any] {
++        let message = modelDiagnostic(message)
+         var result: [String: Any] = ["content": [["type": "text", "text": message]], "isError": true]
+         if inputNotSent {
+             let metadata: [String: Any] = ["input_receipt": [
+@@ -750,8 +874,8 @@ enum MCPServer {
+ }
+ 
+ /// The stdio server's synchronous bridge to the app's local HTTP API.
+-/// Keep the semaphore wait and URLSession callback together: each MCP tool completes
+-/// its HTTP action before the server reads and processes the next input line.
++/// The client waits only for its response budget: a timeout does not cancel host
++/// work. The managed host owns capture/input serialization through helper cleanup.
+ struct MCPHTTPClient {
+     let base: URL
+     let language: AppLanguage
+diff --git a/Tests/PythonTests/test_mcp_stdio.py b/Tests/PythonTests/test_mcp_stdio.py
+index 7008870..a954dab 100644
+--- a/Tests/PythonTests/test_mcp_stdio.py
++++ b/Tests/PythonTests/test_mcp_stdio.py
+@@ -111,6 +111,9 @@ class MockApp(BaseHTTPRequestHandler):
+         if self.server.before_post:
+             self.server.before_post(body)
+         if self.path == "/ocr":
++            if self.server.ocr_response is not None:
++                self.send(200, json.dumps(self.server.ocr_response).encode())
++                return
+             self.send(200, json.dumps({"device": body["device"], "width": 600, "height": 1200,
+                                        "items": [{"text": "设置", "x": 120, "y": 400}]}).encode())
+             return
+@@ -161,6 +164,7 @@ class MCPStdioTests(unittest.TestCase):
+         self.server.before_screenshot = None
+         self.server.screenshot_response = None
+         self.server.screen_ocr = None
++        self.server.ocr_response = None
+         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+         self.thread.start()
+         self.state = tempfile.TemporaryDirectory()
+@@ -194,6 +198,109 @@ class MCPStdioTests(unittest.TestCase):
+         self.assertEqual([reply["id"] for reply in replies], ["init"] + list(range(1, len(calls) + 1)))
+         return [reply["result"] for reply in replies[1:]]
+ 
++    def test_managed_device_alias_hides_transport_identity_and_keeps_exact_host_requests(self):
++        physical = "11111111-1111111111111111"
++        alias = "configured-usb-phone"
++        self.env["IPHONE_USE_DEVICE_ID"] = physical
++        self.server.devices = [{"id": physical, "name": physical}]
++        sequence = 0
++
++        def screenshot(path):
++            nonlocal sequence
++            sequence += 1
++            status, image, headers = identified_capture_reply(160, sequence, capture_uptime())
++            headers["X-Device"] = physical
++            ocr = json.loads(base64.b64decode(headers["X-Screen-OCR"]))
++            ocr["device"] = physical
++            headers["X-Screen-OCR"] = base64.b64encode(json.dumps(ocr).encode()).decode()
++            return status, image, headers
++
++        self.server.screenshot_response = screenshot
++        results = self.exchange([
++            ("list_devices", {}),
++            ("screenshot", {"device": alias, "include_image": False}),
++            ("ocr_screen", {"device_id": alias, "include_image": False}),
++            ("screenshot_burst", {"device": alias, "frames": 2, "interval_ms": 100, "include_image": False}),
++            ("session_context", {"device": alias}),
++            ("act", {"device": alias, "device_id": alias, "steps": [{"type": "home"}], "observe": "none"}),
++        ])
++        self.assertTrue(all(not result.get("isError") for result in results), results)
++        self.assertNotIn(physical, json.dumps(results))
++        listing = json.loads(results[0]["content"][0]["text"])
++        self.assertEqual(listing["devices"], [{"id": alias, "name": "USB iPhone", "transport": "coredevice-usb"}])
++        self.assertTrue(any("Screenshot of " + alias in block.get("text", "") for block in results[1]["content"]))
++        self.assertIn("frame", results[1]["structuredContent"])
++        self.assertEqual(json.loads(results[2]["content"][0]["text"])["device"], alias)
++        self.assertEqual(results[3]["structuredContent"]["device"], alias)
++        self.assertEqual(results[4]["structuredContent"]["device"], alias)
++        for event in self.server.events + [("GET", path) for path in self.server.stability_events]:
++            if event[0] == "POST":
++                self.assertEqual(event[2]["device"], physical)
++            elif event[1].startswith("/screenshot?"):
++                self.assertEqual(parse_qs(urlsplit(event[1]).query)["device"], [physical])
++        saved = json.loads(next(Path(self.state.name).glob("session-context-*.json")).read_text())
++        self.assertEqual(saved["device"], physical)
++
++    def test_managed_raw_foreign_or_conflicting_selectors_fail_before_host_or_helper(self):
++        physical = "11111111-1111111111111111"
++        self.env["IPHONE_USE_DEVICE_ID"] = physical
++        calls = []
++        for tool, arguments in [("screenshot", {}), ("ocr_screen", {}), ("screenshot_burst", {}),
++                                ("session_context", {}), ("accessibility_tree", {}),
++                                ("act", {"steps": [{"type": "home"}]})]:
++            for selector in ({"device": physical}, {"device": "another-phone"},
++                             {"device": "configured-usb-phone", "device_id": physical}):
++                calls.append((tool, {**arguments, **selector}))
++        results = self.exchange(calls)
++        self.assertTrue(all(result.get("isError") for result in results))
++        self.assertNotIn(physical, json.dumps(results))
++        self.assertTrue(all(event == ("GET", "/config?wake=0") for event in self.server.events))
++        self.assertFalse(list(Path(self.state.name).glob("session-context-*.json")))
++
++    def test_managed_alias_cannot_hide_wrong_screenshot_or_ocr_response_identity(self):
++        physical, other = "11111111-1111111111111111", "22222222-2222222222222222"
++        self.env["IPHONE_USE_DEVICE_ID"] = physical
++        self.server.devices = [{"id": physical, "name": "USB iPhone"}]
++
++        def screenshot(device, ocr_device):
++            status, image, headers = identified_capture_reply(160, 1, capture_uptime())
++            headers["X-Device"] = device
++            ocr = json.loads(base64.b64decode(headers["X-Screen-OCR"]))
++            ocr["device"] = ocr_device
++            headers["X-Screen-OCR"] = base64.b64encode(json.dumps(ocr).encode()).decode()
++            return status, image, headers
++
++        for device, ocr_device in [(other, physical), (physical, other)]:
++            with self.subTest(device=device, ocr_device=ocr_device):
++                self.server.screenshot_response = lambda path: screenshot(device, ocr_device)
++                result, = self.exchange([("screenshot", {"device": "configured-usb-phone"})])
++                self.assertTrue(result["isError"])
++                self.assertFalse(any(block["type"] == "image" for block in result["content"]))
++                self.assertNotIn("frame", result.get("structuredContent", {}))
++                self.assertNotIn(physical, json.dumps(result))
++                self.assertNotIn(other, json.dumps(result))
++        self.server.ocr_response = {"device": other, "items": [], "width": 16, "height": 16}
++        result, = self.exchange([("ocr_screen", {})])
++        self.assertTrue(result["isError"])
++        self.assertNotIn(other, json.dumps(result))
++
++    def test_managed_ax_envelope_alias_does_not_change_helper_target(self):
++        physical = "11111111-1111111111111111"
++        helper = Path(self.state.name) / "fake-ax.py"
++        helper.write_text("import json, os\n"
++                          + "assert os.environ['IPHONE_USE_USB_DEVICE_ID'] == " + repr(physical) + "\n"
++                          + "print(json.dumps({'schema_version':1,'source':'ios-native-ax','status':'ok',"
++                            "'device_id':os.environ['IPHONE_USE_USB_DEVICE_ID'],'nodes':[{'label':'retained AX text'}]}))\n")
++        self.env.update(IPHONE_USE_DEVICE_ID=physical, IPHONE_USE_USB_DEVICE_ID=physical,
++                        IPHONE_USE_USB_CLIPBOARD_PYTHON=sys.executable, IPHONE_USE_AX_HELPER=str(helper))
++        result, = self.exchange([("accessibility_tree", {"device": "configured-usb-phone"})])
++        self.assertFalse(result.get("isError"), result)
++        tree = json.loads(result["content"][0]["text"])
++        self.assertEqual(tree["device_id"], "configured-usb-phone")
++        self.assertEqual(tree["nodes"], [{"label": "retained AX text"}])
++        self.assertNotIn(physical, json.dumps(result))
++        self.assertEqual(self.server.events, [("GET", "/config?wake=0")])
++
+     def test_direct_touch_batch_preserves_uncertainty_and_only_observes_success(self):
+         sequence = 0
+         def screenshot(path):
+@@ -1641,7 +1748,7 @@ class MCPStdioTests(unittest.TestCase):
+         )
+         self.assertEqual(process.returncode, 0, process.stderr)
+         replies = [json.loads(line) for line in process.stdout.splitlines()]
+-        self.assertIn("控制真实 iPhone", replies[0]["result"]["instructions"])
++        self.assertIn("控制已配置的 USB iPhone", replies[0]["result"]["instructions"])
+         tools = replies[1]["result"]["tools"]
+         # Tool and parameter names are the client contract and stay English.
+         self.assertEqual({tool["name"] for tool in tools}, {
+diff --git a/Tests/iPhoneUseTests/API/Phase2Tests.swift b/Tests/iPhoneUseTests/API/Phase2Tests.swift
+index b3a4057..0d02ab2 100644
+--- a/Tests/iPhoneUseTests/API/Phase2Tests.swift
++++ b/Tests/iPhoneUseTests/API/Phase2Tests.swift
+@@ -307,7 +307,7 @@ final class Phase2Tests: XCTestCase {
+             sleep: {
+                 delay += $0
+             },
+-            now: { 0 },
++            now: { delay },
+             execute: { _, _, _ in
+                 XCTFail("Timeout must stop execution")
+                 return .json([:])
+diff --git a/Tests/iPhoneUseTests/API/USBObservationLifecycleTests.swift b/Tests/iPhoneUseTests/API/USBObservationLifecycleTests.swift
+new file mode 100644
+index 0000000..8d15043
+--- /dev/null
++++ b/Tests/iPhoneUseTests/API/USBObservationLifecycleTests.swift
+@@ -0,0 +1,164 @@
++import Darwin
++import Foundation
++import ImageIO
++import Testing
++@testable import iPhoneUse
++
++@Suite(.serialized) struct USBObservationLifecycleTests {
++    private final class Harness {
++        let device = "33333333-3333333333333333"
++        let captureEntered = DispatchSemaphore(value: 0)
++        let captureReturned = DispatchSemaphore(value: 0)
++        let releaseCapture = DispatchSemaphore(value: 0)
++        let inputEntered = DispatchSemaphore(value: 0)
++        let releaseInput = DispatchSemaphore(value: 0)
++        let eventsLock = NSLock()
++        var events: [String] = []
++        var blockCapture = true, failCapture = false, blockInput = false
++        func record(_ event: String) { eventsLock.withLock { events.append(event) } }
++        var recorded: [String] { eventsLock.withLock { events } }
++        var dependencies: USBControlAPI.Dependencies {
++            var d = USBControlAPI.Dependencies()
++            d.environment = ["IPHONE_USE_DEVICE_ID": device, "IPHONE_USE_USB_DEVICE_ID": device,
++                "IPHONE_USE_USB_CLIPBOARD_PYTHON": "/usr/bin/python3",
++                USBScreenCapture.helperKey: "/private/synthetic/screenshot.py"]
++            d.pin = { .init(registryEntryID: 53, serial: self.device) }
++            d.capture = { _ in
++                defer { self.captureReturned.signal() }
++                self.record("capture-open")
++                self.captureEntered.signal()
++                if self.blockCapture {
++                    guard self.releaseCapture.wait(timeout: .now() + 8) == .success else {
++                        throw DeviceError("fixture capture was not released")
++                    }
++                }
++                // The production capture returns only after child/tunnel cleanup.
++                self.record("capture-closed")
++                if self.failCapture { throw DeviceError("synthetic capture cleanup failed") }
++                let context = CGContext(data: nil, width: 2, height: 4, bitsPerComponent: 8, bytesPerRow: 0,
++                    space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
++                let data = NSMutableData()
++                let destination = CGImageDestinationCreateWithData(data, "public.png" as CFString, 1, nil)!
++                CGImageDestinationAddImage(destination, context.makeImage()!, nil)
++                guard CGImageDestinationFinalize(destination) else { throw DeviceError("fixture PNG failed") }
++                return data as Data
++            }
++            d.keyboard = { _, _, _, before, clipboard in
++                self.record("input-open")
++                self.inputEntered.signal()
++                if self.blockInput {
++                    guard self.releaseInput.wait(timeout: .now() + 8) == .success else {
++                        throw DeviceError("fixture input was not released")
++                    }
++                }
++                try before(); try clipboard?(); try before()
++                self.record("input-closed")
++                return ["input_status": "sent_unverified", "hid_input_status": "sent_unverified",
++                    "clipboard_status": "not_requested"]
++            }
++            return d
++        }
++        func handle(_ request: HTTPRequest) -> HTTPResponse {
++            USBControlAPI.handle(request, dependencies: dependencies)
++        }
++    }
++
++    private func unusedLoopbackPort() throws -> UInt16 {
++        let fd = Darwin.socket(AF_INET, SOCK_STREAM, 0)
++        try #require(fd >= 0)
++        defer { Darwin.close(fd) }
++        var address = sockaddr_in()
++        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
++        address.sin_family = sa_family_t(AF_INET)
++        address.sin_addr.s_addr = inet_addr("127.0.0.1")
++        let bound = withUnsafePointer(to: &address) { pointer in
++            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
++                Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
++            }
++        }
++        try #require(bound == 0)
++        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
++        let read = withUnsafeMutablePointer(to: &address) { pointer in
++            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &length) }
++        }
++        try #require(read == 0)
++        return UInt16(bigEndian: address.sin_port)
++    }
++
++    // Exercise the actual concurrent HTTP listener and the same timed client as
++    // MCP. A canceled response must not hand device ownership to the next POST.
++    @Test(arguments: ["baseline", "post-action", "burst", "capture-error"])
++    func timedOutHTTPObservationCannotOverlapInput(_ mode: String) throws {
++        let h = Harness()
++        h.failCapture = mode == "capture-error"
++        let port = try unusedLoopbackPort()
++        let server = HTTPServer(port: port, handler: h.handle)
++        try server.start()
++        defer { h.releaseCapture.signal(); server.stop() }
++        let client = MCPHTTPClient(base: URL(string: "http://127.0.0.1:\(port)")!, language: .en)
++        let readyBy = ProcessInfo.processInfo.systemUptime + 3
++        while (try? client.get("/status", timeout: 0.1)) == nil {
++            try #require(ProcessInfo.processInfo.systemUptime < readyBy)
++            Thread.sleep(forTimeInterval: 0.01)
++        }
++        let observed = DispatchSemaphore(value: 0)
++        DispatchQueue.global().async {
++            let path = "/screenshot?observationOnly=1" + (mode == "baseline" ? "&format=png&stability=1" : "&ocr=1")
++            #expect(throws: (any Error).self) {
++                _ = try client.get(path, timeout: mode == "baseline" ? 2 : 0.1)
++            }
++            observed.signal()
++        }
++        try #require(h.captureEntered.wait(timeout: .now() + 3) == .success)
++        try #require(observed.wait(timeout: .now() + 3) == .success)
++        #expect(h.recorded == ["capture-open"])
++        let finished = DispatchSemaphore(value: 0)
++        DispatchQueue.global().async {
++            do { _ = try client.post("/home", [:]) }
++            catch { Issue.record("Home request failed: \(error)") }
++            finished.signal()
++        }
++        #expect(h.inputEntered.wait(timeout: .now() + 0.15) == .timedOut)
++        h.releaseCapture.signal()
++        try #require(h.captureReturned.wait(timeout: .now() + 3) == .success)
++        try #require(finished.wait(timeout: .now() + 3) == .success)
++        #expect(h.recorded == ["capture-open", "capture-closed", "input-open", "input-closed"])
++    }
++
++    @Test func screenshotWaitsUntilInputCleanupFinishes() throws {
++        let h = Harness(); h.blockInput = true; h.blockCapture = false
++        let inputFinished = DispatchSemaphore(value: 0), captureFinished = DispatchSemaphore(value: 0)
++        defer { h.releaseInput.signal() }
++        DispatchQueue.global().async {
++            #expect(h.handle(HTTPRequest(method: "POST", path: "/home", query: [:], body: [:])).status == 200)
++            inputFinished.signal()
++        }
++        try #require(h.inputEntered.wait(timeout: .now() + 3) == .success)
++        DispatchQueue.global().async {
++            #expect(h.handle(HTTPRequest(method: "GET", path: "/screenshot",
++                query: ["observationOnly": "1"], body: [:])).status == 200)
++            captureFinished.signal()
++        }
++        #expect(h.captureEntered.wait(timeout: .now() + 0.15) == .timedOut)
++        h.releaseInput.signal()
++        try #require(inputFinished.wait(timeout: .now() + 3) == .success)
++        try #require(captureFinished.wait(timeout: .now() + 3) == .success)
++        #expect(h.recorded == ["input-open", "input-closed", "capture-open", "capture-closed"])
++    }
++
++    @Test func batchAndTextPreflightReenterTheSameDeviceLock() throws {
++        let h = Harness(); h.blockCapture = false
++        let finished = DispatchSemaphore(value: 0)
++        DispatchQueue.global().async {
++            let body: [String: Any] = ["steps": [
++                ["type": "type", "text": "a", "ensure_chinese_ime": true, "use_clipboard": false],
++                ["type": "home"],
++            ]]
++            #expect(h.handle(HTTPRequest(method: "POST", path: "/act", query: [:], body: body)).status == 200)
++            finished.signal()
++        }
++        try #require(finished.wait(timeout: .now() + 3) == .success)
++        #expect(h.recorded == ["capture-open", "capture-closed", "input-open", "input-closed",
++            "input-open", "input-closed"])
++    }
++}
+diff --git a/Tests/iPhoneUseTests/API/WaitTextDeadlineTests.swift b/Tests/iPhoneUseTests/API/WaitTextDeadlineTests.swift
+new file mode 100644
+index 0000000..8689bee
+--- /dev/null
++++ b/Tests/iPhoneUseTests/API/WaitTextDeadlineTests.swift
+@@ -0,0 +1,118 @@
++import AppKit
++import Testing
++
++@testable import iPhoneUse
++
++/// Cached OCR and an injected monotonic clock exercise the production executor
++/// without real waiting, Vision recognition, device capture or input.
++@Suite struct WaitTextDeadlineTests {
++    private func image(device: String, texts: [String]) throws -> Data {
++        let context = try #require(CGContext(data: nil, width: 16, height: 16, bitsPerComponent: 8, bytesPerRow: 0,
++            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
++        context.setFillColor(CGColor(gray: 1, alpha: 1))
++        context.fill(CGRect(x: 0, y: 0, width: 16, height: 16))
++        let bitmap = NSBitmapImageRep(cgImage: try #require(context.makeImage()))
++        let data = try #require(bitmap.representation(using: .png, properties: [:]))
++        let result = ScreenOCR.recognize(data, device: device,
++            recognition: { _ in texts.map { .init(text: $0, x: 1, y: 2) } })
++        #expect(result.items.map(\.text) == texts)
++        return data
++    }
++
++    private func request(timeout: TimeInterval = 0.25) throws -> ActRequest {
++        try ActRequest(["steps": [
++            ["type": "wait_text", "text": "ready", "exact": true, "timeout": timeout],
++            ["type": "home"], ["type": "type", "text": "owned", "use_clipboard": false],
++        ]], directKeyboardConfigured: false, requireFrameTouch: true)
++    }
++
++    private func expectTimeout(_ response: HTTPResponse) throws {
++        #expect(response.status == 400)
++        let body = try #require(try JSONSerialization.jsonObject(with: response.body) as? [String: Any])
++        #expect(body["ok"] as? Bool == false)
++        #expect(body["failed_step"] as? Int == 1 && body["completed"] as? Int == 0)
++        #expect((body["error"] as? String)?.contains("wait_text timed out") == true)
++        let receipts = try #require(body["step_receipts"] as? [[String: Any]])
++        #expect(receipts.count == 1 && receipts[0]["ok"] as? Bool == false)
++        #expect(receipts[0]["type"] as? String == "wait_text")
++    }
++
++    @Test(arguments: [0.25, 0.251])
++    func matchingCaptureAtOrAfterDeadlineCannotExecuteHomeOrType(_ captureSeconds: TimeInterval) throws {
++        let device = UUID().uuidString
++        let data = try image(device: device, texts: ["ready"])
++        var clock = 10.0, captures = 0
++        var paths: [String] = []
++        let response = try request().perform(device: device, capture: { _, _ in
++            captures += 1
++            clock += captureSeconds
++            return (device, data)
++        }, sleep: { _ in Issue.record("A late capture must time out immediately") }, now: { clock },
++        execute: { path, _, _ in paths.append(path); return .json(["ok": true]) })
++        try expectTimeout(response)
++        #expect(captures == 1 && paths.isEmpty)
++    }
++
++    @Test func matchingCaptureInsideDeadlineAdmitsFollowingInput() throws {
++        let device = UUID().uuidString
++        let data = try image(device: device, texts: ["ready"])
++        var clock = 10.0, captures = 0
++        var paths: [String] = []
++        let response = try request().perform(device: device, capture: { _, _ in
++            captures += 1
++            clock += 0.249
++            return (device, data)
++        }, sleep: { _ in Issue.record("A match inside the deadline must not poll again") }, now: { clock },
++        execute: { path, _, _ in paths.append(path); return .json(["ok": true]) })
++        #expect(response.status == 200 && captures == 1)
++        #expect(paths == ["/home", "/type"])
++        let body = try #require(try JSONSerialization.jsonObject(with: response.body) as? [String: Any])
++        #expect(body["completed"] as? Int == 3)
++    }
++
++    @Test func deadlineCrossingAfterCaptureStillRejectsTheOCRMatch() throws {
++        let device = UUID().uuidString
++        let data = try image(device: device, texts: ["ready"])
++        var captured = false, afterCaptureChecks = 0, inputs = 0
++        let response = try request().perform(device: device, capture: { _, _ in
++            captured = true
++            return (device, data)
++        }, sleep: { _ in Issue.record("An expired match cannot start another poll") }, now: {
++            guard captured else { return 10 }
++            afterCaptureChecks += 1
++            // Capture returned inside the window; time has crossed the deadline
++            // when the executor checks the completed OCR match.
++            return afterCaptureChecks == 1 ? 10.1 : 10.3
++        }, execute: { _, _, _ in inputs += 1; return .json(["ok": true]) })
++        try expectTimeout(response)
++        #expect(captured && afterCaptureChecks >= 2 && inputs == 0)
++    }
++
++    @Test func expiredPollDeadlineDoesNotStartAnotherCapture() throws {
++        let device = UUID().uuidString
++        let data = try image(device: device, texts: [])
++        var clock = 10.0, captures = 0, inputs = 0
++        var delays: [TimeInterval] = []
++        let response = try request().perform(device: device, capture: { _, _ in
++            captures += 1
++            return (device, data)
++        }, sleep: { delay in
++            delays.append(delay)
++            clock += 0.3 // Simulate a delayed wake-up past the absolute deadline.
++        }, now: { clock }, execute: { _, _, _ in inputs += 1; return .json(["ok": true]) })
++        try expectTimeout(response)
++        #expect(captures == 1 && inputs == 0)
++        #expect(delays == [0.1])
++    }
++
++    @Test func zeroTimeoutStartsNeitherCaptureNorFollowingInput() throws {
++        var captures = 0, inputs = 0
++        let response = try request(timeout: 0).perform(device: "fixture", capture: { _, _ in
++            captures += 1
++            return ("fixture", Data())
++        }, sleep: { _ in Issue.record("An immediate deadline cannot sleep") }, now: { 10 },
++        execute: { _, _, _ in inputs += 1; return .json(["ok": true]) })
++        try expectTimeout(response)
++        #expect(captures == 0 && inputs == 0)
++    }
++}
+diff --git a/Tests/iPhoneUseTests/Input/KeyboardClipboardReceiptTests.swift b/Tests/iPhoneUseTests/Input/KeyboardClipboardReceiptTests.swift
+index 7562bac..21bb4d9 100644
+--- a/Tests/iPhoneUseTests/Input/KeyboardClipboardReceiptTests.swift
++++ b/Tests/iPhoneUseTests/Input/KeyboardClipboardReceiptTests.swift
+@@ -1,3 +1,4 @@
++import Darwin
+ import Foundation
+ import Testing
+ @testable import iPhoneUse
+@@ -163,16 +164,23 @@ print(json.dumps({'schema_version':1, 'backend':'coredevice-keyboard',
+ 
+     @Test func clipboardTimeoutIsUnconfirmedEvenWithUncommittedHID() throws {
+         let harness = try Harness()
+-        let environment = try harness.clipboardEnvironment("printf 'called' > \"$CLIPBOARD_TEST_MARKER\"\nexec /bin/sleep 5\n")
++        // Ignore TERM across exec so the real Swift wrapper must use its KILL
++        // path; exec keeps one PID and leaves no descendant sleep process.
++        let environment = try harness.clipboardEnvironment(
++            "trap '' TERM\nprintf '%s' \"$$\" > \"$CLIPBOARD_TEST_MARKER\"\nexec /bin/sleep 5\n")
+         var failure: DeviceClipboard.WriteFailure?
+         let receipt = try harness.perform(clipboard: {
+-            do { try DeviceClipboard.write("synthetic", environment: environment, timeout: 0.2) }
++            do { try DeviceClipboard.write("synthetic", environment: environment, timeout: 0.5) }
+             catch {
+                 failure = error as? DeviceClipboard.WriteFailure
+                 throw error
+             }
+         })
+         #expect(failure?.status == .unconfirmed)
++        let pidText = try String(contentsOfFile: environment["CLIPBOARD_TEST_MARKER"]!, encoding: .utf8)
++        let pid = try #require(Int32(pidText))
++        let probe = kill(pid, 0), probeError = errno
++        #expect(probe == -1 && probeError == ESRCH)
+         #expect(try harness.observedPhases() == ["ready"])
+         try expectPartialClipboardEffect(receipt, clipboard: "unconfirmed", directory: harness.directory)
+     }
+diff --git a/Tests/iPhoneUseTests/MCP/MCPDevicePrivacyTests.swift b/Tests/iPhoneUseTests/MCP/MCPDevicePrivacyTests.swift
+new file mode 100644
+index 0000000..38ab6e5
+--- /dev/null
++++ b/Tests/iPhoneUseTests/MCP/MCPDevicePrivacyTests.swift
+@@ -0,0 +1,122 @@
++import Foundation
++import XCTest
++
++@testable import iPhoneUse
++
++final class MCPDevicePrivacyTests: XCTestCase {
++    private let physical = "11111111-1111111111111111"
++    private let other = "22222222-2222222222222222"
++    private let alias = "configured-usb-phone"
++
++    private func encode(_ value: Any) throws -> String {
++        String(decoding: try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]), as: UTF8.self)
++    }
++
++    private func textObject(_ result: [String: Any]) throws -> [String: Any] {
++        let blocks = try XCTUnwrap(result["content"] as? [[String: Any]])
++        let text = try XCTUnwrap(blocks.first(where: { $0["type"] as? String == "text" })?["text"] as? String)
++        return try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
++    }
++
++    func testManagedSelectorsAcceptOnlyAliasOrOmissionAndCheckBothFields() throws {
++        for arguments: [String: Any] in [[:], ["device": alias], ["device_id": alias.uppercased()],
++                                         ["device": alias, "device_id": alias]] {
++            XCTAssertNoThrow(try MCPServer.validateManagedSelectors(arguments, configuredDevice: physical))
++        }
++        for arguments: [String: Any] in [["device": physical], ["device": other], ["device": "USB iPhone"],
++                                         ["device": alias, "device_id": other], ["device_id": 7]] {
++            XCTAssertThrowsError(try MCPServer.validateManagedSelectors(arguments, configuredDevice: physical))
++        }
++    }
++
++    func testDeviceListShowsOnlyAliasAndRejectsWrongOrMultiplePhysicalTargets() throws {
++        func list(_ ids: [String]) throws -> Data {
++            try JSONSerialization.data(withJSONObject: ["devices": ids.map { ["id": $0, "name": $0] }])
++        }
++        let input = try list([physical])
++        let result = try MCPServer.deviceListContent(input, configuredDevice: physical)
++        let devices = try XCTUnwrap(try textObject(result)["devices"] as? [[String: String]])
++        XCTAssertEqual(devices, [["id": alias, "name": "USB iPhone", "transport": "coredevice-usb"]])
++        XCTAssertFalse(try encode(result).contains(physical))
++        XCTAssertEqual(try MCPServer.resolveDevice(alias, data: input, configuredDevice: physical), physical)
++        for ids in [[], [other], [physical, other], [physical, physical]] {
++            XCTAssertThrowsError(try MCPServer.deviceListContent(list(ids), configuredDevice: physical))
++        }
++    }
++
++    func testScreenshotCaptionChangesWithoutChangingImageOrOCRText() throws {
++        let image = Data(physical.utf8)
++        let ocr = ScreenOCR.Result(width: 20, height: 40, items: [.init(text: "kept OCR", x: 1, y: 2)])
++        let original = MCPServer.screenshotContent(image: image, device: physical, width: "20", height: "40",
++            includeImage: true, ocr: ocr, mimeType: "image/png")
++        let projected = MCPServer.modelResult(original, configuredDevice: physical)
++        let blocks = try XCTUnwrap(projected["content"] as? [[String: Any]])
++        XCTAssertEqual(blocks.first?["data"] as? String, image.base64EncodedString())
++        let text = try XCTUnwrap(blocks.last?["text"] as? String)
++        XCTAssertTrue(text.contains(alias))
++        XCTAssertFalse(text.contains(physical))
++        XCTAssertTrue(text.contains("kept OCR"))
++        let chinese: [String: Any] = ["content": [["type": "text", "text": "\(physical) 的截图，20x40 像素。"]]]
++        XCTAssertTrue(try encode(MCPServer.modelResult(chinese, configuredDevice: physical)).contains(alias))
++    }
++
++    func testOCRAndBurstTextAndStructuredMetadataUseSameAlias() throws {
++        let ocr = ScreenOCR.Result(width: 20, height: 40, items: [], screenHash: "fixture")
++        let rawOCR: [String: Any] = ["content": [["type": "text", "text": try encode(ocr.json(device: physical))]]]
++        XCTAssertEqual(try textObject(MCPServer.modelResult(rawOCR, configuredDevice: physical))["device"] as? String, alias)
++        let frame = MCPServer.ObservationFrame(image: Data([1]), device: physical, width: "20", height: "40",
++            mimeType: "image/png", identity: .init(source: "coredevice-usb:42", sequence: 1, receivedAt: 11), signature: "fixture")
++        var burst = MCPScreenshotBurst.Result(options: try .init(["frames": 2]), startedAt: 10)
++        burst.samples = [.init(frame: frame, returnedAfter: 1)]
++        let projected = MCPServer.modelResult(MCPScreenshotBurst.content(burst, device: physical, includeImage: false),
++            configuredDevice: physical)
++        XCTAssertEqual(try textObject(projected)["device"] as? String, alias)
++        XCTAssertEqual((projected["structuredContent"] as? [String: Any])?["device"] as? String, alias)
++        XCTAssertFalse(try encode(projected).contains(physical))
++    }
++
++    func testSessionProjectionDoesNotChangePrivateStorageIdentity() throws {
++        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("mcp-privacy-\(UUID().uuidString)")
++        defer { try? FileManager.default.removeItem(at: directory) }
++        let store = try MCPContextStore(device: physical, directory: directory)
++        let context = try store.context()
++        let result: [String: Any] = ["content": [["type": "text", "text": try encode(context)]], "structuredContent": context]
++        let projected = MCPServer.modelResult(result, configuredDevice: physical)
++        XCTAssertEqual(try textObject(projected)["device"] as? String, alias)
++        XCTAssertEqual((projected["structuredContent"] as? [String: Any])?["device"] as? String, alias)
++        XCTAssertFalse(try encode(projected).contains(physical))
++        let saved = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: store.file)) as? [String: Any])
++        XCTAssertEqual(saved["device"] as? String, physical)
++    }
++
++    func testAXEnvelopeChangesButNativeAndCheckpointPayloadsRemainExact() throws {
++        let payload: [String: Any] = ["device": physical, "device_id": physical, "text": "original \(physical)"]
++        let tree: [String: Any] = ["schema_version": 1, "source": "ios-native-ax", "status": "ok",
++            "device_id": physical, "nodes": [payload], "parents": [payload], "parent_fields": [payload],
++            "defaults": payload, "node_defaults": payload, "ancestors": [payload], "items": [payload],
++            "checkpoint": payload, "archive": ["status": "failed"]]
++        let result = MCPServer.modelResult(try MCPServer.accessibilityResult(tree), configuredDevice: physical)
++        let visible = try textObject(result)
++        XCTAssertEqual(visible["device_id"] as? String, alias)
++        for key in ["nodes", "parents", "parent_fields", "ancestors", "items"] {
++            XCTAssertEqual(try encode(visible[key]!), try encode([payload]))
++        }
++        for key in ["defaults", "node_defaults", "checkpoint"] {
++            XCTAssertEqual(try encode(visible[key]!), try encode(payload))
++        }
++        let structured = MCPServer.modelResult(["structuredContent": ["device": physical, "checkpoint": payload]],
++            configuredDevice: physical)["structuredContent"] as? [String: Any]
++        XCTAssertEqual(structured?["device"] as? String, alias)
++        XCTAssertEqual(try encode(try XCTUnwrap(structured?["checkpoint"])), try encode(payload))
++    }
++
++    func testDiagnosticMetadataRedactsIdentifierButCheckpointDiagnosticWordsStayLiteral() throws {
++        let note: [String: Any] = ["device": physical, "reason": "original \(physical)"]
++        let raw: [String: Any] = ["structuredContent": ["device": physical, "reason": "failed \(physical)",
++            "observation": ["detail": "failed \(physical)"], "checkpoint": note]]
++        let projected = try XCTUnwrap(MCPServer.modelResult(raw, configuredDevice: physical)["structuredContent"] as? [String: Any])
++        XCTAssertEqual(projected["reason"] as? String, "failed \(alias)")
++        XCTAssertEqual((projected["observation"] as? [String: Any])?["detail"] as? String, "failed \(alias)")
++        XCTAssertEqual(try encode(projected["checkpoint"]!), try encode(note))
++    }
++}
+diff --git a/Tests/iPhoneUseTests/MCP/MCPDeviceSelectionTests.swift b/Tests/iPhoneUseTests/MCP/MCPDeviceSelectionTests.swift
+index 7b0d271..b01ff9b 100644
+--- a/Tests/iPhoneUseTests/MCP/MCPDeviceSelectionTests.swift
++++ b/Tests/iPhoneUseTests/MCP/MCPDeviceSelectionTests.swift
+@@ -7,9 +7,12 @@ final class MCPDeviceSelectionTests: XCTestCase {
+         #"{"devices":[{"id":"spare-15","name":"Spare"},{"id":"daily-air","name":"Daily"}]}"#.utf8)
+ 
+     func testConfiguredDeviceIsExactAndOverridesAutomaticSingleDeviceChoice() throws {
+-        XCTAssertEqual(try MCPServer.resolveDevice(nil, data: devices, configuredDevice: "spare-15"), "spare-15")
++        let onlySpare = Data(#"{"devices":[{"id":"spare-15","name":"Spare"}]}"#.utf8)
++        XCTAssertEqual(try MCPServer.resolveDevice(nil, data: onlySpare, configuredDevice: "spare-15"), "spare-15")
+         XCTAssertEqual(
+-            try MCPServer.resolveDevice("SPARE-15", data: devices, configuredDevice: "spare-15"), "spare-15")
++            try MCPServer.resolveDevice("configured-usb-phone", data: onlySpare, configuredDevice: "spare-15"), "spare-15")
++        XCTAssertThrowsError(try MCPServer.resolveDevice("SPARE-15", data: onlySpare, configuredDevice: "spare-15"))
++        XCTAssertThrowsError(try MCPServer.resolveDevice(nil, data: devices, configuredDevice: "spare-15"))
+         XCTAssertThrowsError(try MCPServer.resolveDevice("daily-air", data: devices, configuredDevice: "spare-15"))
+         XCTAssertThrowsError(try MCPServer.resolveDevice("spare", data: devices, configuredDevice: "spare-15"))
+         XCTAssertThrowsError(try MCPServer.resolveDevice(nil, data: devices, configuredDevice: ""))
