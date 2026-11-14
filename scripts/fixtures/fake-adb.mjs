@@ -13,7 +13,9 @@ AdbClient.prototype.adb = function (device, ...args) {
   record('adb', args);
   if (args[0] === 'get-state') return Buffer.from('device\n');
   if (args[0] === 'forward') return Buffer.from(args[1] === 'tcp:0' ? '31337' : '');
-  if (args.includes('uiautomator')) return Buffer.from('<?xml version="1.0"?><hierarchy><node class="android.widget.EditText" focused="true" bounds="[0,0][100,50]"/></hierarchy>');
+  if (args.includes('uiautomator')) return Buffer.from(process.env.PHONE_TEST_WEBVIEW === '1'
+    ? '<?xml version="1.0"?><hierarchy><node class="android.webkit.WebView" bounds="[0,20][100,180]"><node class="android.widget.TextView" text="Synthetic article" resource-id="fixture:id/article" bounds="[0,30][100,150]"/></node></hierarchy>'
+    : '<?xml version="1.0"?><hierarchy><node class="android.widget.EditText" focused="true" bounds="[0,0][100,50]"/></hierarchy>');
   if (args[0] === 'exec-out' && ['cat', 'screencap'].includes(args[1])) return invalidCapture ? Buffer.from('invalid capture') : png;
   throw new Error('Unexpected fake ADB command');
 };

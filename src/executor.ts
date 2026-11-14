@@ -22,9 +22,14 @@ import { canonicalArguments, isPowerKey, actionBinding, hostStorageTools } from 
 import { ClipStore, ClipStoreError } from "./clip-store.js";
 import { captureShortClip, ClipCaptureError } from "./clip-capture.js";
 import { openClip, clipKeepSchema } from "./clip-tools.js";
+import { LatencyProfiles, latencySchema } from "./latency.js";
+import { DelegationHost } from "./delegation.js";
+import { delegationNames } from "./delegation-tools.js";
 
 const json = (value: any): CallToolResult => ({ content: [{ type: "text", text: JSON.stringify(value) }] });
 const failure = (code: string): CallToolResult => ({ isError: true, content: [{ type: "text", text: code }] });
+const refusal = (code: string): CallToolResult => ({ ...failure(code), content: [
+  { type: "text", text: code }, { type: "text", text: JSON.stringify({ phoneAdmission: { inputAttempted: false } }) }] });
 const safeError = (error: unknown) => error instanceof PolicyError ? error.code : "OPERATION_FAILED: inspect the receipt before retrying";
 
 export class Executor {
@@ -39,9 +44,13 @@ export class Executor {
   private captureClip = captureShortClip;
   private summarizer: ActivitySummarizer;
   private validators;
+  private latency: LatencyProfiles;
+  private delegation: DelegationHost;
   private maintenance: ReturnType<typeof setInterval>;
   constructor(private security: OwnerSecurity, private device: string, private client: Client, catalog: Tool[]) {
     this.journal = new ActivityJournal(security.directory);
+    this.ui = new UiInspector(this.adb, 1, 8000, security.config.uiSnapshotApps);
+    this.latency = new LatencyProfiles(this.journal, device);
     this.images = new ImageStore(security.directory);
     if (security.config.screenshotKeepsakes.enabled) this.keepsakes = new KeepsakeStore(security.directory, security.config.screenshotKeepsakes);
     const clips = security.config.shortClips;
@@ -52,22 +61,51 @@ export class Executor {
     this.summarizer = new ActivitySummarizer(this.journal, security.config.allowModelSummary);
     const provider = new AjvJsonSchemaValidator();
     this.validators = new Map(catalog.map(tool => [tool.name, provider.getValidator(tool.inputSchema)]));
-    this.maintenance = setInterval(() => { try { this.journal.maintain(); this.images.prune(); this.clips?.prune(); } catch { /* next admission fails closed */ } }, 60000);
+    this.delegation = new DelegationHost(security, this.journal, {
+      call: (name, args, current) => this.enqueue(name, args, current), idle: () => this.queued === 0,
+      imageAvailable: event => !event?.callerClaim?.private && this.images.available(event?.observation?.screenshot),
+      latency: app => this.latency.read(app),
+    });
+    this.maintenance = setInterval(() => {
+      try { this.journal.maintain(); this.images.prune(); this.clips?.prune(); } catch { /* next admission fails closed */ }
+      try { this.latency.prune(); } catch { /* optional derived cache */ }
+      try { this.delegation.prune(); } catch { /* bounded job admission reports unavailable */ }
+    }, 60000);
     this.maintenance.unref();
   }
   call(name: string, all: Record<string, any>): Promise<CallToolResult> {
+    return this.enqueue(name, all);
+  }
+  private enqueue(name: string, all: Record<string, any>, delegated?: () => boolean): Promise<CallToolResult> {
     try {
       boundedValue(all);
-      if (!this.validators.get(name)?.(all).valid) return Promise.resolve(failure("INVALID_ARGUMENTS"));
+      if (!this.validators.get(name)?.(all).valid) return Promise.resolve(refusal("INVALID_ARGUMENTS"));
       all = { ...canonicalArguments(name, all), ...(all.approval ? { approval: all.approval } : {}) };
-      if (this.queued >= LIMITS.queue) return Promise.resolve(failure("QUEUE_FULL: no input attempted"));
-    } catch (error) { return Promise.resolve(failure(safeError(error))); }
+      if (delegationNames.has(name)) return this.delegation.call(name, all);
+      if (name === "android_latency_profile") {
+        this.security.authorize(name, all);
+        const { context: ignored, ...query } = all;
+        const parsed = latencySchema.parse(query);
+        return Promise.resolve(json({ phoneLatency: this.latency.read(parsed.app, parsed.detail) }));
+      }
+      this.admitDuringDelegation(name, all, delegated);
+      if (this.queued >= LIMITS.queue) return Promise.resolve(refusal("QUEUE_FULL: no input attempted"));
+    } catch (error) { return Promise.resolve(refusal(safeError(error))); }
     const receivedAt = Date.now();
     this.queued++;
-    const run = () => withDeadline(Math.max(0, 25000 - (Date.now() - receivedAt)), () => this.execute(name, all));
+    const run = () => {
+      try { this.admitDuringDelegation(name, all, delegated); }
+      catch (error) { return refusal(safeError(error)); }
+      return withDeadline(Math.max(0, 25000 - (Date.now() - receivedAt)), () => this.execute(name, all, Date.now() - receivedAt));
+    };
     const result = this.queue.then(run, run).catch(error => failure(safeError(error)));
     this.queue = result.finally(() => { this.queued--; });
     return result;
+  }
+  private admitDuringDelegation(name: string, all: Record<string, any>, delegated?: () => boolean) {
+    if (delegated) { if (!delegated()) deny("DELEGATION_SUPERSEDED"); return; }
+    if (this.delegation.busy() && (!passiveTools.has(name) && !hostStorageTools.has(name)
+      || (name === "android_device_info" && all.wake))) deny("DELEGATION_OWNS_PHONE: stop and wait for handoffReady before direct UI access");
   }
   private guard(expectedPackage?: string) {
     requireAwake(this.adb, this.device);
@@ -81,7 +119,8 @@ export class Executor {
     this.security.url(expectedUrl);
     await captureChromePage(this.adb, this.device, { expectedUrl }, undefined, { url: value => this.security.url(value), verifyOnly: true });
   }
-  private async execute(name: string, all: Record<string, any>): Promise<CallToolResult> {
+  private async execute(name: string, all: Record<string, any>, queueMs = 0): Promise<CallToolResult> {
+    const workStart = performance.now();
     remainingTime();
     const history = name.startsWith("android_activity_");
     const archive = hostStorageTools.has(name);
@@ -101,14 +140,14 @@ export class Executor {
       if (clipTool) return { isError: true, ...json({ error: safeError(error), status: this.clipStatus() }) };
       if (archive && !this.security.config.screenshotKeepsakes.enabled) return { isError: true, ...json({ error: safeError(error),
         status: { enabled: false, maxBytes: this.security.config.screenshotKeepsakes.maxBytes, maxCount: this.security.config.screenshotKeepsakes.maxCount, usedBytes: null, count: null } }) };
-      return failure(safeError(error));
+      return refusal(safeError(error));
     }
     let eventId: number;
     try { eventId = this.journal.begin(name, all, context, archive ? "host-storage" : history ? "history" : status && !wake ? "status" : "phone", input ? requestId : undefined); }
     catch {
       // Storage pressure must not prevent recovery of an already executed action.
       if (history || (archive && !input)) eventId = 0;
-      else return failure("JOURNAL_UNAVAILABLE: no input attempted");
+      else return refusal("JOURNAL_UNAVAILABLE: no input attempted");
     }
     let result: CallToolResult = failure("OPERATION_FAILED"), observation: any = null, preparation: any = null;
     let hostStorage: any;
@@ -270,11 +309,13 @@ export class Executor {
     // No failure path performs a fallback UI read or repeats an input.
     if (!history && !archive && !observation) observation = { at: new Date().toISOString(), uiOmitted: "operation stopped; no fallback UI read" };
     if (observation && delay) observation.delay = delay;
+    if (observation) observation.preparation = preparation ?? { wakeRequested: false };
     const inline = clipTool ? false : boundResultImages(result, imageEventId, imageMaxEdge || DEFAULT_IMAGE_EDGE, imageMode === "deferred");
     if (observation?.screenshot) observation.screenshot.returnedInline = inline;
     if (!history && !archive) result.content.push({ type: "text", text: JSON.stringify({ phoneObservation: {
       at: observation.at, preparation, errors: observation.errors, uiOmitted: observation.uiOmitted,
       screenshot: observation.screenshot, screenshotOmitted: observation.screenshotOmitted, delay: observation.delay, metadataVerified: observation.metadataVerified,
+      timing: observation.timing, uiCapture: observation.uiCapture,
     } }) });
     try {
       if (eventId) this.journal.finish(eventId, policyDrift ? "policy_drift" : result.isError ? "error" : "completed", { result: { isError: !!result.isError, ...(history ? { historyRead: true } : {}) }, preparation, observation, ...(hostStorage ? { hostStorage } : {}) });
@@ -282,6 +323,11 @@ export class Executor {
       result.content.push({ type: "text", text: JSON.stringify({ phoneActivity: { eventId: eventId || null, ...(!eventId ? archive ? { storageReadNotRecorded: true } : { historyReadNotRecorded: true } : {}), ...(name === "android_activity_open" && args.receiptOnly ? {} : this.journal.context()) },
         ...(history || !eventId ? {} : { phoneReceipt: this.receipt(this.journal.open(eventId)) }) }) });
     } catch { result.content.push({ type: "text", text: "RECORD_FINALIZATION_FAILED: action may have run; do not replay" }); }
+    if (!history && !archive && !context.private) try {
+      this.latency.record({ eventId, at: observation.at, tool: name, observation, queueMs, workMs: performance.now() - workStart, failed: !!result.isError });
+      const notice = observation?.timing && this.latency.notice(observation.foregroundApp?.packageName, context);
+      if (notice) result.content.push({ type: "text", text: JSON.stringify({ phoneLatency: notice }) });
+    } catch { /* An auxiliary profile cannot change the action or its receipt. */ }
     return result;
   }
   private savedImage(entry: any, result: CallToolResult) {
@@ -310,5 +356,5 @@ export class Executor {
     return { enabled: config.enabled, storage: "owner-host", status: config.enabled ? "unavailable" : "disabled",
       cache: { ...config.cache, usedBytes: null, count: null }, keepsakes: { ...config.keepsakes, usedBytes: null, count: null } };
   }
-  async close() { clearInterval(this.maintenance); await this.queue; this.summarizer.stop(); this.journal.close(); }
+  async close() { clearInterval(this.maintenance); await this.delegation.close(); await this.queue; this.summarizer.stop(); this.journal.close(); }
 }

@@ -2,7 +2,9 @@
 
 Codex-E · `Stella-hash/phone_use_for_llm` · 2026-11-14.
 Status: source preview prepared for independent review; no binary/package release.
-Review base: `41651b77369033958d551a73d43f571fcd92cfb8`.
+Initial review base: `41651b77369033958d551a73d43f571fcd92cfb8`; updated by a
+normal merge from `main@169cbb79ee4fdef54852c766f9179f4927b9e53c` after Android
+PR #13 landed. The iOS source recipe is unchanged by that merge.
 Native input: `YueChen-C/iPhone-use@577d5f2d0ec5831ed6e3e5d9c3ae482ee1dc4f5c`
 plus ordered patches 0001–0037. The PR head identifies the integration revision.
 This page adds iOS evidence; it does not supersede the Android validation records.
@@ -40,9 +42,9 @@ successfully on the development Mac. Its native Git tree was
 | Isolated production-source Swift Testing | 115 tests in 14 suites passed |
 | Actual release Python protocol tests | 116 tests passed |
 | Release MCP handshake | Initialize, notifications, seven tools and ping passed; clean JSON-RPC stdout |
-| Android regression after dependency update | 138 tests: 133 passed, five skipped |
-| Android clean-start verification | Owner setup/approval, 31 authenticated tools, receipt recovery and private export passed with synthetic transport |
-| Android/Node production dependencies (`pnpm audit --prod`) | No known vulnerabilities reported after updating `fast-xml-parser` to 5.12.0; Python dependencies were not audited |
+| Android regression after merging current main | 168 tests: 163 passed, five skipped |
+| Android clean-start verification | Owner setup/approval, 36 authenticated tools, delegation disabled by default, passive latency, receipt recovery and private export passed with synthetic transport |
+| Android/Node production dependencies (`pnpm audit --prod`) | No known vulnerabilities reported with `fast-xml-parser` 5.12.0 (also supplied by current main); Python dependencies were not audited |
 
 The isolated native check replaces the test directory with the selected production
 source acceptance suites because the local CLT does not provide XCTest. It is
