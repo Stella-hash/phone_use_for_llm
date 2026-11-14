@@ -1,0 +1,223 @@
+diff --git a/Sources/iPhoneUse/Localization/StringsUI.swift b/Sources/iPhoneUse/Localization/StringsUI.swift
+index b50346f..d8efc44 100644
+--- a/Sources/iPhoneUse/Localization/StringsUI.swift
++++ b/Sources/iPhoneUse/Localization/StringsUI.swift
+@@ -41,6 +41,7 @@ struct StringsUI: LocalizedTable {
+     // Sidebar status line (PhoneControlView.swift)
+     let statusWaitingDevice: String
+     let statusWaitingBluetooth: String
++    let statusUSBPreviewOnly: String
+     let statusVerifyingScreen: String
+     let statusConnected: String
+     let statusPointerNotReady: String
+@@ -74,6 +75,7 @@ struct StringsUI: LocalizedTable {
+ 
+     // Canvas waiting message (PhoneControlView.swift)
+     let canvasWaitingText: String
++    let canvasWaitingUSBText: String
+ 
+     static var current: StringsUI { StringsUI(language: AppLanguageStore.shared.language) }
+ 
+@@ -107,6 +109,7 @@ struct StringsUI: LocalizedTable {
+         helpPower: "短按 iPhone 电源键，可锁屏；使用 Home 唤醒后仍需解锁",
+         statusWaitingDevice: "等待 iPhone 连接",
+         statusWaitingBluetooth: "等待蓝牙连接",
++        statusUSBPreviewOnly: "USB 模式 · 仅预览",
+         statusVerifyingScreen: "蓝牙已连接，画面身份待确认",
+         statusConnected: "已连接",
+         statusPointerNotReady: "指针尚未就绪",
+@@ -150,7 +153,8 @@ struct StringsUI: LocalizedTable {
+         },
+         overlayHelp:
+             "连接失败时，可打开 Mac「系统设置 → 蓝牙」检查状态及配对提示，再从 iPhone 重试。若找不到设备，请检查 Mac「隐私与安全性 → 蓝牙」中 iPhone Use 的权限。",
+-        canvasWaitingText: "等待 iPhone 画面…\n请解锁手机并确认已配对 Bluetooth")
++        canvasWaitingText: "等待 iPhone 画面…\n请解锁手机并确认已配对 Bluetooth",
++        canvasWaitingUSBText: "等待 iPhone 画面…\n请连接 USB 并解锁手机")
+ 
+     static let en = StringsUI(
+         quietBackgroundMode: "Quiet Background Mode",
+@@ -183,6 +187,7 @@ struct StringsUI: LocalizedTable {
+         helpPower: "Briefly press the iPhone power key to lock; Home can wake it, but unlocking is still required",
+         statusWaitingDevice: "Waiting for iPhone",
+         statusWaitingBluetooth: "Waiting for Bluetooth",
++        statusUSBPreviewOnly: "USB-only · Preview only",
+         statusVerifyingScreen: "Bluetooth connected; verifying screen identity",
+         statusConnected: "Connected",
+         statusPointerNotReady: "Pointer not ready yet",
+@@ -231,5 +236,6 @@ struct StringsUI: LocalizedTable {
+         },
+         overlayHelp:
+             "If pairing fails, open the Mac's System Settings → Bluetooth to check its state and pairing prompts, then retry from the iPhone. If the device is missing, check iPhone Use's Bluetooth permission in System Settings → Privacy & Security.",
+-        canvasWaitingText: "Waiting for iPhone screen…\nUnlock the phone and confirm Bluetooth is paired")
++        canvasWaitingText: "Waiting for iPhone screen…\nUnlock the phone and confirm Bluetooth is paired",
++        canvasWaitingUSBText: "Waiting for iPhone screen…\nConnect USB and unlock the phone")
+ }
+diff --git a/Sources/iPhoneUse/UI/ControlConnectionOverlay.swift b/Sources/iPhoneUse/UI/ControlConnectionOverlay.swift
+index 5c2cb7b..27e941a 100644
+--- a/Sources/iPhoneUse/UI/ControlConnectionOverlay.swift
++++ b/Sources/iPhoneUse/UI/ControlConnectionOverlay.swift
+@@ -2,15 +2,20 @@ import AppKit
+ import IOBluetooth
+ 
+ enum ControlConnectionStatus {
+-    case waitingForDevice, disconnected, unmatched, connecting, verifyingScreen, connected
++    case waitingForDevice, disconnected, unmatched, connecting, verifyingScreen, connected, usbPreviewOnly
+ 
+-    var showsOverlay: Bool { self != .connected && self != .verifyingScreen }
++    var showsOverlay: Bool { self != .connected && self != .verifyingScreen && self != .usbPreviewOnly }
++
++    func showsBluetoothGuidance(bluetoothEnabled: Bool) -> Bool {
++        bluetoothEnabled && self != .unmatched && self != .usbPreviewOnly
++    }
+ 
+     static func resolve(
+         hasScreen: Bool, hasMatchedHost: Bool, bluetoothState: DeviceBluetoothState,
+-        inputIsCurrent: Bool, inputIsReady: Bool, screenPermitsInput: Bool
++        inputIsCurrent: Bool, inputIsReady: Bool, screenPermitsInput: Bool, bluetoothEnabled: Bool = true
+     ) -> Self {
+         guard hasScreen else { return .waitingForDevice }
++        guard bluetoothEnabled else { return .usbPreviewOnly }
+         if !hasMatchedHost { return bluetoothState == .unmatched ? .unmatched : .disconnected }
+         if !screenPermitsInput { return .verifyingScreen }
+         if inputIsCurrent { return inputIsReady ? .connected : .connecting }
+@@ -25,7 +30,8 @@ final class ControlConnectionOverlay: NSView {
+     private static var cachedControllerName: String?
+     private static var controllerNameLoaded = false
+ 
+-    private let title = NSTextField(labelWithString: StringsUI.current.overlayNotConnectedTitle)
++    private let bluetoothEnabled = HIDPeripheral.shared.bluetoothEnabled
++    private let title = NSTextField(labelWithString: "")
+     private let message = NSTextField(wrappingLabelWithString: "")
+     private var hasConnected = false
+     private var lastStatus: ControlConnectionStatus = .disconnected
+@@ -46,7 +52,7 @@ final class ControlConnectionOverlay: NSView {
+         let stack = makeMessageStack(
+             card: card, icon: icon, instructions: instructions, help: help)
+         installConstraints(card: card, stack: stack, icon: icon, instructions: instructions, help: help)
+-        update(.disconnected)
++        update(bluetoothEnabled ? .disconnected : .waitingForDevice)
+     }
+ 
+     private func makeMessageCard() -> NSView {
+@@ -83,6 +89,7 @@ final class ControlConnectionOverlay: NSView {
+     }
+ 
+     private func pairingText() -> String {
++        guard bluetoothEnabled else { return "" }
+         let advertisedName = HIDPeripheral.shared.localName
+         // The advertising name does not give this app a separate Bluetooth
+         // identity. iOS may show the Mac's controller name instead. Resolve it
+@@ -92,6 +99,7 @@ final class ControlConnectionOverlay: NSView {
+     }
+ 
+     private func resolveControllerNameIfNeeded() {
++        guard bluetoothEnabled else { return }
+         let alreadyLoaded = Self.controllerNameLock.withLock { Self.controllerNameLoaded }
+         guard !alreadyLoaded else { return }
+         DispatchQueue.global(qos: .utility).async { [weak self] in
+@@ -109,7 +117,7 @@ final class ControlConnectionOverlay: NSView {
+     }
+ 
+     private func makeTroubleshootingLabel() -> NSTextField {
+-        let help = NSTextField(wrappingLabelWithString: StringsUI.current.overlayHelp)
++        let help = NSTextField(wrappingLabelWithString: bluetoothEnabled ? StringsUI.current.overlayHelp : "")
+         help.font = .systemFont(ofSize: 11)
+         help.textColor = .secondaryLabelColor
+         helpField = help
+@@ -157,8 +165,9 @@ final class ControlConnectionOverlay: NSView {
+         if status == .connected { hasConnected = true }
+         isHidden = !status.showsOverlay
+         let table = StringsUI.current
+-        instructionsField?.isHidden = status == .unmatched
+-        helpField?.isHidden = status == .unmatched
++        let showBluetoothGuidance = status.showsBluetoothGuidance(bluetoothEnabled: bluetoothEnabled)
++        instructionsField?.isHidden = !showBluetoothGuidance
++        helpField?.isHidden = !showBluetoothGuidance
+         switch status {
+         case .waitingForDevice:
+             title.stringValue = table.overlayWaitingTitle
+@@ -173,6 +182,9 @@ final class ControlConnectionOverlay: NSView {
+         case .unmatched:
+             title.stringValue = table.overlayUnmatchedTitle
+             message.stringValue = table.overlayUnmatchedMessage
++        case .usbPreviewOnly:
++            title.stringValue = table.statusUSBPreviewOnly
++            message.stringValue = ""
+         case .verifyingScreen, .connected:
+             break
+         }
+@@ -183,7 +195,7 @@ final class ControlConnectionOverlay: NSView {
+     func refreshLocalization() {
+         setAccessibilityLabel(StringsUI.current.overlayAccessibility)
+         instructionsField?.stringValue = pairingText()
+-        helpField?.stringValue = StringsUI.current.overlayHelp
++        helpField?.stringValue = bluetoothEnabled ? StringsUI.current.overlayHelp : ""
+         update(lastStatus)
+     }
+ 
+diff --git a/Sources/iPhoneUse/UI/PhoneControlView.swift b/Sources/iPhoneUse/UI/PhoneControlView.swift
+index e25aab2..462467b 100644
+--- a/Sources/iPhoneUse/UI/PhoneControlView.swift
++++ b/Sources/iPhoneUse/UI/PhoneControlView.swift
+@@ -256,7 +256,9 @@ final class PhoneControlView: NSView {
+         let table = StringsUI.current
+         var available: Set<ControlShortcut> = []
+         let status: String
+-        if connectionStatus == .verifyingScreen {
++        if connectionStatus == .usbPreviewOnly {
++            status = table.statusUSBPreviewOnly
++        } else if connectionStatus == .verifyingScreen {
+             status = table.statusVerifyingScreen
+         } else if connectionStatus != .connected {
+             status =
+@@ -325,7 +327,8 @@ final class PhoneControlView: NSView {
+         device = current
+         // Matching an unknown Bluetooth host can probe several screens. Resolve
+         // it outside AppKit and keep only one outstanding attempt per window.
+-        if input == nil, let current, let request = binding.beginInputRequest(at: Date()) {
++        if HIDPeripheral.shared.bluetoothEnabled, input == nil, let current,
++            let request = binding.beginInputRequest(at: Date()) {
+             inputQueue.async { [weak self] in
+                 let resolved = Self.resolveInput(for: current)
+                 DispatchQueue.main.async { [weak self] in
+@@ -370,7 +373,7 @@ final class PhoneControlView: NSView {
+             bluetoothState: device?.bluetoothState ?? .disconnected,
+             inputIsCurrent: input?.isCurrentSession == true, inputIsReady: input?.isBluetoothReady == true,
+             screenPermitsInput: device.map { ScreenCaptureManager.shared.permitsPointerAssociation(for: $0.screen) }
+-                ?? false)
++                ?? false, bluetoothEnabled: HIDPeripheral.shared.bluetoothEnabled)
+         guard connectionStatus != status else { return }
+         cancelInteraction()
+         if status != .connected { input?.invalidatePointerEstimate() }
+@@ -601,7 +604,8 @@ private enum ControlScreenRenderer {
+ 
+     static func drawWaitingMessage(in bounds: CGRect) {
+         // Read per draw so the 30 Hz repaint picks up a language change at once.
+-        let text = StringsUI.current.canvasWaitingText
++        let table = StringsUI.current
++        let text = HIDPeripheral.shared.bluetoothEnabled ? table.canvasWaitingText : table.canvasWaitingUSBText
+         let style = NSMutableParagraphStyle()
+         style.alignment = .center
+         let attributes: [NSAttributedString.Key: Any] = [
+diff --git a/Tests/iPhoneUseTests/UI/ControlConnectionStatusTests.swift b/Tests/iPhoneUseTests/UI/ControlConnectionStatusTests.swift
+index 15052af..c72faae 100644
+--- a/Tests/iPhoneUseTests/UI/ControlConnectionStatusTests.swift
++++ b/Tests/iPhoneUseTests/UI/ControlConnectionStatusTests.swift
+@@ -3,6 +3,17 @@ import XCTest
+ @testable import iPhoneUse
+ 
+ final class ControlConnectionStatusTests: XCTestCase {
++    func testUSBOnlyScreenIsPreviewWithoutBluetoothPairingGuidance() {
++        let status = ControlConnectionStatus.resolve(
++            hasScreen: true, hasMatchedHost: false, bluetoothState: .disconnected,
++            inputIsCurrent: false, inputIsReady: false, screenPermitsInput: false, bluetoothEnabled: false)
++        XCTAssertEqual(status, .usbPreviewOnly)
++        XCTAssertFalse(status.showsOverlay)
++        XCTAssertFalse(status.showsBluetoothGuidance(bluetoothEnabled: false))
++        XCTAssertFalse(ControlConnectionStatus.waitingForDevice.showsBluetoothGuidance(bluetoothEnabled: false))
++        XCTAssertTrue(ControlConnectionStatus.disconnected.showsBluetoothGuidance(bluetoothEnabled: true))
++    }
++
+     func testSurvivingBluetoothAssociationPausesForCaptureWithoutShowingPairingOverlay() {
+         let status = ControlConnectionStatus.resolve(
+             hasScreen: true, hasMatchedHost: true, bluetoothState: .connected,

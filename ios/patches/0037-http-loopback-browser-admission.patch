@@ -1,0 +1,370 @@
+diff --git a/Sources/iPhoneUse/API/HTTPServer.swift b/Sources/iPhoneUse/API/HTTPServer.swift
+index 5b087aa..c6c18fc 100644
+--- a/Sources/iPhoneUse/API/HTTPServer.swift
++++ b/Sources/iPhoneUse/API/HTTPServer.swift
+@@ -7,45 +7,122 @@ struct HTTPRequest {
+     let path: String
+     let query: [String: String]
+     let body: [String: Any]
++    let headers: [String: String]
++
++    init(method: String, path: String, query: [String: String], body: [String: Any], headers: [String: String] = [:]) {
++        self.method = method; self.path = path; self.query = query; self.body = body; self.headers = headers
++    }
++
++    enum Decoded {
++        case incomplete
++        case request(HTTPRequest)
++        case invalid(String)
++    }
++
++    static let maximumHeaderBytes = 32 * 1024
++    static let maximumBodyBytes = 8 * 1024 * 1024
+ 
+     /// Returns nil until a request header and its declared body are available.
+     /// The server handles one request per connection, so trailing bytes are ignored.
+     static func parse(_ data: Data) -> HTTPRequest? {
+-        guard let separator = data.range(of: Data("\r\n\r\n".utf8)),
++        if case let .request(request) = decode(data) { return request }
++        return nil
++    }
++
++    static func decode(_ data: Data) -> Decoded {
++        guard let separator = data.range(of: Data("\r\n\r\n".utf8)) else {
++            return data.count > maximumHeaderBytes ? .invalid("HTTP headers exceed the byte limit") : .incomplete
++        }
++        guard separator.upperBound <= maximumHeaderBytes,
+             let header = String(data: data[..<separator.lowerBound], encoding: .utf8)
+-        else { return nil }
++        else { return .invalid("Invalid or oversized HTTP headers") }
+ 
+         let lines = header.components(separatedBy: "\r\n")
+         let requestLine = lines[0].split(separator: " ")
+-        guard requestLine.count >= 2 else { return nil }
++        guard requestLine.count == 3, ["HTTP/1.0", "HTTP/1.1"].contains(String(requestLine[2])),
++            requestLine[0].utf8.allSatisfy({ (65...90).contains($0) })
++        else { return .invalid("Invalid HTTP request line") }
++
++        // Security-relevant singleton headers must never use last-value-wins.
++        let singletons: Set<String> = ["host", "origin", "content-length", "content-type", "transfer-encoding",
++                                       "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest"]
++        let tokenPunctuation = Set("!#$%&'*+-.^_`|~".utf8)
++        var headers: [String: String] = [:]
++        for line in lines.dropFirst() {
++            guard let colon = line.firstIndex(of: ":") else { return .invalid("Malformed HTTP header") }
++            let name = String(line[..<colon]).lowercased()
++            guard !name.isEmpty, name.utf8.allSatisfy({ byte in
++                (97...122).contains(byte) || (48...57).contains(byte) || tokenPunctuation.contains(byte)
++            }) else { return .invalid("Malformed HTTP header name") }
++            let rawValue = line[line.index(after: colon)...]
++            guard !rawValue.utf8.contains(where: { $0 == 127 || ($0 < 32 && $0 != 9) }) else {
++                return .invalid("Malformed HTTP header value")
++            }
++            let value = rawValue.trimmingCharacters(in: .whitespaces)
++            if let previous = headers[name] {
++                guard !singletons.contains(name) else { return .invalid("Duplicate HTTP singleton header") }
++                headers[name] = previous + ", " + value
++            } else { headers[name] = value }
++        }
++        guard headers["transfer-encoding"] == nil else { return .invalid("Transfer-Encoding is unsupported") }
++
++        let length: Int
++        if let value = headers["content-length"] {
++            guard !value.isEmpty, value.utf8.allSatisfy({ (48...57).contains($0) }),
++                let count = Int(value), count <= maximumBodyBytes
++            else { return .invalid("Invalid or oversized Content-Length") }
++            length = count
++        } else { length = 0 }
+ 
+-        let length = contentLength(in: lines.dropFirst())
+         let bodyStart = separator.upperBound
+-        guard data.count - bodyStart >= length else { return nil }
++        guard data.count - bodyStart >= length else { return .incomplete }
+         let bodyData = data[bodyStart..<(bodyStart + length)]
+-        // Non-object or invalid JSON has historically been treated as an empty body.
+-        let body = (try? JSONSerialization.jsonObject(with: bodyData)) as? [String: Any] ?? [:]
++        let body: [String: Any]
++        if length > 0 {
++            guard let object = (try? JSONSerialization.jsonObject(with: bodyData)) as? [String: Any] else {
++                return .invalid("HTTP body must be a JSON object")
++            }
++            body = object
++        } else {
++            guard requestLine[0] != "POST" else { return .invalid("POST requires a JSON object body") }
++            body = [:]
++        }
+ 
+         let target = String(requestLine[1])
+-        let components = URLComponents(string: target)
++        guard target.hasPrefix("/"), !target.hasPrefix("//"),
++            !target.utf8.contains(where: { $0 < 33 || $0 == 127 }),
++            let components = URLComponents(string: target), components.scheme == nil,
++            components.host == nil, components.fragment == nil
++        else { return .invalid("HTTP request target must be an origin-form path") }
+         var query: [String: String] = [:]
+-        for item in components?.queryItems ?? [] {
++        for item in components.queryItems ?? [] {
+             // Repeated keys use the last value; a key without '=' has an empty value.
+             query[item.name] = item.value ?? ""
+         }
+-        return HTTPRequest(
+-            method: String(requestLine[0]), path: components?.path ?? target, query: query, body: body)
++        return .request(HTTPRequest(
++            method: String(requestLine[0]), path: components.path, query: query, body: body, headers: headers))
+     }
+ 
+-    private static func contentLength(in headerLines: ArraySlice<String>) -> Int {
+-        var length = 0
+-        for line in headerLines {
+-            let pair = line.split(separator: ":", maxSplits: 1)
+-            if pair.count == 2, pair[0].lowercased() == "content-length" {
+-                length = Int(pair[1].trimmingCharacters(in: .whitespaces)) ?? 0
++    /// Browser-origin admission, not authentication of local processes. Native
++    /// MCP sends no Origin and uses JSON POST bodies; the viewer is same-origin.
++    func rejection(listeningPort: UInt16) -> HTTPResponse? {
++        guard let authority = headers["host"]?.lowercased(),
++            ["127.0.0.1:\(listeningPort)", "localhost:\(listeningPort)"].contains(authority)
++        else { return .rejectedRequest("A loopback Host with the listening port is required", status: 403) }
++        if let origin = headers["origin"], origin.lowercased() != "http://\(authority)" {
++            return .rejectedRequest("Cross-origin HTTP requests are not allowed", status: 403)
++        }
++        if let site = headers["sec-fetch-site"], !["same-origin", "none"].contains(site) {
++            return .rejectedRequest("Cross-site HTTP requests are not allowed", status: 403)
++        }
++        if method == "POST" {
++            let mediaType = headers["content-type"]?.split(separator: ";", maxSplits: 1).first?
++                .trimmingCharacters(in: .whitespaces).lowercased()
++            guard mediaType == "application/json" else {
++                return .rejectedRequest("POST requires application/json", status: 415)
+             }
+         }
+-        return length
++        return nil
+     }
+ }
+ 
+@@ -64,6 +141,10 @@ struct HTTPResponse {
+         json(["error": message], status: status)
+     }
+ 
++    static func rejectedRequest(_ message: String, status: Int = 400) -> HTTPResponse {
++        json(["error": message, "input_sent": false], status: status)
++    }
++
+     /// Encodes exactly one response. The transport closes the connection after sending it.
+     var serialized: Data {
+         var header = "HTTP/1.1 \(status) \(Self.reason(status))\r\n"
+@@ -77,8 +158,10 @@ struct HTTPResponse {
+         switch status {
+         case 200: "OK"
+         case 400: "Bad Request"
++        case 403: "Forbidden"
+         case 404: "Not Found"
+         case 409: "Conflict"
++        case 415: "Unsupported Media Type"
+         case 503: "Service Unavailable"
+         default: "Error"
+         }
+@@ -124,17 +207,31 @@ final class HTTPServer {
+             guard let self else { return }
+             var buffer = buffer
+             if let data { buffer.append(data) }
+-            if let request = HTTPRequest.parse(buffer) {
+-                let response = self.handler(request)
+-                self.send(response, on: connection)
+-            } else if done || error != nil || buffer.count > 8 << 20 {
+-                connection.cancel()
+-            } else {
+-                self.receive(connection, buffer: buffer)
++            switch HTTPRequest.decode(buffer) {
++            case let .request(request):
++                self.send(Self.response(to: request, listeningPort: self.port.rawValue, handler: self.handler), on: connection)
++            case let .invalid(reason):
++                self.send(.rejectedRequest(reason), on: connection)
++            case .incomplete:
++                if done || error != nil || buffer.count > HTTPRequest.maximumHeaderBytes + HTTPRequest.maximumBodyBytes {
++                    connection.cancel()
++                } else { self.receive(connection, buffer: buffer) }
+             }
+         }
+     }
+ 
++    /// Keep admission outside ControlAPI so rejected network traffic cannot
++    /// wake capture or reach even diagnostic/legacy handlers.
++    static func response(
++        to request: HTTPRequest, listeningPort: UInt16, handler: (HTTPRequest) -> HTTPResponse
++    ) -> HTTPResponse {
++        var response = request.rejection(listeningPort: listeningPort) ?? handler(request)
++        response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
++        response.headers["X-Content-Type-Options"] = "nosniff"
++        response.headers["X-Frame-Options"] = "DENY"
++        return response
++    }
++
+     private func send(_ response: HTTPResponse, on connection: NWConnection) {
+         connection.send(
+             content: response.serialized,
+diff --git a/Tests/iPhoneUseTests/API/HTTPAPITests.swift b/Tests/iPhoneUseTests/API/HTTPAPITests.swift
+index 22f4f08..6e2de5f 100644
+--- a/Tests/iPhoneUseTests/API/HTTPAPITests.swift
++++ b/Tests/iPhoneUseTests/API/HTTPAPITests.swift
+@@ -34,19 +34,21 @@ final class HTTPMessageTests: XCTestCase {
+         XCTAssertTrue(request.body.isEmpty)
+     }
+ 
+-    func testContentLengthIsCaseInsensitiveAndLastHeaderWins() throws {
++    func testDuplicateContentLengthIsRejectedEvenWithDifferentCase() throws {
+         let data = Data("POST /type HTTP/1.1\r\nContent-Length: 900\r\ncOnTeNt-LeNgTh: 2\r\n\r\n{}ignored".utf8)
+-        let request = try XCTUnwrap(HTTPRequest.parse(data))
+-        XCTAssertTrue(request.body.isEmpty)
++        guard case .invalid = HTTPRequest.decode(data) else { return XCTFail("duplicate length must fail explicitly") }
++        let valid = Data("POST /type HTTP/1.1\r\ncOnTeNt-LeNgTh: 2\r\n\r\n{}ignored".utf8)
++        XCTAssertTrue(try XCTUnwrap(HTTPRequest.parse(valid)).body.isEmpty)
+     }
+ 
+-    func testInvalidLengthsAndNonObjectJSONKeepTheExistingEmptyBodyFallback() throws {
+-        let invalidLength = Data("POST /type HTTP/1.1\r\nContent-Length: invalid\r\n\r\n".utf8)
+-        XCTAssertTrue(try XCTUnwrap(HTTPRequest.parse(invalidLength)).body.isEmpty)
+-
+-        for body in ["[1,2]", "broken"] {
++    func testInvalidLengthsAndNonObjectJSONFailInsteadOfBecomingEmptyInput() throws {
++        for length in ["invalid", "-1", "+2", "9999999999999999999999999999", "8388609"] {
++            let data = Data("POST /type HTTP/1.1\r\nContent-Length: \(length)\r\n\r\n".utf8)
++            guard case .invalid = HTTPRequest.decode(data) else { return XCTFail("invalid length must be rejected") }
++        }
++        for body in ["[1,2]", "broken", "null", ""] {
+             let data = Data("POST /type HTTP/1.1\r\nContent-Length: \(body.utf8.count)\r\n\r\n\(body)".utf8)
+-            XCTAssertTrue(try XCTUnwrap(HTTPRequest.parse(data)).body.isEmpty)
++            guard case .invalid = HTTPRequest.decode(data) else { return XCTFail("invalid POST body must be rejected") }
+         }
+     }
+ 
+diff --git a/Tests/iPhoneUseTests/API/HTTPBoundaryTests.swift b/Tests/iPhoneUseTests/API/HTTPBoundaryTests.swift
+new file mode 100644
+index 0000000..a0c8f30
+--- /dev/null
++++ b/Tests/iPhoneUseTests/API/HTTPBoundaryTests.swift
+@@ -0,0 +1,123 @@
++import Foundation
++import Testing
++@testable import iPhoneUse
++
++struct HTTPBoundaryTests {
++    private func wire(_ method: String = "GET", _ path: String = "/viewer",
++                      headers: [String] = ["Host: 127.0.0.1:7390"], body: String? = nil) -> Data {
++        let length = body.map { ["Content-Length: \($0.utf8.count)"] } ?? []
++        return Data((["\(method) \(path) HTTP/1.1"] + headers + length).joined(separator: "\r\n").utf8)
++            + Data("\r\n\r\n\(body ?? "")".utf8)
++    }
++
++    private func response(_ data: Data, expected: Int, calls: Int) throws {
++        let request = try #require(HTTPRequest.parse(data))
++        var dispatched = 0
++        let result = HTTPServer.response(to: request, listeningPort: 7390) { _ in
++            dispatched += 1
++            return .json(["synthetic": true])
++        }
++        #expect(result.status == expected)
++        #expect(dispatched == calls)
++        #expect(result.headers["Cross-Origin-Resource-Policy"] == "same-origin")
++        #expect(result.headers["X-Content-Type-Options"] == "nosniff")
++        if calls == 0 {
++            let body = try #require(try JSONSerialization.jsonObject(with: result.body) as? [String: Any])
++            #expect(body["input_sent"] as? Bool == false)
++        }
++    }
++
++    @Test func nativeJSONAndSameOriginViewerReachTheHandler() throws {
++        try response(wire(), expected: 200, calls: 1)
++        try response(wire("GET", "/screenshot", headers: ["Host: 127.0.0.1:7390",
++            "Origin: http://127.0.0.1:7390", "Sec-Fetch-Site: same-origin"]), expected: 200, calls: 1)
++        try response(wire("GET", "/viewer", headers: ["Host: localhost:7390",
++            "Origin: http://localhost:7390", "Sec-Fetch-Site: none"]), expected: 200, calls: 1)
++        try response(wire("POST", "/home", headers: ["Host: 127.0.0.1:7390",
++            "Content-Type: application/json; charset=utf-8"], body: "{}"), expected: 200, calls: 1)
++    }
++
++    @Test func crossOriginSimpleJSONNeverDispatchesInput() throws {
++        for origin in ["https://example.invalid", "null", "http://localhost:7390",
++                       "http://127.0.0.1:7391", "http://127.0.0.1:7390/path"] {
++            try response(wire("POST", "/type", headers: ["Host: 127.0.0.1:7390",
++                "Origin: \(origin)", "Content-Type: text/plain"], body: #"{"text":"synthetic"}"#),
++                expected: 403, calls: 0)
++        }
++    }
++
++    @Test func nonJSONInputAndCrossSiteMetadataNeverReachTheHandler() throws {
++        for contentType in ["text/plain", "application/x-www-form-urlencoded", "multipart/form-data"] {
++            try response(wire("POST", "/home", headers: ["Host: 127.0.0.1:7390",
++                "Content-Type: \(contentType)"], body: "{}"), expected: 415, calls: 0)
++        }
++        try response(wire("POST", "/home", body: "{}"), expected: 415, calls: 0)
++        for site in ["cross-site", "same-site", "unexpected"] {
++            try response(wire("GET", "/screenshot", headers: ["Host: 127.0.0.1:7390",
++                "Sec-Fetch-Site: \(site)"]), expected: 403, calls: 0)
++        }
++    }
++
++    @Test func hostMustBeLiteralLoopbackWithTheActualListeningPort() throws {
++        for host in ["example.invalid:7390", "127.0.0.1:7391", "127.0.0.1", "127.1:7390",
++                     "[::1]:7390", "localhost:7390.example.invalid", "127.0.0.1:7390, example.invalid"] {
++            try response(wire(headers: ["Host: \(host)"]), expected: 403, calls: 0)
++        }
++        try response(wire(headers: []), expected: 403, calls: 0)
++        let request = try #require(HTTPRequest.parse(wire(headers: ["Host: localhost:7400"])))
++        #expect(request.rejection(listeningPort: 7400) == nil)
++        #expect(request.rejection(listeningPort: 7390)?.status == 403)
++    }
++
++    @Test func duplicateSingletonHeadersAndMalformedLinesAreExplicitFailures() {
++        for name in ["Host", "Origin", "Content-Length", "Content-Type", "Sec-Fetch-Site", "Sec-Fetch-Mode", "Sec-Fetch-Dest"] {
++            let data = wire(headers: ["\(name): value", "\(name.lowercased()): value"])
++            guard case .invalid = HTTPRequest.decode(data) else {
++                Issue.record("Duplicate \(name) was not rejected"); continue
++            }
++        }
++        for header in ["Host : 127.0.0.1:7390", " Host: 127.0.0.1:7390", "MissingColon",
++                       "Origin: null\u{0}", "Transfer-Encoding: chunked"] {
++            guard case .invalid = HTTPRequest.decode(wire(headers: [header])) else {
++                Issue.record("Malformed header was not rejected"); continue
++            }
++        }
++    }
++
++    @Test func badLengthsAndNonObjectBodiesNeverBecomeEmptyInput() {
++        for length in ["-1", "+2", "1.5", "bad", "9999999999999999999999999", "8388609"] {
++            let data = wire("POST", "/home", headers: ["Content-Length: \(length)"])
++            guard case .invalid = HTTPRequest.decode(data) else {
++                Issue.record("Invalid Content-Length was not rejected"); continue
++            }
++        }
++        for body in ["", "broken", "null", "[]", "42"] {
++            guard case .invalid = HTTPRequest.decode(wire("POST", "/home", body: body)) else {
++                Issue.record("Invalid JSON body was not rejected"); continue
++            }
++        }
++    }
++
++    @Test func fragmentedUTF8AndValidDuplicateQueryBehaviorRemainSupported() throws {
++        let data = wire("POST", "/type?device=first&device=last&flag",
++                        headers: ["hOsT: 127.0.0.1:7390", "Content-Type: application/json"], body: #"{"text":"你好"}"#)
++        guard case .incomplete = HTTPRequest.decode(Data(data.dropLast())) else {
++            Issue.record("Fragmented body was not retained"); return
++        }
++        let request = try #require(HTTPRequest.parse(data))
++        #expect(request.body["text"] as? String == "你好")
++        #expect(request.query == ["device": "last", "flag": ""])
++        #expect(request.rejection(listeningPort: 7390) == nil)
++        #expect(HTTPRequest.parse(data + Data("ignored next request".utf8)) != nil)
++    }
++
++    @Test func malformedTargetsAndOversizedHeadersFailBeforeDispatch() {
++        for target in ["http://example.invalid/type", "//example.invalid/type", "/type#fragment"] {
++            guard case .invalid = HTTPRequest.decode(wire("POST", target, body: "{}")) else {
++                Issue.record("Non-origin-form target was not rejected"); continue
++            }
++        }
++        let data = Data(repeating: 65, count: HTTPRequest.maximumHeaderBytes + 1)
++        guard case .invalid = HTTPRequest.decode(data) else { Issue.record("Oversized header was not rejected"); return }
++    }
++}

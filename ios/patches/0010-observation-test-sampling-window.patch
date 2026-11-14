@@ -1,0 +1,43 @@
+diff --git a/Tests/PythonTests/test_mcp_stdio.py b/Tests/PythonTests/test_mcp_stdio.py
+index 80828e2..eced8ab 100644
+--- a/Tests/PythonTests/test_mcp_stdio.py
++++ b/Tests/PythonTests/test_mcp_stdio.py
+@@ -420,18 +420,34 @@ class MCPStdioTests(unittest.TestCase):
+         self.assertFalse(observation["fresh"])
+         self.assertGreaterEqual(observation["elapsed_ms"], 500)
+         sequence = [0]
++        posted = threading.Event()
++        fresh_times = []
++        self.server.before_post = lambda body: posted.set()
+ 
+         def fresh(path):
+             sequence[0] += 1
+-            return capture_reply(0, sequence[0], capture_uptime())
++            if posted.is_set() and not fresh_times:
++                # A bounded first-frame delay leaves too few samples in a 0.5s
++                # window. Fresh pixels alone do not establish the required 160ms
++                # stability span; allow the normal observation budget to do so.
++                time.sleep(0.28)
++            received_at = capture_uptime()
++            if posted.is_set():
++                fresh_times.append(received_at)
++            return capture_reply(0, sequence[0], received_at)
+ 
+         self.server.screenshot_response = fresh
+-        unchanged = self.exchange([("home", {"observation_timeout": 0.5})])[0]
++        unchanged = self.exchange([("home", {"observation_timeout": 1.5})])[0]
+         observation = unchanged["structuredContent"]["observation"]
+-        self.assertEqual(observation["status"], "stable")
++        evidence = {"observation": observation, "post_action_frame_times": fresh_times}
++        self.assertGreaterEqual(len(fresh_times), 2, evidence)
++        self.assertGreaterEqual(fresh_times[-1] - fresh_times[0], 0.16, evidence)
++        self.assertEqual(observation["status"], "stable", evidence)
+         self.assertTrue(observation["fresh"])
++        self.assertTrue(observation["visually_stable"])
+         self.assertFalse(observation["changed_from_baseline"])
+-        self.assertGreaterEqual(observation["elapsed_ms"], 500)
++        self.assertGreaterEqual(observation["elapsed_ms"], 1500)
++        self.assertEqual(observation["frame"]["sequence"], str(sequence[0]))
+         self.assertEqual(sum(event[0] == "POST" for event in self.server.events), 2)
+ 
+     def test_failed_capture_does_not_turn_acknowledged_input_into_a_retryable_action_error(self):

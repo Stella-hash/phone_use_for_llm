@@ -1,0 +1,2917 @@
+diff --git a/Sources/iPhoneUse/API/ControlAPI.swift b/Sources/iPhoneUse/API/ControlAPI.swift
+index 6858bd2..df06d50 100644
+--- a/Sources/iPhoneUse/API/ControlAPI.swift
++++ b/Sources/iPhoneUse/API/ControlAPI.swift
+@@ -37,6 +37,7 @@ enum ControlAPI {
+         activity: QuietModeActivityController = .shared,
+         pointerTrace: PointerTraceWindow = HIDPointerTrace.window
+     ) -> HTTPResponse {
++        if USBControlAPI.isConfigured { return USBControlAPI.handle(request) }
+         // This diagnostic must not wake capture, discover devices or rebuild input.
+         // Keep it ahead of requestStarted(), including malformed requests.
+         if request.path == "/diagnostics/pointer-trace" {
+@@ -341,6 +342,7 @@ enum ControlAPI {
+         references: ScreenshotReferences = .shared
+     ) -> [String: String] {
+         var headers = [
++            "Cache-Control": "no-store",
+             "X-Device": device,
+             "X-Screen-Width": "\(Int(screenSize.width))", "X-Screen-Height": "\(Int(screenSize.height))",
+             "X-Image-Width": "\(imageSize.0)", "X-Image-Height": "\(imageSize.1)",
+@@ -775,7 +777,7 @@ struct ActRequest {
+                 let request = try KeyRequest(step)
+                 if directKeyboardConfigured { plannedBudget += programmedSeconds(try CoreDeviceKeyboardProgram.key(request).samples) }
+             case "home":
+-                if directKeyboardConfigured { plannedBudget += programmedSeconds(try CoreDeviceKeyboardProgram.home().samples) }
++                if directKeyboardConfigured { plannedBudget += try CoreDeviceKeyboardProgram.home().programmedSeconds }
+             default: break
+             }
+             if type == "delay" || type == "wait_text" {
+diff --git a/Sources/iPhoneUse/API/HTTPServer.swift b/Sources/iPhoneUse/API/HTTPServer.swift
+index c6c18fc..6ed0507 100644
+--- a/Sources/iPhoneUse/API/HTTPServer.swift
++++ b/Sources/iPhoneUse/API/HTTPServer.swift
+@@ -129,7 +129,7 @@ struct HTTPRequest {
+ struct HTTPResponse {
+     var status: Int = 200
+     var contentType = "application/json"
+-    var headers: [String: String] = [:]
++    var headers: [String: String] = ["Cache-Control": "no-store"]
+     var body = Data()
+ 
+     static func json(_ object: Any, status: Int = 200) -> HTTPResponse {
+@@ -150,6 +150,9 @@ struct HTTPResponse {
+         var header = "HTTP/1.1 \(status) \(Self.reason(status))\r\n"
+         header += "Content-Type: \(contentType)\r\nContent-Length: \(body.count)\r\nConnection: close\r\n"
+         for (name, value) in headers { header += "\(name): \(value)\r\n" }
++        if !headers.keys.contains(where: { $0.caseInsensitiveCompare("Cache-Control") == .orderedSame }) {
++            header += "Cache-Control: no-store\r\n"
++        }
+         header += "\r\n"
+         return Data(header.utf8) + body
+     }
+diff --git a/Sources/iPhoneUse/API/ScreenshotReferences.swift b/Sources/iPhoneUse/API/ScreenshotReferences.swift
+index e25e552..fade549 100644
+--- a/Sources/iPhoneUse/API/ScreenshotReferences.swift
++++ b/Sources/iPhoneUse/API/ScreenshotReferences.swift
+@@ -85,6 +85,23 @@ final class ScreenshotReferences {
+     /// A valid selected-device token is consumed once, including failed attempts.
+     /// A new observation is the recovery path; this never replays an input.
+     func consume(_ raw: Any, device: String, source: String, screenSize: CGSize?) throws -> Reference {
++        try take(raw, device: device) { reference in
++            try Self.validate(reference, device: device, source: source, screenSize: screenSize)
++        }
++    }
++
++    /// USB screenshots already come from the physical target. The owned touch
++    /// helper checks current native dimensions after opening that same UDID and
++    /// before commit; no AV capture geometry is consulted or guessed here.
++    func consumeUSB(_ raw: Any, device: String, source: String) throws -> Reference {
++        try take(raw, device: device) { reference in
++            guard source.hasPrefix("coredevice-usb:"), reference.source == source else {
++                throw Rejected("physical USB attachment changed; observe again")
++            }
++        }
++    }
++
++    private func take(_ raw: Any, device: String, validate: (Reference) throws -> Void) throws -> Reference {
+         lock.lock()
+         defer { lock.unlock() }
+         guard let id = raw as? String, let reference = references[id] else {
+@@ -93,7 +110,7 @@ final class ScreenshotReferences {
+         guard reference.device == device else { throw Rejected("frame_id belongs to another device") }
+         references.removeValue(forKey: id)
+         order.removeAll { $0 == id }
+-        try Self.validate(reference, device: device, source: source, screenSize: screenSize)
++        try validate(reference)
+         return reference
+     }
+ 
+diff --git a/Sources/iPhoneUse/API/USBControlAPI.swift b/Sources/iPhoneUse/API/USBControlAPI.swift
+new file mode 100644
+index 0000000..a73d85b
+--- /dev/null
++++ b/Sources/iPhoneUse/API/USBControlAPI.swift
+@@ -0,0 +1,145 @@
++import Foundation
++
++/// The managed USB surface has one identity, selected before any helper starts.
++/// It deliberately does not dispatch through the legacy AV/BLE device registry.
++enum USBControlAPI {
++    static var isConfigured: Bool {
++        let env = ProcessInfo.processInfo.environment
++        return env[USBScreenCapture.helperKey] != nil || env[CoreDeviceTouch.helperKey] != nil
++            || env[CoreDeviceKeyboard.helperKey] != nil || DeviceClipboard.isConfigured(environment: env)
++    }
++
++    struct Dependencies {
++        var environment = ProcessInfo.processInfo.environment
++        var pin: () -> USBValeriaConfigurator.PinnedUSBDevice? = USBValeriaConfigurator.currentSingleIOSDeviceIdentity
++        var capture: ([String: String]) throws -> Data = USBScreenCapture.capture
++        var keyboard: (CoreDeviceKeyboardProgram, String, [String: String], () throws -> Void,
++            (() throws -> Void)?) throws -> [String: Any] = { program, device, env, before, clipboard in
++                try CoreDeviceKeyboard.perform(program, device: device, environment: env,
++                    beforeCommit: before, clipboard: clipboard)
++            }
++        var touch: (TouchSequenceRequest, ScreenshotReferences.Reference, [String: String],
++            (DeviceDisplayMapping) throws -> Void) throws -> [String: Any] = { program, reference, env, before in
++                try CoreDeviceTouch.perform(program, reference: reference, environment: env, beforeCommit: before)
++            }
++        var clipboard: (String, [String: String], () throws -> Void) throws -> Void = { text, env, before in
++            try DeviceClipboard.write(text, environment: env, beforeWrite: before)
++        }
++        var references = ScreenshotReferences.shared
++    }
++
++    private static let sequenceLock = NSLock()
++    private static var sequence: UInt64 = 0
++
++    static func handle(_ request: HTTPRequest, dependencies d: Dependencies = Dependencies()) -> HTTPResponse {
++        if request.method == "GET", ["/viewer", "/viewer/"].contains(request.path) {
++            return WebPreview.response(for: request.query["lang"].flatMap(AppLanguage.init(rawValue:))
++                ?? AppLanguageStore.shared.language)
++        }
++        if request.method == "GET", request.path == "/config" {
++            return .json(["language": AppLanguageStore.shared.language.rawValue])
++        }
++        do {
++            let binding = try USBDeviceBinding.resolve(environment: d.environment, pin: d.pin)
++            let query = ControlAPI.deviceSelector(body: request.body, query: request.query)
++            guard query == nil || query == binding.deviceID else {
++                throw InputRequestError("This host accepts only its exact physical USB UDID")
++            }
++            let revalidate = { try binding.revalidate(environment: d.environment, pin: d.pin) }
++            func capture(_ maxWidth: Int?, _ maxEdge: Int?, png: Bool = true) throws -> USBScreenCapture.Image {
++                try revalidate()
++                let data = try d.capture(d.environment)
++                try revalidate()
++                return try USBScreenCapture.image(data, png: png, maxWidth: maxWidth, maxEdge: maxEdge)
++            }
++            func captureText(_ device: String?, _ maxEdge: Int?) throws -> (String, Data) {
++                guard device == nil || device == binding.deviceID else { throw InputRequestError("USB target mismatch") }
++                return (binding.deviceID, try capture(nil, maxEdge).data)
++            }
++            let device: [String: Any] = ["id": binding.deviceID, "name": "USB iPhone", "transport": "coredevice-usb"]
++            switch (request.method, request.path) {
++            case ("GET", "/"), ("GET", "/status"), ("GET", "/devices"):
++                return .json(["runtime_identity": RuntimeIdentity.current.json, "devices": [device],
++                    "directTouch": true, "directKeyboard": true, "bluetoothEnabled": false, "bluetoothHosts": [],
++                    "capture": ["transport": "coredevice-usb", "identity_basis": "exact_physical_udid",
++                        "source": binding.source, "idleSuspended": false]])
++            case ("GET", "/screenshot"):
++                let observationOnly = try ControlAPI.screenshotObservationOnly(request.query)
++                func dimension(_ key: String) throws -> Int? {
++                    guard let raw = request.query[key] else { return nil }
++                    guard let value = Int(raw), (1...16384).contains(value) else { throw InputRequestError("Invalid screenshot size") }
++                    return value
++                }
++                let ocr = request.query["ocr"] == "1"
++                let png = request.query["format"] == "png" || ocr
++                let image = try capture(dimension("maxWidth"), dimension("maxEdge"), png: png)
++                let next = sequenceLock.withLock { sequence += 1; return sequence }
++                var headers = ControlAPI.screenshotHeaders(device: binding.deviceID, source: binding.source,
++                    screenSize: image.screenSize, imageSize: image.imageSize, sequence: next,
++                    receivedAt: ProcessInfo.processInfo.systemUptime, observationOnly: observationOnly, references: d.references)
++                if ocr {
++                    headers["X-Screen-OCR"] = try JSONSerialization.data(withJSONObject:
++                        ScreenOCR.recognize(image.data, device: binding.deviceID).json(device: binding.deviceID)).base64EncodedString()
++                }
++                return HTTPResponse(contentType: png ? "image/png" : "image/jpeg", headers: headers, body: image.data)
++            case ("GET", "/ocr"), ("POST", "/ocr"):
++                var options = request.body
++                if options["maxEdge"] == nil, let value = request.query["maxEdge"] {
++                    guard let edge = Int(value), edge > 0 else { throw InputRequestError("Invalid OCR maxEdge") }
++                    options["maxEdge"] = edge
++                }
++                let image = try capture(nil, OCRRequest.maxEdge(options))
++                return .json(ScreenOCR.recognize(image.data, device: binding.deviceID).json(device: binding.deviceID))
++            case ("POST", "/act"):
++                return try ActRequest(request.body, directKeyboardConfigured: true, requireFrameTouch: true).perform(
++                    device: binding.deviceID, capture: captureText, execute: { path, body, _ in
++                        handle(HTTPRequest(method: "POST", path: path, query: [:], body: body), dependencies: d)
++                    })
++            case ("POST", "/tap"), ("POST", "/swipe"), ("POST", "/touch"),
++                 ("POST", "/home"), ("POST", "/key"), ("POST", "/type"):
++                let lock = DeviceCommandLocks.acquire(binding.deviceID)
++                defer { lock.unlock() }
++                try revalidate()
++                var step = request.body
++                step.removeValue(forKey: "device"); step.removeValue(forKey: "device_id")
++                step["type"] = String(request.path.dropFirst())
++                _ = try ActRequest(["steps": [step]], directKeyboardConfigured: true, requireFrameTouch: true)
++                if ["/tap", "/swipe", "/touch"].contains(request.path) {
++                    guard let raw = request.body["frame_id"] else { throw InputRequestError("Touch requires a fresh frame_id") }
++                    let reference = try d.references.consumeUSB(raw, device: binding.deviceID, source: binding.source)
++                    let body = try reference.coordinateBody(request.body)
++                    let program = try request.path == "/touch"
++                        ? TouchSequenceRequest(body, image: (reference.width, reference.height))
++                        : TouchSequenceRequest.gesture(path: request.path, body: body)
++                    let receipt = try d.touch(program, reference, d.environment) { mapping in
++                        try mapping.validate(captureSize: CGSize(width: reference.screenWidth, height: reference.screenHeight))
++                        try revalidate()
++                    }
++                    return .json(["ok": receipt["input_status"] as? String == "sent_unverified",
++                        "device": binding.deviceID, "touch_receipt": receipt])
++                }
++                let text = try request.path == "/type" ? TypeTextRequest(request.body,
++                    deviceClipboardConfigured: true, directKeyboardConfigured: true) : nil
++                let switchIME = try text?.ensureChineseIME == true
++                    && ChineseIMEHeuristic.isEnglish(ScreenOCR.recognize(capture(nil, 1600).data, device: binding.deviceID))
++                let program: CoreDeviceKeyboardProgram
++                if let text { program = try CoreDeviceKeyboardProgram.text(text, switchIME: switchIME) }
++                else if request.path == "/home" { program = try CoreDeviceKeyboardProgram.home() }
++                else { program = try CoreDeviceKeyboardProgram.key(KeyRequest(request.body)) }
++                let clipboard: (() throws -> Void)? = text?.hasClipboard == true ? {
++                    try text!.writeClipboard { value in try d.clipboard(value, d.environment, revalidate) }
++                } : nil
++                let receipt = try d.keyboard(program, binding.deviceID, d.environment, revalidate, clipboard)
++                return CoreDeviceKeyboard.response(receipt, device: binding.deviceID)
++            default:
++                return .rejectedRequest("Route unavailable in managed USB mode", status: 404)
++            }
++        } catch let error as ScreenshotReferences.Rejected {
++            return .json(["error": error.description, "frame_rejected": true, "input_sent": false], status: 409)
++        } catch {
++            // Owned input wrappers return uncertain receipts after any possible
++            // effect. Thrown errors here are pre-input validation/read failures.
++            return .rejectedRequest(String(describing: error), status: 409)
++        }
++    }
++}
+diff --git a/Sources/iPhoneUse/App/Application.swift b/Sources/iPhoneUse/App/Application.swift
+index c1b364c..4066f39 100644
+--- a/Sources/iPhoneUse/App/Application.swift
++++ b/Sources/iPhoneUse/App/Application.swift
+@@ -23,8 +23,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
+ 
+     func applicationDidFinishLaunching(_ notification: Notification) {
+         installMenus()
+-        QuietModeActivityController.shared.start()
+-        windows.start()
++        if !USBControlAPI.isConfigured {
++            QuietModeActivityController.shared.start()
++            windows.start()
++        }
+         if AppRunModeStore.shared.mode == .desktop {
+             NSApp.activate(ignoringOtherApps: true)
+         }
+@@ -60,6 +62,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
+         languageObserver = nil
+         if let runModeObserver { NotificationCenter.default.removeObserver(runModeObserver) }
+         runModeObserver = nil
++        guard !USBControlAPI.isConfigured else { return }
+         QuietModeActivityController.shared.stop()
+         windows.stop()
+         let stopResult = ScreenCaptureManager.shared.stop(waitTimeout: Application.shutdownWaitTimeout)
+@@ -200,10 +203,17 @@ enum Application {
+         let appDelegate = AppDelegate()
+         app.delegate = appDelegate
+ 
+-        DeviceRegistry.shared.start()
+-        HIDPeripheral.shared.start(initialDisplayState: HIDPeripheral.onlineDisplayState())
+-        let powerObservers = installPowerObservers()
+-        ScreenCaptureManager.shared.start()
++        // The managed host reads physical USB screenshots on demand. Starting
++        // AV capture here would reintroduce an unrelated device/mux lifecycle.
++        let powerObservers: [NSObjectProtocol]
++        if USBControlAPI.isConfigured {
++            powerObservers = []
++        } else {
++            DeviceRegistry.shared.start()
++            HIDPeripheral.shared.start(initialDisplayState: HIDPeripheral.onlineDisplayState())
++            powerObservers = installPowerObservers()
++            ScreenCaptureManager.shared.start()
++        }
+         let server = HTTPServer(port: port, handler: ControlAPI.handle)
+         do {
+             try server.start()
+@@ -258,6 +268,9 @@ enum Application {
+             let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+             source.setEventHandler {
+                 server.stop()
++                // This host never opened the legacy AV/Valeria/HID lifecycle.
++                // Its one-shot USB children own their tunnel cleanup.
++                if USBControlAPI.isConfigured { exit(0) }
+                 let stopResult = ScreenCaptureManager.shared.stop(waitTimeout: Self.shutdownWaitTimeout)
+                 if !stopResult.isClean {
+                     log(
+diff --git a/Sources/iPhoneUse/Capture/ScreenOCR.swift b/Sources/iPhoneUse/Capture/ScreenOCR.swift
+index 6af8fee..b68cee1 100644
+--- a/Sources/iPhoneUse/Capture/ScreenOCR.swift
++++ b/Sources/iPhoneUse/Capture/ScreenOCR.swift
+@@ -93,7 +93,6 @@ enum ScreenOCR {
+     private static let significantLumaDelta = 6
+     private static let significantPixelRatio = 2000
+     private static var recentSignatures: [FrameSignature] = []
+-    private static var previous: [String: Set<String>] = [:]
+ 
+     struct Diff {
+         let added: [String]
+@@ -107,21 +106,15 @@ enum ScreenOCR {
+         }
+     }
+ 
+-    static func diff(device: String, current: Result) -> Diff {
+-        lock.lock()
+-        defer { lock.unlock() }
++    /// Compare explicit observations; another call or client cannot replace the baseline.
++    static func diff(baseline: Result, current: Result) -> Diff {
+         let texts = Set(current.items.map(\.text))
+-        let old = previous[device]
+-        previous[device] = texts
++        let old = Set(baseline.items.map(\.text))
+         return Diff(
+-            added: texts.subtracting(old ?? []).sorted(), removed: (old ?? []).subtracting(texts).sorted(),
++            added: texts.subtracting(old).sorted(), removed: old.subtracting(texts).sorted(),
+             unchanged: old == texts, screenHash: current.screenHash)
+     }
+ 
+-    static func summaryDiff(for result: Result, device: String) -> String {
+-        diff(device: device, current: result).summary
+-    }
+-
+     /// Hash decoded pixels with a 2-level L-infinity tolerance on an 8x8 luminance grid
+     /// so USB H.264/YUV LSB quantization noise does not invalidate a static screen.
+     static func stabilitySignature(_ data: Data) -> String {
+diff --git a/Sources/iPhoneUse/Capture/USBScreenCapture.swift b/Sources/iPhoneUse/Capture/USBScreenCapture.swift
+new file mode 100644
+index 0000000..5d5e24a
+--- /dev/null
++++ b/Sources/iPhoneUse/Capture/USBScreenCapture.swift
+@@ -0,0 +1,122 @@
++import Darwin
++import Foundation
++import ImageIO
++import UniformTypeIdentifiers
++
++/// Managed input and observation share one physical UDID. An AVFoundation
++/// acquisition UUID, same-size raster or visual match cannot authorize input.
++struct USBDeviceBinding: Equatable {
++    let deviceID: String
++    let attachmentID: UInt64
++    var source: String { "coredevice-usb:\(attachmentID)" }
++
++    static func resolve(
++        environment: [String: String],
++        pin: () -> USBValeriaConfigurator.PinnedUSBDevice? = USBValeriaConfigurator.currentSingleIOSDeviceIdentity
++    ) throws -> USBDeviceBinding {
++        let configuration = try DeviceClipboard.Configuration(environment: environment)
++        guard environment["IPHONE_USE_DEVICE_ID"] == configuration.deviceID else {
++            throw InputRequestError("Capture and USB target must be the same physical UDID; remove the legacy captureId configuration")
++        }
++        guard let helper = environment[USBScreenCapture.helperKey], helper.hasPrefix("/"), !helper.contains("\0") else {
++            throw InputRequestError("Physical USB screenshots are required before managed input can be enabled")
++        }
++        guard let attached = pin(), attached.registryEntryID != 0,
++            USBValeriaConfigurator.normalizedSerial(attached.serial)
++                == USBValeriaConfigurator.normalizedSerial(configuration.deviceID) else {
++            throw InputRequestError("Connect exactly one iPhone with the configured physical USB UDID; identity is not confirmed")
++        }
++        return USBDeviceBinding(deviceID: configuration.deviceID, attachmentID: attached.registryEntryID)
++    }
++
++    func revalidate(environment: [String: String],
++        pin: () -> USBValeriaConfigurator.PinnedUSBDevice? = USBValeriaConfigurator.currentSingleIOSDeviceIdentity
++    ) throws {
++        guard try Self.resolve(environment: environment, pin: pin) == self else {
++            throw ScreenshotReferences.Rejected("physical USB attachment changed; observe again")
++        }
++    }
++}
++
++/// One owned read-only helper; no capture mux, BLE, AX or image identity guess.
++enum USBScreenCapture {
++    static let helperKey = "IPHONE_USE_USB_SCREENSHOT_HELPER"
++    static let maximumBytes = 16 * 1024 * 1024
++    struct Image {
++        let data: Data
++        let screenSize: CGSize
++        let imageSize: (Int, Int)
++    }
++
++    static func capture(environment: [String: String]) throws -> Data {
++        let configuration = try DeviceClipboard.Configuration(environment: environment)
++        guard let helper = environment[helperKey], helper.hasPrefix("/"), !helper.contains("\0"),
++            FileManager.default.isReadableFile(atPath: helper),
++            FileManager.default.isExecutableFile(atPath: configuration.python.path) else {
++            throw DeviceError("Physical USB screenshot helper is unavailable; run setup-usb")
++        }
++        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("iphone-use-usb-screen-\(UUID().uuidString)")
++        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
++            attributes: [.posixPermissions: 0o700])
++        defer { try? FileManager.default.removeItem(at: directory) }
++        let outputURL = directory.appendingPathComponent("screen.png")
++        guard FileManager.default.createFile(atPath: outputURL.path, contents: nil,
++            attributes: [.posixPermissions: 0o600]) else { throw DeviceError("Cannot prepare USB screenshot output") }
++        let output = try FileHandle(forWritingTo: outputURL)
++        defer { try? output.close() }
++        let process = Process(), finished = DispatchSemaphore(value: 0)
++        process.executableURL = configuration.python
++        process.arguments = ["-I", "-B", helper]
++        process.environment = configuration.childEnvironment(environment)
++        process.standardInput = FileHandle.nullDevice
++        process.standardOutput = output
++        process.standardError = FileHandle.nullDevice
++        process.terminationHandler = { _ in finished.signal() }
++        try process.run()
++        guard finished.wait(timeout: .now() + 8) == .success else {
++            if process.isRunning { process.terminate() }
++            if finished.wait(timeout: .now() + 2) == .timedOut, process.isRunning {
++                kill(process.processIdentifier, SIGKILL)
++                _ = finished.wait(timeout: .now() + 1)
++            }
++            throw DeviceError("Physical USB screenshot timed out; no fallback was used")
++        }
++        guard process.terminationReason == .exit, process.terminationStatus == 0 else {
++            throw DeviceError("Physical USB screenshot unavailable; no capture-ID fallback was used")
++        }
++        let attributes = try FileManager.default.attributesOfItem(atPath: outputURL.path)
++        guard let size = attributes[.size] as? NSNumber, (9...maximumBytes).contains(size.intValue) else {
++            throw DeviceError("Physical USB screenshot exceeded the image byte budget")
++        }
++        return try Data(contentsOf: outputURL)
++    }
++
++    static func image(_ data: Data, png: Bool, maxWidth: Int?, maxEdge: Int?) throws -> Image {
++        guard data.count <= maximumBytes, data.starts(with: [137, 80, 78, 71, 13, 10, 26, 10]),
++            let source = CGImageSourceCreateWithData(data as CFData, nil),
++            let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
++            let width = properties[kCGImagePropertyPixelWidth] as? Int,
++            let height = properties[kCGImagePropertyPixelHeight] as? Int,
++            (1...16384).contains(width), (1...16384).contains(height), width * height <= 40_000_000 else {
++            throw DeviceError("Physical USB screenshot returned invalid PNG dimensions")
++        }
++        let screen = CGSize(width: width, height: height)
++        let size = RequestCoordinates.imageSize(screen, maxWidth: maxWidth, maxEdge: maxEdge)
++        guard size.0 > 0, size.1 > 0,
++            let original = CGImageSourceCreateImageAtIndex(source, 0, nil),
++            let context = CGContext(data: nil, width: size.0, height: size.1, bitsPerComponent: 8,
++                bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)
++        else { throw DeviceError("Cannot decode physical USB screenshot") }
++        context.interpolationQuality = .high
++        context.draw(original, in: CGRect(x: 0, y: 0, width: size.0, height: size.1))
++        guard let image = context.makeImage() else { throw DeviceError("Cannot resize physical USB screenshot") }
++        let result = NSMutableData()
++        guard let destination = CGImageDestinationCreateWithData(result,
++            (png ? UTType.png.identifier : UTType.jpeg.identifier) as CFString, 1, nil) else {
++            throw DeviceError("Cannot encode physical USB screenshot")
++        }
++        CGImageDestinationAddImage(destination, image, [kCGImageDestinationLossyCompressionQuality: 0.8] as CFDictionary)
++        guard CGImageDestinationFinalize(destination) else { throw DeviceError("Cannot finish physical USB screenshot") }
++        return Image(data: result as Data, screenSize: screen, imageSize: size)
++    }
++}
+diff --git a/Sources/iPhoneUse/Capture/USBSetupDiscovery.swift b/Sources/iPhoneUse/Capture/USBSetupDiscovery.swift
+index 16eb74c..64e3e48 100644
+--- a/Sources/iPhoneUse/Capture/USBSetupDiscovery.swift
++++ b/Sources/iPhoneUse/Capture/USBSetupDiscovery.swift
+@@ -1,147 +1,80 @@
+-import AVFoundation
+-import CoreMediaIO
+ import Darwin
+ import Foundation
+ 
+-/// Setup inventory only. Reuses the host's USB activation/restore owner and never
+-/// starts Application, DeviceRegistry, capture sessions, Bluetooth or input.
++/// Physical USB setup inventory. Does not start Application, DeviceRegistry,
++/// AV capture, Bluetooth, pairing, input, or a new USB configuration change.
++/// Only the existing persisted restore ledger can require cleanup of an earlier run.
+ enum USBSetupDiscovery {
+     static let workerArgument = "--discover-usb-setup"
+-    struct Capture: Equatable {
+-        let id: String
+-        let name: String
+-    }
+     struct Dependencies {
+         var physical: () throws -> [String]
+-        var captures: () -> [Capture]
+         var singlePin: () -> USBValeriaConfigurator.PinnedUSBDevice?
+         var pendingRestore: () -> Bool
+-        var activate: (String, USBValeriaConfigurator.PinnedUSBDevice) -> USBValeriaConfigurator.ActivationOutcome
+         var restore: () -> Bool
+-        var wait: () -> Void
+         var cancelled: () -> Bool
+     }
+ 
+-    /// A sole topology provides a configuration candidate, not screenshot identity
+-    /// proof. Never infer a mapping between multiple opaque capture/USB IDs.
+-    static func candidate(captures: [Capture], physical: [String]) -> [String: Any]? {
+-        guard captures.count == 1, physical.count == 1,
+-            let capture = captures.first, let usb = physical.first,
+-            USBValeriaConfigurator.isOpaqueCaptureUUID(capture.id)
+-                || USBValeriaConfigurator.normalizedSerial(capture.id) == USBValeriaConfigurator.normalizedSerial(usb)
+-        else { return nil }
+-        return ["captureId": capture.id, "port": 7390, "usbDeviceId": usb]
++    static func isPhysicalUDID(_ value: String) -> Bool {
++        guard [25, 40].contains(value.utf8.count),
++            let range = value.range(of: "^(?:[0-9A-Fa-f]{8}-[0-9A-Fa-f]{16}|[0-9A-Fa-f]{40})$", options: .regularExpression)
++        else { return false }
++        return range == value.startIndex..<value.endIndex
+     }
+ 
+     static func collect(_ dependencies: Dependencies) -> [String: Any] {
+-        var captures: [Capture] = []
+         var physical: [String] = []
+         var failure: String?
+-        var activation = "not_attempted"
+         var cleanup = "not_needed"
+-        var changed = false
+         var observedPin: USBValeriaConfigurator.PinnedUSBDevice?
+-        // The existing persisted ledger owns recovery after an earlier abnormal
+-        // exit. Do not activate again while its restoration is unresolved.
+-        if dependencies.pendingRestore() {
+-            guard dependencies.restore() else {
+-                return report(captures: [], physical: [], failure: "previous_usb_restore_pending",
+-                              activation: activation, cleanup: "pending")
+-            }
+-            cleanup = "settled"
+-        }
+         do {
+             physical = try dependencies.physical()
+-            captures = dependencies.captures()
+-            if dependencies.cancelled() { failure = "cancelled_or_deadline" }
+-            if failure == nil, physical.count == 1, let usb = physical.first {
+-                guard let pin = dependencies.singlePin(),
+-                    USBValeriaConfigurator.normalizedSerial(pin.serial) == USBValeriaConfigurator.normalizedSerial(usb)
+-                else {
+-                    return report(captures: captures, physical: physical, failure: "usb_topology_unconfirmed",
+-                                  activation: activation, cleanup: cleanup)
++            if !physical.allSatisfy(isPhysicalUDID) {
++                failure = "physical_usb_identity_invalid"
++            } else if physical.count == 1, let usb = physical.first {
++                observedPin = dependencies.singlePin()
++                if observedPin == nil || USBValeriaConfigurator.normalizedSerial(observedPin?.serial)
++                    != USBValeriaConfigurator.normalizedSerial(usb) {
++                    failure = "usb_topology_unconfirmed"
+                 }
+-                observedPin = pin
+             }
+-            if failure == nil, captures.isEmpty, let usb = physical.first, let pin = observedPin {
+-                switch dependencies.activate(usb, pin) {
+-                case .switched:
+-                    activation = "temporarily_activated"
+-                    changed = true
+-                case .unconfirmedSwitch:
+-                    activation = "activation_unconfirmed"
+-                    changed = true
+-                case .blockedByActiveUSBNetwork:
+-                    activation = "blocked_by_usb_network"
+-                case .blockedByUSBResourceShortage:
+-                    activation = "blocked_by_usb_resource"
+-                case .notActivated:
+-                    activation = "not_activated"
+-                }
+-                // Wait for CoreMediaIO publication, without opening any capture
+-                // session. A finite sample budget is secondary to the worker deadline.
+-                for _ in 0..<20 where !dependencies.cancelled() {
+-                    if !captures.isEmpty { break }
+-                    dependencies.wait()
+-                    captures = dependencies.captures()
+-                }
+-            }
+-            let after = try dependencies.physical()
+-            if after != physical || (observedPin != nil && dependencies.singlePin() != observedPin) {
+-                failure = "usb_topology_changed"
+-            }
+-            if dependencies.cancelled() { failure = "cancelled_or_deadline" }
+         } catch {
+             failure = "physical_usb_inventory_unavailable"
+         }
+-        if changed {
+-            // The aggregate restore API treats detached/superseded entries as
+-            // terminal too. "settled" never claims the original config was restored.
++
++        // Reconcile a previous version's persisted changes, even if inventory or
++        // cancellation failed. This worker never adds a new activation to the ledger.
++        if dependencies.pendingRestore() {
+             cleanup = dependencies.restore() ? "settled" : "pending"
+-            if cleanup == "pending" {
+-                failure = "usb_restore_pending"
+-            } else {
+-                // Cleanup itself can coincide with unplug/replug or an external
+-                // topology change. Do not return the pre-cleanup candidate then.
+-                do {
+-                    let finalPhysical = try dependencies.physical()
+-                    let finalPin = dependencies.singlePin()
+-                    if finalPhysical != physical || finalPin != observedPin {
+-                        failure = failure ?? "usb_topology_changed_during_cleanup"
+-                    }
+-                } catch {
+-                    failure = failure ?? "physical_usb_inventory_unavailable_after_cleanup"
++            if cleanup == "pending" { failure = "previous_usb_restore_pending" }
++        }
++        if failure == nil {
++            do {
++                let finalPhysical = try dependencies.physical()
++                if finalPhysical != physical || (observedPin != nil && dependencies.singlePin() != observedPin) {
++                    failure = cleanup == "settled" ? "usb_topology_changed_during_cleanup" : "usb_topology_changed"
+                 }
++            } catch {
++                failure = "physical_usb_inventory_unavailable"
+             }
+         }
+-        if dependencies.cancelled() {
+-            failure = cleanup == "pending" ? "usb_restore_pending" : "cancelled_or_deadline"
+-        }
+-        return report(captures: captures, physical: physical, failure: failure,
+-                      activation: activation, cleanup: cleanup)
++        if dependencies.cancelled(), cleanup != "pending" { failure = "cancelled_or_deadline" }
++        return report(physical: physical, failure: failure, cleanup: cleanup)
+     }
+ 
+-    static func report(captures: [Capture], physical: [String], failure: String?,
+-                       activation: String, cleanup: String) -> [String: Any] {
+-        let possible = failure == nil ? candidate(captures: captures, physical: physical) : nil
+-        let status = failure ?? (possible != nil ? "configuration_candidate" :
+-            (physical.count > 1 || captures.count > 1) ? "ambiguous_devices" :
+-            physical.isEmpty ? "no_usb_device" : captures.isEmpty ? "capture_unavailable" : "identity_mismatch")
++    private static func report(physical: [String], failure: String?, cleanup: String) -> [String: Any] {
++        let status = failure ?? (physical.isEmpty ? "no_usb_device" :
++            physical.count > 1 ? "ambiguous_devices" : "configuration_candidate")
+         var result: [String: Any] = [
+             "schema_version": 1, "status": status, "selected_device": NSNull(),
+-            "capture_devices": captures.map { ["captureId": $0.id, "name": $0.name] },
+             "usb_devices": physical.map { ["usbDeviceId": $0] },
+-            "usb_configuration": activation, "cleanup": cleanup,
+-            "cleanup_scope": "settled means no tracked restore remains; restored, detached or superseded are all terminal",
+-            "capture_inventory_phase": activation == "temporarily_activated" || activation == "activation_unconfirmed"
+-                ? "before_usb_cleanup" : "inventory",
++            "usb_configuration": "not_attempted", "cleanup": cleanup,
++            "cleanup_scope": "previous-version ledger only; settled means no tracked restore remains; restored, detached or superseded are all terminal",
+             "phone_input_sent": false, "capture_session_started": false,
+-            "bluetooth_started": false, "pairing_attempted": false,
+-            "config_written": false,
++            "bluetooth_started": false, "pairing_attempted": false, "config_written": false,
+         ]
+-        if let possible {
+-            result["config_candidate"] = possible
+-            result["identity_basis"] = "single_attached_USB_and_capture_inventory; not image verification"
++        if status == "configuration_candidate", let usb = physical.first {
++            result["config_candidate"] = ["usbDeviceId": usb, "port": 7390]
++            result["identity_basis"] = "single_physical_USB_UDID_with_matching_rechecked_IOKit_pin"
+         }
+         return result
+     }
+@@ -150,56 +83,21 @@ enum USBSetupDiscovery {
+         let cancellation = DiscoveryCancellation(deadline: ProcessInfo.processInfo.systemUptime + 10)
+         let signals = cancellation.installSignals()
+         return withExtendedLifetime(signals) {
+-            // This property is process-local exposure, not capture startup.
+-            var address = CMIOObjectPropertyAddress(
+-                mSelector: CMIOObjectPropertySelector(kCMIOHardwarePropertyAllowScreenCaptureDevices),
+-                mScope: CMIOObjectPropertyScope(kCMIOObjectPropertyScopeGlobal),
+-                mElement: CMIOObjectPropertyElement(kCMIOObjectPropertyElementMain))
+-            var allow: UInt32 = 1
+-            let exposure = CMIOObjectSetPropertyData(
+-                CMIOObjectID(kCMIOObjectSystemObject), &address, 0, nil,
+-                UInt32(MemoryLayout<UInt32>.size), &allow)
+             var result = collect(Dependencies(
+                 physical: { try USBSetupPhysicalDevices.identifiers() },
+-                captures: {
+-                    guard exposure == noErr else { return [] }
+-                    return AVCaptureDevice.DiscoverySession(
+-                        deviceTypes: [.external], mediaType: .muxed, position: .unspecified
+-                    ).devices.filter { $0.modelID.contains("iOS") && $0.isConnected }
+-                        .map { Capture(id: $0.uniqueID, name: $0.localizedName) }.sorted { $0.id < $1.id }
+-                },
+                 singlePin: USBValeriaConfigurator.currentSingleIOSDeviceIdentity,
+                 pendingRestore: { USBValeriaConfigurator.requiresStartupReconciliation },
+-                activate: { usb, pin in
+-                    guard exposure == noErr else { return .notActivated }
+-                    return USBValeriaConfigurator.activateDormantValeriaConfiguration(
+-                        preferredSerial: usb, allowSingleIOSFallback: false, pinnedSingleDevice: pin,
+-                        shouldProceed: { !cancellation.isCancelled })
+-                },
+                 restore: {
+                     USBValeriaConfigurator.restorePreviousConfigurations(
+                         deadlineUptime: ProcessInfo.processInfo.systemUptime + 3)
+                 },
+-                wait: { RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.25)) },
+                 cancelled: { cancellation.isCancelled }))
+-            result["capture_discovery_exposure_status"] = exposure
+-            result["camera_authorization"] = cameraAuthorization()
+-            result["scope"] = "Local setup inventory; no trust, capture readiness or input-effect verification."
++            result["scope"] = "Physical USB inventory only; no trust, screenshot readiness or input-effect verification."
+             guard let data = try? JSONSerialization.data(withJSONObject: result, options: [.sortedKeys]) else { return 70 }
+             FileHandle.standardOutput.write(data + Data([0x0a]))
+             return result["status"] as? String == "configuration_candidate" ? 0 : 2
+         }
+     }
+-
+-    private static func cameraAuthorization() -> String {
+-        switch AVCaptureDevice.authorizationStatus(for: .video) {
+-        case .authorized: return "authorized"
+-        case .denied: return "denied"
+-        case .restricted: return "restricted"
+-        case .notDetermined: return "not_determined"
+-        @unknown default: return "unknown"
+-        }
+-    }
+ }
+ 
+ private final class DiscoveryCancellation {
+diff --git a/Sources/iPhoneUse/Input/CoreDeviceKeyboard.swift b/Sources/iPhoneUse/Input/CoreDeviceKeyboard.swift
+index 4652da6..ed21a0a 100644
+--- a/Sources/iPhoneUse/Input/CoreDeviceKeyboard.swift
++++ b/Sources/iPhoneUse/Input/CoreDeviceKeyboard.swift
+@@ -5,7 +5,14 @@ import Foundation
+ /// not a persistent keyboard session or a second public input language.
+ struct CoreDeviceKeyboardProgram {
+     private(set) var samples: [[String: Any]] = []
++    private(set) var button: String?
+     private var nextMS = 0
++    var payload: [String: Any] { button.map { ["button": $0] } ?? ["samples": samples] }
++    var reportCount: Int { button == nil ? samples.count : 2 }
++    var programmedSeconds: TimeInterval {
++        button == nil ? ((samples.last?["at_ms"] as? NSNumber)?.doubleValue ?? 0) / 1000 : 0.05
++    }
++    var backend: String { button == nil ? "coredevice-keyboard" : "coredevice-button" }
+ 
+     private mutating func append(_ usages: [Int]) throws {
+         guard samples.count < 128, nextMS <= 6000 else {
+@@ -38,7 +45,7 @@ struct CoreDeviceKeyboardProgram {
+ 
+     static func home() throws -> Self {
+         var program = Self()
+-        try program.key("h", ["command"])
++        program.button = "home"
+         return program
+     }
+ 
+@@ -86,6 +93,12 @@ enum CoreDeviceKeyboard {
+             throw InputRequestError("USB keyboard requires its configured helper and exact capture device")
+         }
+         let configuration = try DeviceClipboard.Configuration(environment: environment)
++        guard configuration.deviceID == device else {
++            throw InputRequestError("Keyboard observation and input must share the exact physical USB UDID")
++        }
++        guard program.button == nil || clipboard == nil else {
++            throw InputRequestError("A native Home button cannot include a clipboard operation")
++        }
+         guard FileManager.default.isExecutableFile(atPath: configuration.python.path) else {
+             throw InputRequestError("USB keyboard Python is unavailable")
+         }
+@@ -93,19 +106,21 @@ enum CoreDeviceKeyboard {
+         var clipboardStatus = clipboard == nil ? "not_requested" : "not_written"
+         func receipt(_ status: String, reason: String? = nil) -> [String: Any] {
+             var result: [String: Any] = [
+-                "schema_version": 1, "backend": "coredevice-keyboard", "input_status": status,
++                "schema_version": 1, "backend": program.backend, "input_status": status,
++                "hid_input_status": status,
+                 "device_bound": true, "frame_bound": false, "device_delivery": "unverified",
+                 "application_effect": "unverified", "clipboard_status": clipboardStatus,
+             ]
++            result["input_status"] = operationStatus(result)
+             if let reason { result["reason"] = reason }
+             return result
+         }
+-        if program.samples.isEmpty {
++        if program.reportCount == 0 {
+             var result = receipt("not_sent")
+             result["no_op"] = true
+             return result
+         }
+-        let data = try JSONSerialization.data(withJSONObject: ["samples": program.samples])
++        let data = try JSONSerialization.data(withJSONObject: program.payload)
+         guard data.count <= 16384 else { throw InputRequestError("USB keyboard plan exceeds 16 KiB") }
+         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("iphone-use-keyboard-\(UUID().uuidString)")
+         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+@@ -121,7 +136,7 @@ enum CoreDeviceKeyboard {
+         defer { try? input.close(); try? output.close() }
+         let process = Process(), finished = DispatchSemaphore(value: 0)
+         process.executableURL = configuration.python
+-        process.arguments = ["-B", helper, "--commit-file", commitURL.path]
++        process.arguments = ["-I", "-B", helper, "--commit-file", commitURL.path]
+         process.environment = configuration.childEnvironment(environment)
+         process.standardInput = input; process.standardOutput = output; process.standardError = FileHandle.nullDevice
+         process.terminationHandler = { _ in finished.signal() }
+@@ -135,7 +150,11 @@ enum CoreDeviceKeyboard {
+             }
+         }
+         func failure(_ reason: String) -> [String: Any] {
+-            receipt(committed ? "unconfirmed" : "not_sent", reason: reason)
++            var result = receipt(committed ? "unconfirmed" : "not_sent", reason: reason)
++            if hasPossibleClipboardWrite(result) {
++                result["reason"] = reason + "; the phone clipboard may have changed; do not replay automatically"
++            }
++            return result
+         }
+         func messages() throws -> [[String: Any]] {
+             let file = try FileHandle(forReadingFrom: outputURL)
+@@ -156,7 +175,12 @@ enum CoreDeviceKeyboard {
+             var ready = false
+             while ProcessInfo.processInfo.systemUptime < deadline {
+                 if try messages().contains(where: {
+-                    $0["phase"] as? String == "ready" && TextEntry.isBoolean($0["keyboard_surface_registered"])
++                    guard $0["phase"] as? String == "ready" else { return false }
++                    if let button = program.button {
++                        return $0["button"] as? String == button && TextEntry.isBoolean($0["button_service_ready"])
++                            && $0["button_service_ready"] as? Bool == true
++                    }
++                    return TextEntry.isBoolean($0["keyboard_surface_registered"])
+                         && $0["keyboard_surface_registered"] as? Bool == true
+                 }) { ready = true; break }
+                 if !process.isRunning { break }
+@@ -167,8 +191,15 @@ enum CoreDeviceKeyboard {
+                     try beforeCommit()
+                     if let clipboard {
+                         clipboardStatus = "unconfirmed"
+-                        try clipboard()
+-                        clipboardStatus = "written_unverified"
++                        do {
++                            try clipboard()
++                            clipboardStatus = "written_unverified"
++                        } catch {
++                            if let failure = error as? DeviceClipboard.WriteFailure {
++                                clipboardStatus = failure.status.rawValue
++                            }
++                            throw error
++                        }
+                     }
+                     // Clipboard setup may take time; do not use a replaced capture selector.
+                     try beforeCommit()
+@@ -176,12 +207,12 @@ enum CoreDeviceKeyboard {
+                     // Child/clipboard diagnostic text may contain user input. Keep it private.
+                     return failure("USB keyboard preparation failed; no keyboard reports were committed")
+                 }
+-                committed = true
+                 let pending = directory.appendingPathComponent("commit.pending")
+                 guard FileManager.default.createFile(atPath: pending.path, contents: Data("{\"commit\":true}".utf8),
+                     attributes: [.posixPermissions: 0o600]), rename(pending.path, commitURL.path) == 0 else {
+                     return failure("USB keyboard commit failed; do not replay")
+                 }
++                committed = true
+                 if finished.wait(timeout: .now() + 15) == .timedOut {
+                     return failure("USB keyboard helper timed out after commit; do not replay")
+                 }
+@@ -189,7 +220,7 @@ enum CoreDeviceKeyboard {
+                 return failure("USB keyboard preflight did not become ready")
+             }
+             guard let raw = try messages().last(where: { $0["schema_version"] as? Int == 1 }),
+-                raw["backend"] as? String == "coredevice-keyboard",
++                raw["backend"] as? String == program.backend,
+                 let status = raw["input_status"] as? String, ["not_sent", "sent_unverified", "unconfirmed"].contains(status),
+                 let attempted = exactCount(raw["reports_attempted"]),
+                 let sent = exactCount(raw["reports_locally_sent"]), sent <= attempted else {
+@@ -201,11 +232,16 @@ enum CoreDeviceKeyboard {
+             let release = raw["cleanup_release"] as? [String: Any] ?? [:]
+             let cleanup = raw["cleanup"] as? [String: Any] ?? [:]
+             let errors = cleanup["errors"] as? [[String: Any]]
++            let validSurface = program.button.map { button in
++                raw["button"] as? String == button && TextEntry.isBoolean(raw["button_service_ready"])
++                    && raw["button_service_ready"] as? Bool == true && TextEntry.isBoolean(raw["virtual_service_registered"])
++                    && raw["virtual_service_registered"] as? Bool == false
++            } ?? (TextEntry.isBoolean(raw["virtual_service_registered"]) && raw["virtual_service_registered"] as? Bool == true)
+             let validSuccess = committed && TextEntry.isBoolean(raw["host_commit_received"])
+                 && raw["host_commit_received"] as? Bool == true
+-                && TextEntry.isBoolean(raw["virtual_service_registered"]) && raw["virtual_service_registered"] as? Bool == true
++                && validSurface
+                 && TextEntry.isBoolean(raw["media_started"]) && raw["media_started"] as? Bool == false
+-                && attempted == program.samples.count && sent == attempted
++                && attempted == program.reportCount && sent == attempted
+                 && release["status"] as? String == "sent_unverified" && errors?.isEmpty == true
+                 && ["connection_closed", "tunnel_closed", "pairing_scratch_removed"].allSatisfy {
+                     TextEntry.isBoolean(cleanup[$0]) && cleanup[$0] as? Bool == true
+@@ -222,7 +258,8 @@ enum CoreDeviceKeyboard {
+             result["cleanup_release"] = ["status": ["not_needed", "sent_unverified", "unconfirmed"].contains(release["status"] as? String ?? "")
+                 ? release["status"] as! String : "unconfirmed"]
+             result["cleanup"] = sanitizedCleanup(cleanup)
+-            result["surface_deregistration"] = "not_independently_observed"
++            result["surface_deregistration"] = program.button == nil ? "not_independently_observed" : "not_applicable"
++            if let button = program.button { result["button"] = button }
+             if raw["error_type"] != nil { result["error_type"] = safeError(raw["error_type"]) }
+             if finalStatus != "sent_unverified" { result["reason"] = "USB keyboard did not complete cleanly; do not replay automatically" }
+             return result
+@@ -255,12 +292,43 @@ enum CoreDeviceKeyboard {
+         return clean
+     }
+ 
++    /// The operation covers clipboard SET as well as HID reports. Older hosts
++    /// may call HID-only not_sent a complete verdict; never repeat that claim
++    /// when their own independent clipboard axis reports a possible write.
++    static func operationStatus(_ receipt: [String: Any]) -> String {
++        let status = receipt["input_status"] as? String ?? "unconfirmed"
++        let hid = receipt["hid_input_status"] as? String ?? status
++        if receipt["hid_input_status"] != nil,
++            !(receipt["hid_input_status"] is String) || !["not_sent", "sent_unverified", "unconfirmed"].contains(hid) {
++            return "unconfirmed"
++        }
++        if receipt["clipboard_status"] != nil, !(receipt["clipboard_status"] is String) { return "unconfirmed" }
++        if let clipboard = receipt["clipboard_status"] as? String {
++            if !["not_requested", "not_written", "written_unverified"].contains(clipboard) {
++                return "unconfirmed"
++            }
++            if clipboard == "written_unverified", status == "not_sent" || hid == "not_sent" {
++                return "unconfirmed"
++            }
++        }
++        if hid == "unconfirmed" || (status == "not_sent" && hid != "not_sent")
++            || (status == "sent_unverified" && hid == "not_sent") { return "unconfirmed" }
++        return ["not_sent", "sent_unverified", "acknowledged", "unconfirmed"].contains(status) ? status : "unconfirmed"
++    }
++
++    static func hasPossibleClipboardWrite(_ receipt: [String: Any]) -> Bool {
++        guard let raw = receipt["clipboard_status"] else { return false }
++        guard let clipboard = raw as? String else { return true }
++        return !["not_requested", "not_written"].contains(clipboard)
++    }
++
+     static func response(_ receipt: [String: Any], device: String) -> HTTPResponse {
+-        let ok = receipt["input_status"] as? String == "sent_unverified" || receipt["no_op"] as? Bool == true
++        let status = operationStatus(receipt)
++        let ok = status == "sent_unverified" || (status == "not_sent" && receipt["no_op"] as? Bool == true)
+         var body: [String: Any] = ["ok": ok, "device": device, "keyboard_receipt": receipt]
+         if !ok {
+             body["error"] = receipt["reason"] ?? "USB keyboard input was not confirmed; inspect before retrying"
+-            body["input_sent"] = receipt["input_status"] as? String == "not_sent" ? false : nil
++            body["input_sent"] = status == "not_sent" ? false : nil
+         }
+         // Non-200 stops the current act batch immediately.
+         return .json(body, status: ok ? 200 : 409)
+diff --git a/Sources/iPhoneUse/Input/CoreDeviceTouch.swift b/Sources/iPhoneUse/Input/CoreDeviceTouch.swift
+index d0d040f..1992c92 100644
+--- a/Sources/iPhoneUse/Input/CoreDeviceTouch.swift
++++ b/Sources/iPhoneUse/Input/CoreDeviceTouch.swift
+@@ -107,6 +107,9 @@ enum CoreDeviceTouch {
+             throw InputRequestError("Direct touch requires the configured helper and exact capture device")
+         }
+         let configuration = try DeviceClipboard.Configuration(environment: environment)
++        guard configuration.deviceID == reference.device else {
++            throw InputRequestError("Touch screenshot and input must share the exact physical USB UDID")
++        }
+         _ = try TouchSequenceRequest(["samples": program.samples], image: (reference.width, reference.height))
+         let plan: [String: Any] = ["image": ["width": reference.width, "height": reference.height], "samples": program.samples]
+         let data = try JSONSerialization.data(withJSONObject: plan)
+@@ -125,7 +128,7 @@ enum CoreDeviceTouch {
+         defer { try? input.close(); try? output.close() }
+         let process = Process(), finished = DispatchSemaphore(value: 0)
+         process.executableURL = configuration.python
+-        process.arguments = ["-B", helper, "--commit-file", commitURL.path]
++        process.arguments = ["-I", "-B", helper, "--commit-file", commitURL.path]
+         process.environment = configuration.childEnvironment(environment)
+         process.standardInput = input; process.standardOutput = output; process.standardError = FileHandle.nullDevice
+         process.terminationHandler = { _ in finished.signal() }
+@@ -173,11 +176,11 @@ enum CoreDeviceTouch {
+             try mapping.validate(captureSize: CGSize(width: reference.screenWidth, height: reference.screenHeight))
+             try beforeCommit(mapping)
+             // Once offered, interruption is uncertain even if no final receipt arrives.
+-            committed = true
+             let pending = directory.appendingPathComponent("commit.pending")
+             guard FileManager.default.createFile(atPath: pending.path, contents: Data("{\"commit\":true}".utf8),
+                 attributes: [.posixPermissions: 0o600]), rename(pending.path, commitURL.path) == 0
+             else { return failure("Could not commit touch program") }
++            committed = true
+             if finished.wait(timeout: .now() + 15) == .timedOut { return failure("Touch helper timed out after commit; do not replay") }
+         } else if process.isRunning {
+             return failure("Touch preflight did not become ready")
+diff --git a/Sources/iPhoneUse/Input/DeviceAccessibility.swift b/Sources/iPhoneUse/Input/DeviceAccessibility.swift
+index f0ddf96..1912349 100644
+--- a/Sources/iPhoneUse/Input/DeviceAccessibility.swift
++++ b/Sources/iPhoneUse/Input/DeviceAccessibility.swift
+@@ -74,7 +74,7 @@ enum DeviceAccessibility {
+         }
+         let process = Process()
+         process.executableURL = configuration.python
+-        process.arguments = [helper] + arguments
++        process.arguments = ["-I", "-B", helper] + arguments
+         process.environment = configuration.childEnvironment(environment)
+         process.standardInput = input
+         process.standardOutput = output
+diff --git a/Sources/iPhoneUse/Input/DeviceClipboard.swift b/Sources/iPhoneUse/Input/DeviceClipboard.swift
+index 87aa594..d37e3ff 100644
+--- a/Sources/iPhoneUse/Input/DeviceClipboard.swift
++++ b/Sources/iPhoneUse/Input/DeviceClipboard.swift
+@@ -8,6 +8,14 @@ enum DeviceClipboard {
+     static let pythonKey = "IPHONE_USE_USB_CLIPBOARD_PYTHON"
+     static let deviceKey = "IPHONE_USE_USB_DEVICE_ID"
+ 
++    enum WriteStatus: String { case notWritten = "not_written", unconfirmed }
++
++    /// Once the helper has launched, a failure cannot prove that SET did not occur.
++    struct WriteFailure: Error, CustomStringConvertible {
++        let status: WriteStatus
++        let description: String
++    }
++
+     static var isConfigured: Bool { isConfigured(environment: ProcessInfo.processInfo.environment) }
+ 
+     static func isConfigured(environment: [String: String]) -> Bool {
+@@ -21,6 +29,7 @@ enum DeviceClipboard {
+         init(environment: [String: String]) throws {
+             guard let python = environment[pythonKey], python.hasPrefix("/"),
+                 !python.contains("\0"), let deviceID = environment[deviceKey],
++                [25, 40].contains(deviceID.count),
+                 deviceID.range(of: "^(?:[0-9A-Fa-f]{8}-[0-9A-Fa-f]{16}|[0-9A-Fa-f]{40})$", options: .regularExpression)
+                     != nil
+             else {
+@@ -30,12 +39,12 @@ enum DeviceClipboard {
+             self.deviceID = deviceID
+         }
+ 
+-        var arguments: [String] { ["-m", "pymobiledevice3", "developer", "core-device", "copy", "--userspace"] }
++        var arguments: [String] { ["-I", "-B", "-m", "pymobiledevice3", "developer", "core-device", "copy", "--userspace"] }
+ 
+         func childEnvironment(_ inherited: [String: String]) -> [String: String] {
+             // Do not let a shell's tunnel or native-transport override select a
+             // different service route. --userspace and this exact ID are fixed.
+-            var result = inherited.filter { !$0.key.hasPrefix("PYMOBILEDEVICE3_") }
++            var result = inherited.filter { !$0.key.hasPrefix("PYMOBILEDEVICE3_") && !$0.key.hasPrefix("PYTHON") }
+             result["PYMOBILEDEVICE3_UDID"] = deviceID
+             result["PYMOBILEDEVICE3_USERSPACE"] = "1"
+             return result
+@@ -44,7 +53,24 @@ enum DeviceClipboard {
+ 
+     static func write(
+         _ text: String, environment: [String: String] = ProcessInfo.processInfo.environment,
+-        timeout: TimeInterval = 10
++        timeout: TimeInterval = 10, beforeWrite: () throws -> Void = {}
++    ) throws {
++        var helperStarted = false
++        do {
++            try performWrite(text, environment: environment, timeout: timeout, beforeWrite: beforeWrite) {
++                helperStarted = true
++            }
++        } catch let failure as WriteFailure {
++            throw failure
++        } catch {
++            throw WriteFailure(status: helperStarted ? .unconfirmed : .notWritten,
++                description: String(describing: error))
++        }
++    }
++
++    private static func performWrite(
++        _ text: String, environment: [String: String], timeout: TimeInterval,
++        beforeWrite: () throws -> Void, didLaunch: () -> Void
+     ) throws {
+         let configuration = try Configuration(environment: environment)
+         guard timeout.isFinite, timeout > 0 else { throw DeviceError("USB clipboard timeout must be positive") }
+@@ -84,9 +110,13 @@ enum DeviceClipboard {
+         process.standardError = diagnostic
+         let finished = DispatchSemaphore(value: 0)
+         process.terminationHandler = { _ in finished.signal() }
++        // The caller may revalidate the physical target after local preparation.
++        // Failure here is definitively before the clipboard helper can write.
++        try beforeWrite()
+         do { try process.run() } catch {
+             throw DeviceError("Could not start USB clipboard helper: \(error.localizedDescription)")
+         }
++        didLaunch()
+         guard finished.wait(timeout: .now() + timeout) == .success else {
+             // Stop only this helper. Do not switch transports or repeat SET.
+             if process.isRunning { process.terminate() }
+diff --git a/Sources/iPhoneUse/Localization/StringsMCP.swift b/Sources/iPhoneUse/Localization/StringsMCP.swift
+index f345527..c49af80 100644
+--- a/Sources/iPhoneUse/Localization/StringsMCP.swift
++++ b/Sources/iPhoneUse/Localization/StringsMCP.swift
+@@ -38,10 +38,10 @@ struct StringsMCP: LocalizedTable {
+ 
+     static let zh = StringsMCP(
+         instructions:
+-            "控制真实 iPhone。先读取 session_context，再观察当前界面：accessibility_tree 提供原生控件/文字证据；触控须取新 screenshot 的 frame.id 与像素坐标。用 act 执行输入；每批最多一个 tap、swipe 或 touch，且必须第一步，后续可输入文字/按键或等待。长按用 tap.hold，多触点用 touch.samples。触控只走已配置 USB；缺失 frame 或后端时明确拒绝，不切换 BLE、不重放。无障碍坐标不是触控引用，也不保证可点击；操作后检查返回观察，应用结果须另行核实。截图长边最多1000像素。连接多台时先用 list_devices 并传 device。操作和观察按手机串行，其他会话仍可能在调用之间改变屏幕。",
++            "控制真实 iPhone。先读取 session_context，再观察当前界面：accessibility_tree 提供原生控件/文字证据；触控须取新 screenshot 的 frame.id 与像素坐标。只有 screenshot 提供触控引用；act 返回的观察和 screenshot_burst 不提供引用，下次触控前须重新调用 screenshot。用 act 执行输入；每批最多一个 tap、swipe 或 touch，且必须第一步，后续可输入文字/按键或等待。长按用 tap.hold，多触点用 touch.samples。触控只走已配置 USB；缺失 frame 或后端时明确拒绝，不切换 BLE、不重放。无障碍坐标不是触控引用，也不保证可点击；操作后检查返回观察，应用结果须另行核实。截图长边最多1000像素。连接多台时先用 list_devices 并传 device。操作和观察按手机串行，其他会话仍可能在调用之间改变屏幕。",
+         deviceParam: "目标 iPhone（list_devices 返回的 id 或名称）。device_id 是 device 的别名；同时提供时优先 device。连接多台时才需要传入。",
+         toolListDevices: "列出当前连接的 iPhone。",
+-        toolScreenshot: "截取 iPhone 当前屏幕，附带 OCR 文字中心点（左上角原点像素坐标）。include_image=false 时仅返回文字。OCR 可能遗漏或误识别。",
++        toolScreenshot: "截取 iPhone 当前屏幕，返回供下一次触控使用的单次 frame.id，附带 OCR 文字中心点（左上角原点像素坐标）。include_image=false 时仅返回文字。OCR 可能遗漏或误识别。",
+         toolOCRScreen: "识别屏幕文字，仅返回文字与左上角原点像素坐标，不含图片。maxEdge 默认为 1000。",
+         includeImage: "是否返回图片（默认 true；false 仅返回文字与 OCR）",
+         toolTypeText:
+@@ -53,7 +53,7 @@ struct StringsMCP: LocalizedTable {
+         invalidDeviceList: "应用返回的设备列表无效",
+         expectedOneMatch: { "期望匹配到一台 iPhone，实际 \($0) 台。请调用 list_devices 并传入完整 device ID。" },
+         actStopped: "之前的输入可能已执行，请勿重放；失败步骤可能部分执行，继续前请重新观察。",
+-        screenshotCaption: { "\($0) 的截图，\($1)x\($2) 像素。触控使用这张截图的 frame.id 与像素坐标，作为 act 的第一步。" },
++        screenshotCaption: { "\($0) 的截图，\($1)x\($2) 像素。" },
+         noResponse: "无响应",
+         appNotRunning: { "iPhone Use 应用未运行（\($0)）" },
+         lockStateDirAbsolute: "IPHONE_USE_STATE_DIR 必须是所有客户端共享的绝对路径。",
+@@ -64,12 +64,12 @@ struct StringsMCP: LocalizedTable {
+ 
+     static let en = StringsMCP(
+         instructions:
+-            "Controls real iPhones. Read session_context, then observe: accessibility_tree provides native control/text evidence; touch requires a fresh screenshot frame.id and its pixels. Use act for input. At most one tap, swipe or touch, first in each batch; subsequent steps may type, press keys or wait. Long press uses tap.hold; multitouch uses touch.samples. Touch requires configured USB and a frame; missing requirements fail explicitly without BLE fallback or replay. Accessibility coordinates are not touch references or proof of hittability. Inspect returned observations and verify app results separately. Screenshots have a maximum long edge of 1000 pixels. With several phones, use list_devices and pass device. Actions and observations are serialized per phone, but other sessions can change the screen between calls.",
++            "Controls real iPhones. Read session_context, then observe: accessibility_tree provides native control/text evidence; touch requires a fresh screenshot frame.id and its pixels. Only screenshot supplies a touch reference; act observations and screenshot_burst do not, so call screenshot again before the next touch. Use act for input. At most one tap, swipe or touch, first in each batch; subsequent steps may type, press keys or wait. Long press uses tap.hold; multitouch uses touch.samples. Touch requires configured USB and a frame; missing requirements fail explicitly without BLE fallback or replay. Accessibility coordinates are not touch references or proof of hittability. Inspect returned observations and verify app results separately. Screenshots have a maximum long edge of 1000 pixels. With several phones, use list_devices and pass device. Actions and observations are serialized per phone, but other sessions can change the screen between calls.",
+         deviceParam:
+             "Which iPhone (id or name from list_devices). device_id aliases device; device takes precedence. Only needed when several are connected.",
+         toolListDevices: "List the connected iPhones.",
+         toolScreenshot:
+-            "Capture the screen with OCR text centers in top-left pixel coordinates. Set include_image=false for text only. OCR may miss or misread text.",
++            "Capture the screen and return a one-use frame.id for the next touch, with OCR text centers in top-left pixel coordinates. Set include_image=false for text only. OCR may miss or misread text.",
+         toolOCRScreen:
+             "Recognize screen text with top-left pixel coordinates; returns text only, no image. maxEdge defaults to 1000.",
+         includeImage: "Return the image (default true; false returns text and OCR only)",
+@@ -86,7 +86,7 @@ struct StringsMCP: LocalizedTable {
+         actStopped:
+             "Earlier input may have executed; do not replay it. The failed step may have partially executed; observe again before continuing.",
+         screenshotCaption: {
+-            "Screenshot of \($0), \($1)x\($2) px. Use this frame.id and its pixels for the first touch step in act."
++            "Screenshot of \($0), \($1)x\($2) px."
+         },
+         noResponse: "no response",
+         appNotRunning: { "iPhone Use app is not running (\($0))" },
+diff --git a/Sources/iPhoneUse/MCP/MCPContextStore.swift b/Sources/iPhoneUse/MCP/MCPContextStore.swift
+index 4246009..aebf169 100644
+--- a/Sources/iPhoneUse/MCP/MCPContextStore.swift
++++ b/Sources/iPhoneUse/MCP/MCPContextStore.swift
+@@ -254,7 +254,7 @@ final class MCPContextRecording {
+     private var frameRejected = false
+     var transportStatus: String? {
+         if let stepReceipts { return Self.batchOutcome(stepReceipts, failed: batchFailed).status }
+-        return transportReceipt?["input_status"] as? String
++        return transportReceipt.map(CoreDeviceKeyboard.operationStatus)
+     }
+     private let inputFrameID: String?
+     private let isInput: Bool
+@@ -348,8 +348,7 @@ final class MCPContextRecording {
+         let inputs = steps.filter { !["delay", "wait_text"].contains($0["type"] as? String ?? "") }
+         let statuses = inputs.map { step -> String in
+             if let transport = (step["keyboard_receipt"] ?? step["touch_receipt"]) as? [String: Any] {
+-                if transport["no_op"] as? Bool == true { return "not_sent" }
+-                return transport["input_status"] as? String ?? "unconfirmed"
++                return CoreDeviceKeyboard.operationStatus(transport)
+             }
+             if step["input_sent"] as? Bool == false { return "not_sent" }
+             return step["ok"] as? Bool == true ? "acknowledged" : "unconfirmed"
+@@ -406,14 +405,22 @@ final class MCPContextRecording {
+                 }
+                 if metadata["ok"] != nil { metadata["ok"] = result["isError"] as? Bool != true }
+             } else if let transportReceipt {
+-                receipt["status"] = transportReceipt["input_status"] ?? "unconfirmed"
+-                if transportReceipt["input_status"] as? String != "sent_unverified", transportReceipt["no_op"] as? Bool != true {
++                let status = CoreDeviceKeyboard.operationStatus(transportReceipt)
++                receipt["status"] = status
++                if status != "sent_unverified", !(status == "not_sent" && transportReceipt["no_op"] as? Bool == true) {
+                     result["isError"] = true
+                 }
++                if metadata["ok"] != nil { metadata["ok"] = result["isError"] as? Bool != true }
+             }
+             for (key, value) in progress { receipt[key] = value }
+             if frameRejected { metadata["frame_rejected"] = true }
+-            if rejectedBeforeInput { metadata["input_sent"] = false }
++            if rejectedBeforeInput, receipt["status"] as? String == "not_sent" {
++                metadata["input_sent"] = false
++            } else if receipt["status"] as? String != "not_sent" {
++                // A legacy HID-only rejection cannot erase a clipboard write or
++                // an earlier side effect already established by leaf receipts.
++                metadata.removeValue(forKey: "input_sent")
++            }
+             metadata["input_receipt"] = receipt
+         }
+         result["structuredContent"] = metadata
+diff --git a/Sources/iPhoneUse/MCP/MCPResultSummary.swift b/Sources/iPhoneUse/MCP/MCPResultSummary.swift
+index a7e3a95..6f2e64d 100644
+--- a/Sources/iPhoneUse/MCP/MCPResultSummary.swift
++++ b/Sources/iPhoneUse/MCP/MCPResultSummary.swift
+@@ -8,8 +8,20 @@ enum MCPResultSummary {
+         let transport = receipt["transport"] as? [String: Any] ?? [:]
+         let backend = transport["backend"] as? String
+         let route = backend.map { " (\($0))" } ?? ""
++        let steps = receipt["steps"] as? [[String: Any]] ?? []
++        let clipboardRows: [(String, [String: Any])] = steps.isEmpty
++            ? [("", transport)]
++            : steps.enumerated().compactMap { index, step in
++                guard let keyboard = step["keyboard_receipt"] as? [String: Any] else { return nil }
++                return ("Step \(step["step"] as? Int ?? index + 1) ", keyboard)
++            }
++        let possibleClipboardWrite = clipboardRows.contains { CoreDeviceKeyboard.hasPossibleClipboardWrite($0.1) }
++        var status = receipt["status"] as? String
++        if (status == "not_sent" && possibleClipboardWrite) || clipboardRows.contains(where: {
++            CoreDeviceKeyboard.hasPossibleClipboardWrite($0.1) && CoreDeviceKeyboard.operationStatus($0.1) == "unconfirmed"
++        }) { status = "unconfirmed" }
+         let input: String
+-        switch receipt["status"] as? String {
++        switch status {
+         case "sent_unverified":
+             input = "locally sent\(route); device delivery unverified"
+         case "acknowledged":
+@@ -22,6 +34,27 @@ enum MCPResultSummary {
+             input = "status unknown; execution not established"
+         }
+         var lines = ["Input: \(input)."]
++        for (prefix, keyboard) in clipboardRows where keyboard["clipboard_status"] != nil
++            && keyboard["clipboard_status"] as? String != "not_requested" {
++            let hid = keyboard["hid_input_status"] as? String ?? keyboard["input_status"] as? String
++            let hidText: String
++            switch hid {
++            case "not_sent": hidText = "not sent"
++            case "sent_unverified": hidText = "locally sent; device delivery unverified"
++            default: hidText = "unconfirmed; may have been sent"
++            }
++            lines.append("\(prefix)HID: \(hidText).")
++            let clipboardText: String
++            switch keyboard["clipboard_status"] as? String {
++            case "not_written": clipboardText = "not written"
++            case "written_unverified": clipboardText = "write acknowledged; device content and paste unverified"
++            default: clipboardText = "write unconfirmed; the phone clipboard may have changed"
++            }
++            lines.append("\(prefix)Clipboard: \(clipboardText).")
++        }
++        if status == "unconfirmed", possibleClipboardWrite {
++            lines.append("Phone side effects: possible; do not replay automatically. Observe before deciding what to do next.")
++        }
+         if let observation = metadata["observation"] as? [String: Any] {
+             if observation["status"] as? String == "unobserved",
+                 observation["reason"] as? String == "disabled"
+@@ -50,7 +83,6 @@ enum MCPResultSummary {
+         }
+         // These routes do not evaluate an application-specific success condition.
+         lines.append("App result: unverified.")
+-        let steps = receipt["steps"] as? [[String: Any]] ?? []
+         if hasCleanupWarning(transport) || steps.contains(where: {
+             hasCleanupWarning(($0["keyboard_receipt"] ?? $0["touch_receipt"]) as? [String: Any] ?? [:])
+         }) {
+diff --git a/Sources/iPhoneUse/MCP/MCPServer.swift b/Sources/iPhoneUse/MCP/MCPServer.swift
+index 7e7f1d0..571e175 100644
+--- a/Sources/iPhoneUse/MCP/MCPServer.swift
++++ b/Sources/iPhoneUse/MCP/MCPServer.swift
+@@ -197,9 +197,10 @@ enum MCPServer {
+                         }
+                         let shouldObserve = observe != "none"
+                         // A baseline is diagnostic only: failure must not prevent authorized input.
++                        // Its USB capture budget is independent of post-input observation.
+                         let baseline =
+                             action != nil && shouldObserve
+-                            ? try? readScreenshot(device, baseline: true, timeout: 0.4) : nil
++                            ? try? readScreenshot(device, baseline: true, timeout: 2.0) : nil
+                         if let action {
+                             var body = action.body
+                             body["device"] = device
+@@ -230,7 +231,7 @@ enum MCPServer {
+                             baseline: baseline, acknowledgedAt: acknowledgedAt, timeout: observationTimeout
+                         ) { remaining in
+                             do {
+-                                return try readScreenshot(device, timeout: remaining)
++                                return try readScreenshot(device, observationOnly: true, timeout: remaining)
+                             } catch {
+                                 captureError = "\(error)"
+                                 return nil
+@@ -239,7 +240,8 @@ enum MCPServer {
+                         if observation.status == .unobserved { observation.detail = captureError }
+                         recording.finish(observation)
+                         return recording.attach(
+-                            to: observationContent(observation, includeImage: includeImage, diff: observe == "ocr_diff", inputStatus: recording.transportStatus)
++                            to: observationContent(observation, includeImage: includeImage, diff: observe == "ocr_diff",
++                                inputStatus: recording.transportStatus, baseline: baseline)
+                         )
+                     } catch {
+                         devicesCache.invalidate()
+@@ -383,7 +385,7 @@ enum MCPServer {
+     }
+ 
+     static func observationTimeout(_ raw: Any?) throws -> TimeInterval {
+-        guard let raw else { return 1.5 }
++        guard let raw else { return 3.0 }
+         guard let number = raw as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+             number.doubleValue.isFinite, (0.2...5).contains(number.doubleValue)
+         else { throw MCPError("observation_timeout must be a finite number from 0.2 to 5 seconds") }
+@@ -578,13 +580,14 @@ enum MCPServer {
+     }
+ 
+     private static func readScreenshot(
+-        _ device: String?, baseline: Bool = false, timeout: TimeInterval = 60
++        _ device: String?, baseline: Bool = false, observationOnly: Bool = false, timeout: TimeInterval = 60
+     ) throws -> ObservationFrame {
+         var path = "/screenshot?maxEdge=\(longEdge)"
+         if let device, let encoded = device.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
+             path += "&device=\(encoded)"
+         }
+         path += baseline ? "&format=png&stability=1" : "&ocr=1"
++        if baseline || observationOnly { path += "&observationOnly=1" }
+         let (image, response) = try client.get(path, timeout: timeout)
+         let width = response.value(forHTTPHeaderField: "X-Image-Width") ?? "?"
+         let height = response.value(forHTTPHeaderField: "X-Image-Height") ?? "?"
+@@ -595,28 +598,25 @@ enum MCPServer {
+             image: image, device: id, width: width, height: height,
+             mimeType: response.value(forHTTPHeaderField: "Content-Type") ?? "image/jpeg",
+             identity: FrameIdentity.parse(response), signature: ScreenOCR.stabilitySignature(image), ocr: serverOCR,
+-            frameID: response.value(forHTTPHeaderField: "X-Frame-ID"))
++            frameID: baseline || observationOnly ? nil : response.value(forHTTPHeaderField: "X-Frame-ID"))
+     }
+ 
+     static func screenshotContent(
+-        _ frame: ObservationFrame, includeImage: Bool, diff: Bool
++        _ frame: ObservationFrame, includeImage: Bool, diff: Bool, baseline: ObservationFrame? = nil
+     ) -> [String: Any] {
+-        let ocr = frame.ocr ?? ScreenOCR.recognize(frame.image, device: frame.device)
+         var result: [String: Any]
+         if diff {
+-            let text =
+-                ocr.screenHash.isEmpty
+-                ? "OCR observation unavailable"
+-                : ScreenOCR.summaryDiff(for: ocr, device: frame.device)
+-            result = ["content": [["type": "text", "text": text]]]
++            result = ocrDifferenceContent(frame, baseline: baseline)
+         } else {
+-            if !ocr.screenHash.isEmpty { _ = ScreenOCR.diff(device: frame.device, current: ocr) }
++            let ocr = frame.ocr ?? ScreenOCR.recognize(frame.image, device: frame.device)
+             result = screenshotContent(
+                 image: frame.image, device: frame.device, width: frame.width, height: frame.height,
+                 includeImage: includeImage, ocr: ocr, mimeType: frame.mimeType)
+         }
+         if let reference = frame.referenceJSON {
+-            result["structuredContent"] = ["frame": reference]
++            var metadata = result["structuredContent"] as? [String: Any] ?? [:]
++            metadata["frame"] = reference
++            result["structuredContent"] = metadata
+             var content = result["content"] as? [[String: Any]] ?? []
+             if let data = try? JSONSerialization.data(withJSONObject: ["frame": reference], options: [.sortedKeys]) {
+                 content.append(["type": "text", "text": String(decoding: data, as: UTF8.self)])
+@@ -626,18 +626,66 @@ enum MCPServer {
+         return result
+     }
+ 
++    /// Both OCR inputs belong to this call. Missing recognition is not an empty
++    /// screen and must never fall back to a previous tool call's observation.
++    static func ocrDifferenceContent(_ frame: ObservationFrame?, baseline: ObservationFrame?) -> [String: Any] {
++        let current = frame.map { $0.ocr ?? ScreenOCR.recognize($0.image, device: $0.device) }
++        let before = baseline.map { $0.ocr ?? ScreenOCR.recognize($0.image, device: $0.device) }
++        var comparison: [String: Any] = [
++            "comparison_reference": "this_call_pre_input_capture",
++            "comparison": "recognized_text_set",
++            "baseline_available": before.map { !$0.screenHash.isEmpty } ?? false,
++            "current_available": current.map { !$0.screenHash.isEmpty } ?? false,
++            "baseline_screen_hash": before.flatMap { $0.screenHash.isEmpty ? nil : $0.screenHash } as Any? ?? NSNull(),
++            "current_screen_hash": current.flatMap { $0.screenHash.isEmpty ? nil : $0.screenHash } as Any? ?? NSNull(),
++            "unchanged": NSNull(),
++        ]
++        let text: String
++        if let current, !current.screenHash.isEmpty, let before, !before.screenHash.isEmpty,
++            frame?.device == baseline?.device {
++            let difference = ScreenOCR.diff(baseline: before, current: current)
++            comparison["status"] = "compared"
++            comparison["added"] = difference.added
++            comparison["removed"] = difference.removed
++            comparison["unchanged"] = difference.unchanged
++            text = difference.summary
++        } else {
++            let status = current == nil || current?.screenHash.isEmpty == true ? "current_unavailable"
++                : before == nil || before?.screenHash.isEmpty == true ? "baseline_unavailable" : "device_mismatch"
++            comparison["status"] = status
++            text = "OCR comparison unavailable: \(status). No prior-call baseline substituted."
++        }
++        return ["content": [["type": "text", "text": text]], "structuredContent": ["ocr_diff": comparison]]
++    }
++
+     static func observationContent(
+-        _ observation: ObservationResult, includeImage: Bool, diff: Bool, inputStatus: String? = nil
++        _ observation: ObservationResult, includeImage: Bool, diff: Bool, inputStatus: String? = nil,
++        baseline: ObservationFrame? = nil
+     ) -> [String: Any] {
+         var metadata: [String: Any] = [
+             "ok": inputStatus == nil || ["sent_unverified", "acknowledged"].contains(inputStatus!), "action_acknowledged": true, "hid_delivery": "unverified",
+             "app_completion": "unverified", "observation": observation.json,
++            "touch_reference": ["status": "not_issued", "reason": "action_observation_only", "next_tool": "screenshot"],
+         ]
+         if let inputStatus { metadata["input_status"] = inputStatus }
+-        if let reference = observation.frame?.referenceJSON { metadata["frame"] = reference }
+         var result =
+-            observation.frame.map { screenshotContent($0, includeImage: includeImage, diff: diff) }
+-            ?? ["content": []]
++            observation.frame.map { frame -> [String: Any] in
++                var frame = frame
++                frame.frameID = nil
++                return screenshotContent(frame, includeImage: includeImage, diff: diff, baseline: baseline)
++            }
++            ?? (diff ? ocrDifferenceContent(nil, baseline: baseline) : ["content": []])
++        if let comparison = (result["structuredContent"] as? [String: Any])?["ocr_diff"] {
++            metadata["ocr_diff"] = comparison
++        }
++        if observation.frame != nil, var content = result["content"] as? [[String: Any]],
++            let index = content.firstIndex(where: { $0["type"] as? String == "text" }),
++            let text = content[index]["text"] as? String {
++            content[index]["text"] = text + (language == .zh
++                ? "\n操作后观察不含触控引用；下次触控前调用 screenshot 获取新的 frame.id。"
++                : "\nAction observation only; call screenshot for a fresh frame.id before the next touch.")
++            result["content"] = content
++        }
+         // attach() adds the input/observation/app-result summary after it has
+         // assembled the final input receipt. Do not duplicate this metadata.
+         result["structuredContent"] = metadata
+diff --git a/Sources/iPhoneUse/MCP/MCPTools.swift b/Sources/iPhoneUse/MCP/MCPTools.swift
+index 45199bf..66f5295 100644
+--- a/Sources/iPhoneUse/MCP/MCPTools.swift
++++ b/Sources/iPhoneUse/MCP/MCPTools.swift
+@@ -49,8 +49,8 @@ enum MCPToolCatalog {
+             tool(
+                 "screenshot_burst",
+                 language == .zh
+-                    ? "连续观察短暂动画，不发送输入。返回 2–6 张按采样时间排列的全新截图（默认 3 张、间隔 300ms，长边最多 1000px），附实际采样间隔；画面相同也可属于不同采样。采样阶段最多 6 秒、图片合计 8MiB；无法采到足量帧时明确返回部分结果。不是实时控制，不运行 OCR。"
+-                    : "Observe a short animation without input: 2–6 ordered fresh screenshots (default 3, interval 300ms, long edge 1000px) with actual capture gaps. Identical pixels can be distinct samples. Sampling is capped at 6s and 8MiB of images; unavailable samples produce an explicit partial result. This is not realtime control and does not run OCR.",
++                    ? "连续观察短暂动画，不发送输入。返回 2–6 张按采样时间排列的全新截图（默认 3 张、间隔 300ms，长边最多 1000px），附实际采样间隔；画面相同也可属于不同采样。采样阶段最多 6 秒、图片合计 8MiB；无法采到足量帧时明确返回部分结果。不是实时控制，不运行 OCR，不提供触控引用；触控前须单独调用 screenshot。"
++                    : "Observe a short animation without input: 2–6 ordered fresh screenshots (default 3, interval 300ms, long edge 1000px) with actual capture gaps. Identical pixels can be distinct samples. Sampling is capped at 6s and 8MiB of images; unavailable samples produce an explicit partial result. This is not realtime control and does not run OCR or supply touch references; call screenshot separately before touch.",
+                 [
+                     "device": device, "include_image": includeImage,
+                     "frames": ["type": "integer", "minimum": 2, "maximum": 6, "default": 3],
+@@ -60,8 +60,8 @@ enum MCPToolCatalog {
+             tool(
+                 "act",
+                 language == .zh
+-                    ? "顺序执行 tap（hold 可长按）、swipe、touch 多触点、type、key、home、delay 或 wait_text；失败立即停止，不重放。每批最多一个触控步骤且必须第一步，使用新截图的 frame_id 和像素；不支持归一化坐标或文字点按。触控、键盘与 Home 均走已配置 USB；Home 使用 Cmd+H。最多16步；USB计划输入加延时/等待总预算30秒，执行窗口耗尽后不再启动后续步骤；不会取消已经执行中的步骤。检查返回观察，本地发送不代表应用完成。"
+-                    : "Execute ordered tap (hold for long press), swipe, touch multitouch, type, key, home, delay or wait_text steps; stop on failure, never replay. At most one touch step, first in the batch, using a fresh screenshot frame_id and its pixels; no normalized or text-targeted touch. Touch, keyboard and Home use configured USB; Home uses Cmd+H. At most 16 steps; USB planned input plus delay/wait budget is 30 seconds. The execution window stops admission of later steps, not an already-running step. Inspect observations; local send is not app completion.",
++                    ? "顺序执行 tap（hold 可长按）、swipe、touch 多触点、type、key、home、delay 或 wait_text；失败立即停止，不重放。每批最多一个触控步骤且必须第一步，使用新截图的 frame_id 和像素；不支持归一化坐标或文字点按。触控、键盘与 Home 均走已配置 USB；Home 使用原生 USB 按钮。最多16步；USB计划输入加延时/等待总预算30秒，执行窗口耗尽后不再启动后续步骤；不会取消已经执行中的步骤。返回图片仅供观察，不含触控引用；下次触控前须单独调用 screenshot。检查返回观察，本地发送不代表应用完成。"
++                    : "Execute ordered tap (hold for long press), swipe, touch multitouch, type, key, home, delay or wait_text steps; stop on failure, never replay. At most one touch step, first in the batch, using a fresh screenshot frame_id and its pixels; no normalized or text-targeted touch. Touch, keyboard and Home use configured USB; Home uses a native USB button. At most 16 steps; USB planned input plus delay/wait budget is 30 seconds. The execution window stops admission of later steps, not an already-running step. Returned images are observations without touch references; call screenshot separately before the next touch. Inspect observations; local send is not app completion.",
+                 [
+                     "steps": actSteps(for: table),
+                     "device": device,
+@@ -118,11 +118,14 @@ enum MCPToolCatalog {
+             ]
+         }
+         if !readOnly && name != "session_context" {
+-            properties["observe"] = ["type": "string", "enum": ["full", "ocr_diff", "none"], "default": "full"]
++            properties["observe"] = [
++                "type": "string", "enum": ["full", "ocr_diff", "none"], "default": "full",
++                "description": "ocr_diff compares OCR from this call's pre-input capture with its returned observation, never prior client history. Missing baseline or current OCR is reported explicitly. none skips both captures.",
++            ]
+             properties["observation_timeout"] = [
+-                "type": "number", "minimum": 0.2, "maximum": 5, "default": 1.5,
++                "type": "number", "minimum": 0.2, "maximum": 5, "default": 3.0,
+                 "description":
+-                    "Seconds to observe after input. Change compares to the capture before sending this call's input sequence, not the last screenshot shown to you. Reports fresh visual change/stability, not app completion; never retries input.",
++                    "Independent post-input observation budget in seconds (default 3). The optional pre-input baseline has a separate 2-second capture budget; failure does not block input. Change compares to that same-call baseline, not the last screenshot shown to you. Reports fresh visual change/stability, not app completion; never retries input.",
+             ]
+         }
+         var schema: [String: Any] = ["type": "object", "properties": properties, "required": required]
+diff --git a/Tests/PythonTests/test_mcp_stdio.py b/Tests/PythonTests/test_mcp_stdio.py
+index d9b56ba..7008870 100644
+--- a/Tests/PythonTests/test_mcp_stdio.py
++++ b/Tests/PythonTests/test_mcp_stdio.py
+@@ -270,11 +270,60 @@ class MCPStdioTests(unittest.TestCase):
+         self.assertEqual(receipt["input_receipt"]["status"], "acknowledged")
+         self.assertEqual(receipt["input_receipt"]["based_on_frame_id"], frame_id)
+         self.assertTrue(receipt["observation"]["fresh"])
+-        self.assertNotEqual(receipt["frame"]["id"], frame_id)
++        self.assertNotIn("frame", receipt)
++        self.assertEqual(receipt["touch_reference"], {
++            "status": "not_issued", "reason": "action_observation_only", "next_tool": "screenshot",
++        })
+         images = [b for b in action["content"] if b["type"] == "image"]
+         self.assertEqual(len(images), 1)
+         self.assertEqual(base64.b64decode(images[0]["data"]), capture_reply(160, 1, 0)[1])
+ 
++    def test_full_frame_cache_survives_internal_baseline_polls_and_burst(self):
++        # Model the route's bounded store already filled by prior public frames.
++        # Native ScreenshotObservationOnlyTests exercises the actual store too.
++        tokens = ["00000000-0000-4000-8000-%012d" % index for index in range(1, 129)]
++        state = {"sequence": 0, "posted": False, "issued": 0, "selected_was_present": False}
++        reads = []
++
++        def screenshot(path):
++            reads.append(path)
++            state["sequence"] += 1
++            status, image, headers = capture_reply(240 if state["posted"] else 0,
++                                                    state["sequence"], capture_uptime())
++            if parse_qs(urlsplit(path).query).get("observationOnly") != ["1"]:
++                state["issued"] += 1
++                token = "00000000-0000-4000-9000-%012d" % state["issued"]
++                tokens.append(token)
++                if len(tokens) > 128:
++                    tokens.pop(0)
++                headers["X-Frame-ID"] = token
++            return status, image, headers
++
++        def post(body):
++            state["selected_was_present"] = body["steps"][0]["frame_id"] in tokens
++            if state["selected_was_present"]:
++                tokens.remove(body["steps"][0]["frame_id"])
++            state["posted"] = True
++
++        self.server.screenshot_response = screenshot
++        self.server.before_post = post
++        action, burst, public = self.exchange([
++            ("act", {"steps": [{"type": "tap", "frame_id": FRAME, "x": 7, "y": 9}],
++                     "observation_timeout": 0.5}),
++            ("screenshot_burst", {"frames": 2, "interval_ms": 100}),
++            ("screenshot", {}),
++        ])
++        self.assertTrue(state["selected_was_present"], "hidden baseline evicted the selected frame before input")
++        self.assertTrue(all(not result.get("isError") for result in (action, burst, public)))
++        self.assertEqual(state["issued"], 1, "only the explicitly requested screenshot may issue a token")
++        self.assertEqual(len(tokens), 128)
++        self.assertIn("00000000-0000-4000-8000-000000000002", tokens)
++        self.assertNotIn("frame", action["structuredContent"])
++        self.assertNotIn("frame", burst["structuredContent"])
++        self.assertIn(public["structuredContent"]["frame"]["id"], tokens)
++        self.assertTrue(all(parse_qs(urlsplit(path).query).get("observationOnly") == ["1"] for path in reads[:-1]))
++        self.assertNotIn("observationOnly", parse_qs(urlsplit(reads[-1]).query))
++
+     def test_frame_rejection_is_not_sent_but_other_http_errors_stay_unconfirmed(self):
+         args = {"steps": [{"type": "tap", "frame_id": FRAME, "x": 7, "y": 12}]}
+         self.server.frame_rejection = True
+@@ -319,6 +368,7 @@ class MCPStdioTests(unittest.TestCase):
+             nonlocal sequence
+             self.assertIn("format=png&stability=1", path)
+             self.assertNotIn("ocr=1", path)
++            self.assertEqual(parse_qs(urlsplit(path).query).get("observationOnly"), ["1"])
+             sequence += 1
+             return capture_reply(sequence * 40, sequence, capture_uptime())
+ 
+@@ -872,30 +922,83 @@ class MCPStdioTests(unittest.TestCase):
+         self.assertFalse(any(event[1].startswith("/screenshot") for event in self.server.events))
+         self.assertEqual(self.server.stability_events, [])
+ 
+-    def test_diff_reuses_server_ocr_and_tracks_full_observation_baseline(self):
+-        observations = iter([("old", "a"), ("new", "b"), ("new", "b")])
++    def test_diff_uses_same_call_pre_input_ocr_instead_of_prior_client_history(self):
++        state = {"posts": 0, "sequence": 0}
++        self.server.before_post = lambda body: state.update(posts=state["posts"] + 1)
+ 
+-        def ocr(device):
+-            text, hash_value = next(observations)
+-            return {"device": device, "width": 500, "height": 1000, "screenHash": hash_value,
+-                    "items": [{"text": text, "x": 20, "y": 30}]}
++        def screenshot(path):
++            baseline = "stability=1" in path
++            text, hash_value = {
++                (False, 0): ("prior-client-history", "history"),
++                (True, 0): ("before-input", "before"),
++                (False, 1): ("after-input", "after"),
++                (True, 1): ("same", "same-before"),
++                (False, 2): ("same", "same-after"),
++            }[(baseline, state["posts"])]
++            state["sequence"] += 1
++            status, image, headers = capture_reply(0 if baseline else 240, state["sequence"], capture_uptime())
++            ocr = {"device": "phone-1", "width": 16, "height": 16, "screenHash": hash_value,
++                   "items": [{"text": text, "x": 2, "y": 3}]}
++            headers["X-Screen-OCR"] = base64.b64encode(json.dumps(ocr).encode()).decode()
++            return status, image, headers
+ 
+-        self.server.screen_ocr = ocr
+-        full, changed, unchanged = self.exchange([
+-            ("act", {"steps": [{"type": "home"}]}),
++        self.server.screenshot_response = screenshot
++        previous, changed, unchanged = self.exchange([
++            ("screenshot", {"include_image": False}),
+             ("act", {"steps": [{"type": "home"}], "observe": "ocr_diff"}),
+             ("act", {"steps": [{"type": "home"}], "observe": "ocr_diff"}),
+         ])
+-        self.assertNotIn("isError", full)
+-        self.assertIn('"old" (20,30)', full["content"][1]["text"])
++        self.assertNotIn("isError", previous)
++        self.assertIn('"prior-client-history" (2,3)', previous["content"][0]["text"])
+         for result in (changed, unchanged):
+             self.assertEqual([block["type"] for block in result["content"]], ["text", "text"])
+             self.assertTrue(result["content"][-1]["text"].startswith("Input:"))
+-        self.assertIn("+new", changed["content"][0]["text"])
+-        self.assertIn("-old", changed["content"][0]["text"])
+-        self.assertIn("screenHash: b", changed["content"][0]["text"])
++            self.assertEqual(result["structuredContent"]["ocr_diff"]["status"], "compared")
++        self.assertIn("+after-input", changed["content"][0]["text"])
++        self.assertIn("-before-input", changed["content"][0]["text"])
++        self.assertNotIn("prior-client-history", changed["content"][0]["text"])
++        self.assertIn("screenHash: after", changed["content"][0]["text"])
++        comparison = changed["structuredContent"]["ocr_diff"]
++        self.assertEqual(comparison["comparison_reference"], "this_call_pre_input_capture")
++        self.assertEqual(comparison["baseline_screen_hash"], "before")
++        self.assertEqual(comparison["current_screen_hash"], "after")
++        self.assertEqual(comparison["removed"], ["before-input"])
+         self.assertIn("unchanged: true", unchanged["content"][0]["text"])
+         self.assertTrue(self.server.stability_events)
++        self.assertTrue(all(parse_qs(urlsplit(path).query).get("observationOnly") == ["1"]
++                            for path in self.server.stability_events))
++
++    def test_diff_reports_missing_same_call_baseline_without_reusing_history(self):
++        state = {"posted": False, "sequence": 0}
++        self.server.before_post = lambda body: state.update(posted=True)
++
++        def screenshot(path):
++            if "stability=1" in path:
++                return 503, b'{"error":"baseline unavailable"}', None
++            state["sequence"] += 1
++            status, image, headers = capture_reply(240, state["sequence"], capture_uptime())
++            text = "current" if state["posted"] else "client-history"
++            ocr = {"device": "phone-1", "width": 16, "height": 16, "screenHash": text,
++                   "items": [{"text": text, "x": 2, "y": 3}]}
++            headers["X-Screen-OCR"] = base64.b64encode(json.dumps(ocr).encode()).decode()
++            return status, image, headers
++
++        self.server.screenshot_response = screenshot
++        _, result = self.exchange([
++            ("screenshot", {"include_image": False}),
++            ("act", {"steps": [{"type": "home"}], "observe": "ocr_diff", "observation_timeout": 1.5}),
++        ])
++        self.assertNotIn("isError", result)
++        comparison = result["structuredContent"]["ocr_diff"]
++        self.assertEqual(comparison["status"], "baseline_unavailable")
++        self.assertFalse(comparison["baseline_available"])
++        self.assertTrue(comparison["current_available"])
++        self.assertIsNone(comparison["unchanged"])
++        self.assertNotIn("added", comparison)
++        self.assertNotIn("removed", comparison)
++        self.assertIn("baseline_unavailable", result["content"][0]["text"])
++        self.assertNotIn("-client-history", result["content"][0]["text"])
++        self.assertEqual(sum(event[0] == "POST" for event in self.server.events), 1)
+ 
+     def test_invalid_observation_and_later_act_step_never_send_input(self):
+         calls = [("act", {"steps": [{"type": "home"}], "observe": value}) for value in ("bad", True, 1)]
+@@ -995,8 +1098,9 @@ class MCPStdioTests(unittest.TestCase):
+         self.assertFalse(observation["changed_from_baseline"])
+         self.assertGreaterEqual(observation["elapsed_ms"], 1500)
+         self.assertEqual(observation["frame"]["received_at_uptime"], selected_frame["received_at"])
+-        self.assertEqual(unchanged["structuredContent"]["frame"]["id"],
+-                         selected_frame["reply"][2]["X-Frame-ID"])
++        self.assertNotIn("frame", unchanged["structuredContent"])
++        self.assertEqual(unchanged["structuredContent"]["touch_reference"]["status"], "not_issued")
++        self.assertNotIn(selected_frame["reply"][2]["X-Frame-ID"], json.dumps(unchanged))
+         self.assertEqual(unchanged["content"][0]["data"],
+                          base64.b64encode(selected_frame["reply"][1]).decode())
+         self.assertEqual(sum(event[0] == "POST" for event in self.server.events), 2)
+@@ -1039,8 +1143,9 @@ class MCPStdioTests(unittest.TestCase):
+         late_frame = frames[-1]
+         self.assertEqual(observation["frame"]["sequence"], str(selected_frame["sequence"]))
+         self.assertEqual(observation["frame"]["received_at_uptime"], selected_frame["received_at"])
+-        self.assertEqual(result["structuredContent"]["frame"]["id"],
+-                         selected_frame["reply"][2]["X-Frame-ID"])
++        self.assertNotIn("frame", result["structuredContent"])
++        self.assertEqual(result["structuredContent"]["touch_reference"]["status"], "not_issued")
++        self.assertNotIn(selected_frame["reply"][2]["X-Frame-ID"], json.dumps(result))
+         self.assertEqual(result["content"][0]["data"], base64.b64encode(selected_frame["reply"][1]).decode())
+         self.assertNotEqual(selected_frame["reply"][1], late_frame["reply"][1])
+         self.assertEqual(observation["status"], "stable")
+@@ -1218,7 +1323,7 @@ class MCPStdioTests(unittest.TestCase):
+             ("GET", "/config?wake=0"),
+             ("GET", "/devices"),
+             ("POST", "/act", {"steps": [{"type": "tap", "frame_id": FRAME, "x": 120.5, "y": 400}], "device": "phone-1"}),
+-            ("GET", "/screenshot?maxEdge=1000&device=phone-1&ocr=1"),
++            ("GET", "/screenshot?maxEdge=1000&device=phone-1&ocr=1&observationOnly=1"),
+         ])
+ 
+     def test_ocr_screen_returns_only_text_and_preserves_dimensions_and_device(self):
+@@ -1281,7 +1386,7 @@ class MCPStdioTests(unittest.TestCase):
+         self.assertEqual(self.server.events, [
+             ("GET", "/config?wake=0"), ("GET", "/devices"),
+             ("POST", "/act", {"steps": steps, "device": "phone-1"}),
+-            ("GET", "/screenshot?maxEdge=1000&device=phone-1&ocr=1"),
++            ("GET", "/screenshot?maxEdge=1000&device=phone-1&ocr=1&observationOnly=1"),
+         ])
+ 
+     def test_device_id_routes_screenshot_and_actions_with_original_precedence(self):
+@@ -1378,7 +1483,7 @@ class MCPStdioTests(unittest.TestCase):
+         self.assertEqual(self.server.events, [
+             ("GET", "/config?wake=0"), ("GET", "/devices"),
+             ("POST", "/act", {"steps": steps, "device": "phone-1"}),
+-            ("GET", "/screenshot?maxEdge=1000&device=phone-1&ocr=1"),
++            ("GET", "/screenshot?maxEdge=1000&device=phone-1&ocr=1&observationOnly=1"),
+         ])
+ 
+     def test_invalid_later_act_keyboard_step_prevents_all_input_and_device_queries(self):
+@@ -1450,8 +1555,8 @@ class MCPStdioTests(unittest.TestCase):
+             self.assertNotIn("isError", other.result(timeout=8)[0])
+         changes = [event for event in self.server.events if event[0] == "POST" or event[1].startswith("/screenshot")]
+         self.assertEqual([event[:2] for event in changes], [
+-            ("POST", "/act"), ("GET", "/screenshot?maxEdge=1000&device=phone-1&ocr=1"),
+-            ("POST", "/act"), ("GET", "/screenshot?maxEdge=1000&device=phone-1&ocr=1"),
++            ("POST", "/act"), ("GET", "/screenshot?maxEdge=1000&device=phone-1&ocr=1&observationOnly=1"),
++            ("POST", "/act"), ("GET", "/screenshot?maxEdge=1000&device=phone-1&ocr=1&observationOnly=1"),
+         ])
+         self.assertEqual(changes[0][2]["steps"], steps)
+ 
+diff --git a/Tests/iPhoneUseTests/API/HTTPAPITests.swift b/Tests/iPhoneUseTests/API/HTTPAPITests.swift
+index e31389a..2409146 100644
+--- a/Tests/iPhoneUseTests/API/HTTPAPITests.swift
++++ b/Tests/iPhoneUseTests/API/HTTPAPITests.swift
+@@ -56,7 +56,7 @@ final class HTTPMessageTests: XCTestCase {
+         let body = Data([0, 127, 128, 255])
+         let response = HTTPResponse(status: 503, contentType: "image/png", headers: ["X-Device": "phone"], body: body)
+         let expectedHeader =
+-            "HTTP/1.1 503 Service Unavailable\r\nContent-Type: image/png\r\nContent-Length: 4\r\nConnection: close\r\nX-Device: phone\r\n\r\n"
++            "HTTP/1.1 503 Service Unavailable\r\nContent-Type: image/png\r\nContent-Length: 4\r\nConnection: close\r\nX-Device: phone\r\nCache-Control: no-store\r\n\r\n"
+         XCTAssertEqual(response.serialized, Data(expectedHeader.utf8) + body)
+     }
+ 
+diff --git a/Tests/iPhoneUseTests/API/Phase2Tests.swift b/Tests/iPhoneUseTests/API/Phase2Tests.swift
+index fe02759..b3a4057 100644
+--- a/Tests/iPhoneUseTests/API/Phase2Tests.swift
++++ b/Tests/iPhoneUseTests/API/Phase2Tests.swift
+@@ -176,22 +176,23 @@ final class Phase2Tests: XCTestCase {
+         XCTAssertEqual(ScreenOCR.screenHash(Data("invalid".utf8)), "")
+     }
+ 
+-    func testDiffIsPerDeviceAndRoundTripsServerOCR() throws {
++    func testDiffUsesOnlyItsExplicitBaselineAndRoundTripsServerOCR() throws {
+         let device = UUID().uuidString
+         func result(_ texts: [String], hash: String) -> ScreenOCR.Result {
+             ScreenOCR.Result(width: 16, height: 16, items: texts.map { .init(text: $0, x: 1, y: 2) }, screenHash: hash)
+         }
+         let first = result(["旧", "保留", "旧"], hash: "a")
+-        let initial = ScreenOCR.diff(device: device, current: first)
+-        XCTAssertEqual(Set(initial.added), ["旧", "保留"])
+-        XCTAssertFalse(initial.unchanged)
+         let next = result(["新", "保留"], hash: "b")
+-        let delta = ScreenOCR.diff(device: device, current: next)
++        let delta = ScreenOCR.diff(baseline: first, current: next)
+         XCTAssertEqual(delta.added, ["新"])
+         XCTAssertEqual(delta.removed, ["旧"])
+         XCTAssertEqual(delta.screenHash, "b")
+-        XCTAssertTrue(ScreenOCR.summaryDiff(for: next, device: device).contains("unchanged: true"))
+-        XCTAssertEqual(ScreenOCR.diff(device: device + "other", current: first).removed, [])
++        XCTAssertTrue(ScreenOCR.diff(baseline: next, current: next).summary.contains("unchanged: true"))
++        _ = ScreenOCR.diff(baseline: result(["unrelated"], hash: "history"), current: next)
++        let repeated = ScreenOCR.diff(baseline: first, current: next)
++        XCTAssertEqual(repeated.added, delta.added)
++        XCTAssertEqual(repeated.removed, delta.removed)
++        XCTAssertEqual(repeated.unchanged, delta.unchanged)
+         let encoded = try JSONSerialization.data(withJSONObject: next.json(device: device))
+         let decoded = try XCTUnwrap(ScreenOCR.decode(encoded))
+         XCTAssertEqual(decoded.items.map(\.text), next.items.map(\.text))
+diff --git a/Tests/iPhoneUseTests/API/ScreenshotObservationOnlyTests.swift b/Tests/iPhoneUseTests/API/ScreenshotObservationOnlyTests.swift
+index 2c198a2..7b59366 100644
+--- a/Tests/iPhoneUseTests/API/ScreenshotObservationOnlyTests.swift
++++ b/Tests/iPhoneUseTests/API/ScreenshotObservationOnlyTests.swift
+@@ -81,6 +81,7 @@ import Testing
+         #expect(preview["X-Frame-ID"] == nil)
+         #expect(preview == ordinary)
+         #expect(preview == [
++            "Cache-Control": "no-store",
+             "X-Device": "phone-a", "X-Frame-Source": "capture-a", "X-Frame-Sequence": "42",
+             "X-Frame-Received-At": "123.5", "X-Screen-Width": "2556", "X-Screen-Height": "1180",
+             "X-Image-Width": "1200", "X-Image-Height": "554",
+@@ -113,4 +114,20 @@ import Testing
+         #expect(throws: ScreenshotReferences.Rejected.self) { try consume(store, first) }
+         #expect(try consume(store, latest).id == latest)
+     }
++
++    @Test func internalBaselineBurstAndPollsPreserveEveryTokenInAFullCache() throws {
++        let store = ScreenshotReferences(capacity: 128)
++        let ids = try (0..<128).map { _ in try #require(headers(store)["X-Frame-ID"]) }
++        // The first token is already the next eviction candidate before the
++        // action's private baseline read. Internal observations must issue none.
++        for query in [
++            ["format": "png", "stability": "1", "observationOnly": "1"],
++            ["ocr": "1", "observationOnly": "1"],
++        ] {
++            for sequence in 0..<256 {
++                #expect(try headers(store, query: query, sequence: UInt64(sequence))["X-Frame-ID"] == nil)
++            }
++        }
++        for id in ids { #expect(try consume(store, id).id == id) }
++    }
+ }
+diff --git a/Tests/iPhoneUseTests/API/USBPhysicalTargetTests.swift b/Tests/iPhoneUseTests/API/USBPhysicalTargetTests.swift
+new file mode 100644
+index 0000000..87720cf
+--- /dev/null
++++ b/Tests/iPhoneUseTests/API/USBPhysicalTargetTests.swift
+@@ -0,0 +1,156 @@
++import Foundation
++import ImageIO
++import Testing
++@testable import iPhoneUse
++
++@Suite(.serialized) struct USBPhysicalTargetTests {
++    private let a = "11111111-1111111111111111"
++    private let b = "22222222-2222222222222222"
++
++    private final class Harness {
++        var captures = 0, keyboardOpens = 0, touchOpens = 0, commits = 0, clipboardWrites = 0
++        var attachment: UInt64 = 42
++        var changeDuringCapture = false, changeBeforeCommit = false
++        let target: String
++        let references = ScreenshotReferences(capacity: 128)
++        init(_ target: String) { self.target = target }
++        var dependencies: USBControlAPI.Dependencies {
++            var d = USBControlAPI.Dependencies()
++            d.environment = ["IPHONE_USE_DEVICE_ID": target, "IPHONE_USE_USB_DEVICE_ID": target,
++                "IPHONE_USE_USB_CLIPBOARD_PYTHON": "/usr/bin/python3",
++                USBScreenCapture.helperKey: "/private/synthetic/screenshot.py"]
++            d.pin = { .init(registryEntryID: self.attachment, serial: self.target) }
++            d.references = references
++            d.capture = { _ in
++                self.captures += 1
++                if self.changeDuringCapture { self.attachment += 1 }
++                let context = CGContext(data: nil, width: 2, height: 4, bitsPerComponent: 8, bytesPerRow: 0,
++                    space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
++                let data = NSMutableData()
++                let destination = CGImageDestinationCreateWithData(data, "public.png" as CFString, 1, nil)!
++                CGImageDestinationAddImage(destination, context.makeImage()!, nil)
++                #expect(CGImageDestinationFinalize(destination))
++                return data as Data
++            }
++            d.touch = { _, reference, env, before in
++                self.touchOpens += 1
++                #expect(reference.device == self.target)
++                #expect(env["IPHONE_USE_USB_DEVICE_ID"] == self.target)
++                if self.changeBeforeCommit { self.attachment += 1 }
++                try before(DeviceDisplayMapping(rotationDegrees: 0, nativeWidth: 2, nativeHeight: 4))
++                self.commits += 1
++                return ["input_status": "sent_unverified"]
++            }
++            d.keyboard = { _, _, _, before, clipboard in
++                self.keyboardOpens += 1
++                if self.changeBeforeCommit { self.attachment += 1 }
++                try before()
++                try clipboard?()
++                try before()
++                self.commits += 1
++                return ["input_status": "sent_unverified", "hid_input_status": "sent_unverified",
++                    "clipboard_status": clipboard == nil ? "not_requested" : "written_unverified"]
++            }
++            d.clipboard = { _, _, before in try before(); self.clipboardWrites += 1 }
++            return d
++        }
++        func call(_ path: String, body: [String: Any] = [:], query: [String: String] = [:],
++            dependencies: USBControlAPI.Dependencies? = nil) -> HTTPResponse {
++            USBControlAPI.handle(HTTPRequest(method: body.isEmpty && ["/screenshot", "/devices", "/status"].contains(path)
++                ? "GET" : "POST", path: path, query: query, body: body), dependencies: dependencies ?? self.dependencies)
++        }
++    }
++
++    @Test func captureAAndTargetBFailBeforeAnyHelperOrClipboard() throws {
++        let h = Harness(b)
++        var d = h.dependencies
++        d.environment["IPHONE_USE_DEVICE_ID"] = a
++        let actions: [(String, [String: Any])] = [
++            ("/home", [:]), ("/key", ["key": "a"]), ("/type", ["text": "synthetic", "use_clipboard": true]),
++            ("/tap", ["frame_id": UUID().uuidString, "x": 0, "y": 0]),
++            ("/act", ["steps": [["type": "home"], ["type": "type", "text": "synthetic"]]]),
++            ("/screenshot", [:]),
++        ]
++        for (path, body) in actions {
++            let response = h.call(path, body: body, dependencies: d)
++            #expect(response.status == 409)
++            let json = try #require(JSONSerialization.jsonObject(with: response.body) as? [String: Any])
++            #expect(json["input_sent"] as? Bool == false)
++        }
++        #expect(h.captures == 0 && h.keyboardOpens == 0 && h.touchOpens == 0)
++        #expect(h.commits == 0 && h.clipboardWrites == 0)
++    }
++
++    @Test func soleWrongPhoneOrMissingPhysicalCaptureNeverAuthorizesInput() {
++        let h = Harness(a)
++        var d = h.dependencies
++        d.pin = { .init(registryEntryID: 42, serial: self.b) }
++        #expect(h.call("/home", dependencies: d).status == 409)
++        d = h.dependencies
++        d.environment.removeValue(forKey: USBScreenCapture.helperKey)
++        #expect(h.call("/home", dependencies: d).status == 409)
++        d = h.dependencies
++        d.pin = { nil }
++        #expect(h.call("/home", dependencies: d).status == 409)
++        #expect(h.keyboardOpens == 0 && h.commits == 0)
++    }
++
++    @Test func onlySamePhysicalScreenshotCanCommitOneTouch() throws {
++        let h = Harness(a)
++        let image = h.call("/screenshot")
++        #expect(image.status == 200 && image.headers["X-Device"] == a)
++        #expect(image.headers["X-Frame-Source"] == "coredevice-usb:42")
++        #expect(image.headers["Cache-Control"] == "no-store")
++        let token = try #require(image.headers["X-Frame-ID"])
++        let body: [String: Any] = ["frame_id": token, "x": 0, "y": 0]
++        #expect(h.call("/tap", body: body).status == 200)
++        #expect(h.call("/tap", body: body).status == 409)
++        #expect(h.touchOpens == 1 && h.commits == 1)
++    }
++
++    @Test func wrongDeviceAndLegacyAVTokensCannotReachTouchHelper() {
++        let h = Harness(b)
++        for (device, source) in [(a, "coredevice-usb:42"), (b, "opaque-av-capture-session")] {
++            let token = h.references.issue(device: device, source: source,
++                screenSize: CGSize(width: 2, height: 4), imageSize: (2, 4))
++            #expect(h.call("/tap", body: ["frame_id": token.id, "x": 0, "y": 0]).status == 409)
++        }
++        #expect(h.touchOpens == 0 && h.commits == 0)
++    }
++
++    @Test func detachDuringCaptureOrPreflightCannotMintOrCommit() throws {
++        let h = Harness(a)
++        h.changeDuringCapture = true
++        let rejected = h.call("/screenshot")
++        #expect(rejected.status == 409 && rejected.headers["X-Frame-ID"] == nil)
++        h.changeDuringCapture = false
++        let image = h.call("/screenshot")
++        let token = try #require(image.headers["X-Frame-ID"])
++        h.changeBeforeCommit = true
++        #expect(h.call("/tap", body: ["frame_id": token, "x": 0, "y": 0]).status == 409)
++        #expect(h.call("/type", body: ["text": "synthetic", "use_clipboard": true]).status == 409)
++        #expect(h.commits == 0 && h.clipboardWrites == 0)
++    }
++
++    @Test func internalCaptureDoesNotEvictFullReferenceStore() throws {
++        let h = Harness(a)
++        var first: String?
++        for _ in 0..<128 {
++            let token = h.references.issue(device: a, source: "coredevice-usb:42",
++                screenSize: CGSize(width: 2, height: 4), imageSize: (2, 4)).id
++            if first == nil { first = token }
++        }
++        #expect(h.call("/screenshot", query: ["observationOnly": "1"]).headers["X-Frame-ID"] == nil)
++        #expect(h.call("/tap", body: ["frame_id": try #require(first), "x": 0, "y": 0]).status == 200)
++    }
++
++    @Test func managedModeHasNoUnboundOrAlternateTransportInputRoute() {
++        let h = Harness(a)
++        #expect(h.call("/tap", body: ["x": 0, "y": 0]).status == 409)
++        #expect(h.call("/pair", body: ["host": UUID().uuidString]).status == 404)
++        #expect(h.call("/tap_text", body: ["text": "synthetic"]).status == 404)
++        #expect(h.touchOpens == 0 && h.keyboardOpens == 0 && h.commits == 0)
++        let serialized = String(decoding: HTTPResponse(contentType: "image/png", headers: [:]).serialized, as: UTF8.self)
++        #expect(serialized.contains("Cache-Control: no-store\r\n"))
++    }
++}
+diff --git a/Tests/iPhoneUseTests/Capture/USBSetupDiscoveryTests.swift b/Tests/iPhoneUseTests/Capture/USBSetupDiscoveryTests.swift
+index a26c35b..70ba149 100644
+--- a/Tests/iPhoneUseTests/Capture/USBSetupDiscoveryTests.swift
++++ b/Tests/iPhoneUseTests/Capture/USBSetupDiscoveryTests.swift
+@@ -4,21 +4,18 @@ import Testing
+ 
+ @Suite struct USBSetupDiscoveryTests {
+     private let usb = "00000000-1111111111111111"
+-    private let capture = USBSetupDiscovery.Capture(id: "00000000-0000-4000-8000-000000000001", name: "Fixture phone")
+ 
+     private final class Fixture {
+         var physical = ["00000000-1111111111111111"]
+-        var captureSamples: [[USBSetupDiscovery.Capture]] = []
+         var pin: USBValeriaConfigurator.PinnedUSBDevice? = .init(registryEntryID: 1, serial: "000000001111111111111111")
+         var pending = false
+         var restoreOK = true
+         var currentConfiguration = 6
+         var terminalConfiguration = 6
+         var duringRestore: ((Fixture) -> Void)?
++        var duringFinalRead: ((Fixture) -> Void)?
+         var cancelled = false
+-        var topologyChanges = false
+-        var throwAfterActivation = false
+-        var outcome: USBValeriaConfigurator.ActivationOutcome = .switched(.init(registryEntryID: 1, previousConfiguration: 6, requestedConfiguration: 5))
++        var throwOnRead: Int?
+         var events: [String] = []
+         var reads = 0
+         enum Failure: Error { case unavailable }
+@@ -26,142 +23,157 @@ import Testing
+             .init(physical: {
+                 self.events.append("physical")
+                 self.reads += 1
+-                if self.throwAfterActivation && self.reads > 1 { throw Failure.unavailable }
+-                return self.topologyChanges && self.reads > 1 ? [] : self.physical
+-            }, captures: {
+-                self.events.append("captures")
+-                if self.captureSamples.count > 1 { return self.captureSamples.removeFirst() }
+-                return self.captureSamples.first ?? []
++                if self.throwOnRead == self.reads { throw Failure.unavailable }
++                if self.reads > 1 { self.duringFinalRead?(self) }
++                return self.physical
+             }, singlePin: {
+                 self.events.append("pin")
+                 return self.pin
+-            }, pendingRestore: { self.pending }, activate: { _, _ in
+-                self.events.append("activate")
+-                self.currentConfiguration = 5
+-                return self.outcome
+-            }, restore: {
++            }, pendingRestore: { self.pending }, restore: {
+                 self.events.append("restore")
+                 self.currentConfiguration = self.terminalConfiguration
+                 self.duringRestore?(self)
+                 return self.restoreOK
+-            }, wait: { self.events.append("wait") }, cancelled: { self.cancelled })
++            }, cancelled: {
++                self.events.append("cancelled")
++                return self.cancelled
++            })
+         }
+     }
+ 
+-    @Test func exposedSoleDeviceProducesCandidateWithoutUSBMutation() {
++    @Test func solePhysicalDeviceProducesOneCanonicalIdentityWithoutAVOrUSBMutation() {
+         let fixture = Fixture()
+-        fixture.captureSamples = [[capture]]
+         let result = USBSetupDiscovery.collect(fixture.dependencies())
++        let candidate = result["config_candidate"] as? [String: Any]
+         #expect(result["status"] as? String == "configuration_candidate")
+-        #expect((result["config_candidate"] as? [String: Any])?["usbDeviceId"] as? String == usb)
+-        #expect(result["config_written"] as? Bool == false)
+-        #expect(!fixture.events.contains("activate"))
+-        #expect(!fixture.events.contains("restore"))
++        #expect(candidate?["usbDeviceId"] as? String == usb)
++        #expect(candidate?["port"] as? Int == 7390)
++        #expect(candidate?.count == 2)
++        #expect(result["capture_devices"] == nil)
++        #expect(result["usb_configuration"] as? String == "not_attempted")
++        #expect(result["cleanup"] as? String == "not_needed")
++        for key in ["config_written", "phone_input_sent", "capture_session_started", "bluetooth_started", "pairing_attempted"] {
++            #expect(result[key] as? Bool == false)
++        }
++        #expect(fixture.events == ["physical", "pin", "physical", "pin", "cancelled"])
+     }
+ 
+-    @Test func dormantSoleDeviceActivatesOnceThenRestoresBeforeReturning() {
+-        let fixture = Fixture()
+-        fixture.captureSamples = [[], [capture]]
+-        let result = USBSetupDiscovery.collect(fixture.dependencies())
+-        #expect(result["status"] as? String == "configuration_candidate")
+-        #expect(result["usb_configuration"] as? String == "temporarily_activated")
+-        #expect(result["cleanup"] as? String == "settled")
+-        #expect(fixture.events.filter { $0 == "activate" }.count == 1)
+-        #expect(fixture.events.contains("restore"))
+-        #expect(fixture.events.lastIndex(of: "physical")! > fixture.events.lastIndex(of: "restore")!)
++    @Test func exactModernAndLegacyUDIDsAreAcceptedWithoutRewriting() {
++        for value in ["0123abcd-ABCDEF0123456789", String(repeating: "AbCdEf0123", count: 4)] {
++            let fixture = Fixture()
++            fixture.physical = [value]
++            fixture.pin = .init(registryEntryID: 1, serial: value.replacingOccurrences(of: "-", with: "").uppercased())
++            let result = USBSetupDiscovery.collect(fixture.dependencies())
++            #expect(result["status"] as? String == "configuration_candidate")
++            #expect((result["config_candidate"] as? [String: Any])?["usbDeviceId"] as? String == value)
++        }
+     }
+ 
+-    @Test func multiplePhonesHaveNoAutomaticPairingOrActivation() {
++    @Test func malformedOrOpaqueCaptureIDsCannotBecomePhysicalCandidates() {
++        for value in ["", String(repeating: "a", count: 25), String(repeating: "a", count: 39),
++            String(repeating: "a", count: 41), "00000000-0000-4000-8000-000000000001",
++            "0123456-0123456789abcdef", "01234567-0123456789abcdeg", usb + "\n", usb + "\r", usb + "\u{2028}"] {
++            let fixture = Fixture()
++            fixture.physical = [value]
++            let result = USBSetupDiscovery.collect(fixture.dependencies())
++            #expect(result["status"] as? String == "physical_usb_identity_invalid")
++            #expect(result["config_candidate"] == nil)
++            #expect(!fixture.events.contains("pin"))
++        }
++    }
++
++    @Test func multiplePhonesHaveNoAutomaticSelection() {
+         let fixture = Fixture()
+         fixture.physical.append("00000000-2222222222222222")
+-        fixture.captureSamples = [[capture]]
+         let result = USBSetupDiscovery.collect(fixture.dependencies())
+         #expect(result["status"] as? String == "ambiguous_devices")
+         #expect(result["config_candidate"] == nil)
+-        #expect(!fixture.events.contains("activate"))
++        #expect(!fixture.events.contains("pin"))
++        #expect(!fixture.events.contains("restore"))
+     }
+ 
+-    @Test func topologyFailureStillRestoresAndSuppressesCandidate() {
++    @Test func noPhysicalPhoneIsAnExplicitNonSuccess() {
+         let fixture = Fixture()
+-        fixture.captureSamples = [[], [capture]]
+-        fixture.topologyChanges = true
++        fixture.physical = []
+         let result = USBSetupDiscovery.collect(fixture.dependencies())
+-        #expect(result["status"] as? String == "usb_topology_changed")
++        #expect(result["status"] as? String == "no_usb_device")
+         #expect(result["config_candidate"] == nil)
+-        #expect(fixture.events.contains("restore"))
+-        #expect(fixture.events.lastIndex(of: "physical")! > fixture.events.lastIndex(of: "restore")!)
++        #expect(fixture.reads == 2)
+     }
+ 
+-    @Test func restoreFailureCannotReportAConfigurationCandidate() {
+-        let fixture = Fixture()
+-        fixture.captureSamples = [[], [capture]]
+-        fixture.restoreOK = false
+-        let result = USBSetupDiscovery.collect(fixture.dependencies())
+-        #expect(result["status"] as? String == "usb_restore_pending")
+-        #expect(result["cleanup"] as? String == "pending")
+-        #expect(result["config_candidate"] == nil)
++    @Test func unavailableFirstOrFinalInventoryCannotReturnSuccess() {
++        for read in [1, 2] {
++            let fixture = Fixture()
++            fixture.throwOnRead = read
++            let result = USBSetupDiscovery.collect(fixture.dependencies())
++            #expect(result["status"] as? String == "physical_usb_inventory_unavailable")
++            #expect(result["config_candidate"] == nil)
++        }
+     }
+ 
+-    @Test func cancelledOrUnconfirmedTopologyNeverActivates() {
+-        for mode in ["cancelled", "unknown", "mismatch"] {
++    @Test func absentOrMismatchedPinCannotConfirmADevice() {
++        for pin in [nil, USBValeriaConfigurator.PinnedUSBDevice(registryEntryID: 2, serial: "different")] {
+             let fixture = Fixture()
+-            fixture.cancelled = mode == "cancelled"
+-            if mode == "unknown" { fixture.pin = nil }
+-            if mode == "mismatch" { fixture.pin = .init(registryEntryID: 2, serial: "different") }
++            fixture.pin = pin
+             let result = USBSetupDiscovery.collect(fixture.dependencies())
++            #expect(result["status"] as? String == "usb_topology_unconfirmed")
+             #expect(result["config_candidate"] == nil)
+-            #expect(!fixture.events.contains("activate"))
+         }
+     }
+ 
+-    @Test func pendingOldRestoreBlocksDiscoveryUntilSettled() {
++    @Test func detachDuringFinalInventorySuppressesTheCandidate() {
+         let fixture = Fixture()
+-        fixture.pending = true
+-        fixture.restoreOK = false
++        fixture.duringFinalRead = { $0.physical = []; $0.pin = nil }
+         let result = USBSetupDiscovery.collect(fixture.dependencies())
+-        #expect(result["status"] as? String == "previous_usb_restore_pending")
+-        #expect(fixture.events == ["restore"])
++        #expect(result["status"] as? String == "usb_topology_changed")
++        #expect(result["config_candidate"] == nil)
+     }
+ 
+-    @Test func USBNetworkProtectionDoesNotBecomeAForcedFallback() {
++    @Test func changedFinalPinIsDetectedEvenWithTheSameUDID() {
+         let fixture = Fixture()
+-        fixture.outcome = .blockedByActiveUSBNetwork
++        fixture.duringFinalRead = { $0.pin = .init(registryEntryID: 2, serial: "000000001111111111111111") }
+         let result = USBSetupDiscovery.collect(fixture.dependencies())
+-        #expect(result["status"] as? String == "capture_unavailable")
+-        #expect(result["usb_configuration"] as? String == "blocked_by_usb_network")
++        #expect(result["status"] as? String == "usb_topology_changed")
+         #expect(result["config_candidate"] == nil)
+-        #expect(fixture.events.filter { $0 == "activate" }.count == 1)
+-        #expect(!fixture.events.contains("restore"))
+     }
+ 
+-    @Test func unavailableFinalInventoryStillRestores() {
++    @Test func pendingOldRestoreBlocksDiscoveryUntilSettled() {
+         let fixture = Fixture()
+-        fixture.captureSamples = [[], [capture]]
+-        fixture.throwAfterActivation = true
++        fixture.pending = true
++        fixture.restoreOK = false
++        let result = USBSetupDiscovery.collect(fixture.dependencies())
++        #expect(result["status"] as? String == "previous_usb_restore_pending")
++        #expect(result["cleanup"] as? String == "pending")
++        #expect(result["config_candidate"] == nil)
++        #expect(fixture.events == ["physical", "pin", "restore", "cancelled"])
++    }
++
++    @Test func oldRestoreStillRunsWhenInitialInventoryIsUnavailable() {
++        let fixture = Fixture()
++        fixture.pending = true
++        fixture.throwOnRead = 1
+         let result = USBSetupDiscovery.collect(fixture.dependencies())
+         #expect(result["status"] as? String == "physical_usb_inventory_unavailable")
++        #expect(result["cleanup"] as? String == "settled")
+         #expect(result["config_candidate"] == nil)
+         #expect(fixture.events.contains("restore"))
+-        #expect(fixture.events.lastIndex(of: "physical")! > fixture.events.lastIndex(of: "restore")!)
+     }
+ 
+-
+-    @Test func detachDuringTerminalCleanupSuppressesTheOldCandidate() {
++    @Test func detachDuringOldCleanupSuppressesTheOldCandidate() {
+         let fixture = Fixture()
+-        fixture.captureSamples = [[], [capture]]
+-        fixture.duringRestore = { state in state.physical = []; state.pin = nil }
++        fixture.pending = true
++        fixture.duringRestore = { $0.physical = []; $0.pin = nil }
+         let result = USBSetupDiscovery.collect(fixture.dependencies())
+         #expect(result["cleanup"] as? String == "settled")
+         #expect(result["status"] as? String == "usb_topology_changed_during_cleanup")
+         #expect(result["config_candidate"] == nil)
++        #expect(fixture.events.lastIndex(of: "physical")! > fixture.events.lastIndex(of: "restore")!)
+     }
+ 
+-    @Test func reattachDuringCleanupIsDetectedEvenWithTheSameUDID() {
++    @Test func reattachDuringOldCleanupIsDetectedEvenWithTheSameUDID() {
+         let fixture = Fixture()
+-        fixture.captureSamples = [[], [capture]]
+-        fixture.duringRestore = { state in
+-            state.pin = .init(registryEntryID: 2, serial: "000000001111111111111111")
+-        }
++        fixture.pending = true
++        fixture.duringRestore = { $0.pin = .init(registryEntryID: 2, serial: "000000001111111111111111") }
+         let result = USBSetupDiscovery.collect(fixture.dependencies())
+         #expect(result["status"] as? String == "usb_topology_changed_during_cleanup")
+         #expect(result["config_candidate"] == nil)
+@@ -169,30 +181,47 @@ import Testing
+ 
+     @Test func supersededTerminalCleanupNeverClaimsOriginalConfigurationRestored() {
+         let fixture = Fixture()
+-        fixture.captureSamples = [[], [capture]]
+-        // Mirrors the aggregate API's true result for an external configuration
+-        // superseding our change. USB identity stays the same; configuration 6 was not restored.
++        fixture.pending = true
++        // The aggregate API can return true for an external configuration that
++        // superseded a previous run's change. It did not restore configuration 6.
+         fixture.terminalConfiguration = 7
+         let result = USBSetupDiscovery.collect(fixture.dependencies())
+         #expect(fixture.currentConfiguration == 7)
+         #expect(result["cleanup"] as? String == "settled")
+         #expect((result["cleanup_scope"] as? String)?.contains("superseded") == true)
+-        #expect(result["capture_inventory_phase"] as? String == "before_usb_cleanup")
+-        #expect(fixture.events.lastIndex(of: "physical")! > fixture.events.lastIndex(of: "restore")!)
++        #expect(result["status"] as? String == "configuration_candidate")
++        #expect(result["usb_configuration"] as? String == "not_attempted")
++        #expect(fixture.events.lastIndex(of: "pin")! > fixture.events.lastIndex(of: "restore")!)
+     }
+ 
+-    @Test func cancellationDuringCleanupCannotReturnSuccess() {
++    @Test func cancellationDuringOldCleanupCannotReturnSuccess() {
+         let fixture = Fixture()
+-        fixture.captureSamples = [[], [capture]]
++        fixture.pending = true
+         fixture.duringRestore = { $0.cancelled = true }
+         let result = USBSetupDiscovery.collect(fixture.dependencies())
+         #expect(result["cleanup"] as? String == "settled")
+         #expect(result["status"] as? String == "cancelled_or_deadline")
+         #expect(result["config_candidate"] == nil)
++        #expect(fixture.events.last == "cancelled")
++    }
++
++    @Test func cancelledInventoryCannotReturnSuccess() {
++        let fixture = Fixture()
++        fixture.cancelled = true
++        let result = USBSetupDiscovery.collect(fixture.dependencies())
++        #expect(result["status"] as? String == "cancelled_or_deadline")
++        #expect(result["config_candidate"] == nil)
++        #expect(!fixture.events.contains("restore"))
+     }
+ 
+-    @Test func distinctNonopaqueIdentifiersDoNotBecomeAMapping() {
+-        let other = USBSetupDiscovery.Capture(id: "00000000-2222222222222222", name: "Other")
+-        #expect(USBSetupDiscovery.candidate(captures: [other], physical: [usb]) == nil)
++    @Test func pendingCleanupRetainsItsActionableFailureDuringCancellation() {
++        let fixture = Fixture()
++        fixture.pending = true
++        fixture.restoreOK = false
++        fixture.duringRestore = { $0.cancelled = true }
++        let result = USBSetupDiscovery.collect(fixture.dependencies())
++        #expect(result["status"] as? String == "previous_usb_restore_pending")
++        #expect(result["cleanup"] as? String == "pending")
++        #expect(result["config_candidate"] == nil)
+     }
+ }
+diff --git a/Tests/iPhoneUseTests/Input/CoreDeviceHomeTests.swift b/Tests/iPhoneUseTests/Input/CoreDeviceHomeTests.swift
+new file mode 100644
+index 0000000..37a9580
+--- /dev/null
++++ b/Tests/iPhoneUseTests/Input/CoreDeviceHomeTests.swift
+@@ -0,0 +1,177 @@
++import Foundation
++import Testing
++@testable import iPhoneUse
++
++/// Runs only the Swift bridge and a stdlib fake child; no device service is opened.
++@Suite(.serialized) struct CoreDeviceHomeTests {
++    private enum Stop: Error { case targetChanged }
++    private static let device = "11111111-1111111111111111"
++
++    private final class Harness {
++        let directory: URL, helper: URL, marker: URL
++        let mode: String
++
++        init(_ mode: String = "normal") throws {
++            self.mode = mode
++            directory = FileManager.default.temporaryDirectory.appendingPathComponent("home-bridge-test-\(UUID().uuidString)")
++            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
++                attributes: [.posixPermissions: 0o700])
++            helper = directory.appendingPathComponent("fake.py")
++            marker = directory.appendingPathComponent("events.json")
++            try Self.script.write(to: helper, atomically: true, encoding: .utf8)
++        }
++
++        deinit { try? FileManager.default.removeItem(at: directory) }
++
++        var environment: [String: String] {
++            var env = ProcessInfo.processInfo.environment
++            env[CoreDeviceKeyboard.helperKey] = helper.path
++            env["IPHONE_USE_DEVICE_ID"] = CoreDeviceHomeTests.device
++            env[DeviceClipboard.deviceKey] = CoreDeviceHomeTests.device
++            env[DeviceClipboard.pythonKey] = ProcessInfo.processInfo.environment["PHONE_USE_TEST_PYTHON"] ?? "/usr/bin/python3"
++            env["HOME_TEST_MODE"] = mode
++            env["HOME_TEST_MARKER"] = marker.path
++            return env
++        }
++
++        func perform(beforeCommit: () throws -> Void = {}, clipboard: (() throws -> Void)? = nil) throws -> [String: Any] {
++            try CoreDeviceKeyboard.perform(CoreDeviceKeyboardProgram.home(), device: CoreDeviceHomeTests.device,
++                environment: environment, beforeCommit: beforeCommit, clipboard: clipboard)
++        }
++
++        func events() throws -> [[String: Any]] {
++            let value = try #require(try JSONSerialization.jsonObject(with: Data(contentsOf: marker)) as? [String: Any])
++            #expect(value["plan"] as? [String: String] == ["button": "home"])
++            return try #require(value["events"] as? [[String: Any]])
++        }
++
++        private static let script = #"""
++import json, os, pathlib, signal, sys, time
++assert sys.flags.isolated == 1 and sys.dont_write_bytecode
++assert sys.argv[1] == '--commit-file'
++assert os.environ['PYMOBILEDEVICE3_UDID'] == '11111111-1111111111111111'
++plan = json.load(sys.stdin)
++assert plan == {'button': 'home'}
++commit = pathlib.Path(sys.argv[2])
++marker = pathlib.Path(os.environ['HOME_TEST_MARKER'])
++mode = os.environ['HOME_TEST_MODE']; events = []
++def record(stage):
++    events.append({'stage': stage, 'commit_seen': commit.exists()})
++    pending = marker.with_suffix('.pending')
++    pending.write_text(json.dumps({'plan': plan, 'events': events}))
++    pending.replace(marker)
++def stop(*args):
++    record('terminated'); raise SystemExit(1)
++signal.signal(signal.SIGTERM, stop)
++record('opened')
++receipt = {'schema_version': 1, 'backend': 'coredevice-button', 'button': 'home',
++    'input_status': 'sent_unverified', 'reports_attempted': 2, 'reports_locally_sent': 2,
++    'host_commit_received': True, 'button_service_ready': True,
++    'virtual_service_registered': False, 'media_started': False,
++    'cleanup_release': {'status': 'sent_unverified'}, 'cleanup': {'errors': [],
++        'connection_closed': True, 'tunnel_closed': True, 'pairing_scratch_removed': True}}
++ready = {'phase': 'ready', 'button': 'home', 'button_service_ready': True}
++if mode == 'ready_keyboard': ready = {'phase': 'ready', 'keyboard_surface_registered': True}
++if mode == 'ready_wrong_button': ready['button'] = 'power'
++if mode == 'ready_false_service': ready['button_service_ready'] = False
++if mode == 'ready_numeric_service': ready['button_service_ready'] = 1
++if mode == 'ready_wrong_phase': ready['phase'] = 'other'
++record('ready')
++print(json.dumps(ready), flush=True)
++if mode.startswith('ready_'):
++    # Deliberately claim success without a commit; invalid readiness must never authorize it.
++    print(json.dumps(receipt), flush=True); raise SystemExit(0)
++deadline = time.monotonic() + 4
++while not commit.exists() and time.monotonic() < deadline: time.sleep(.005)
++if not commit.exists(): raise SystemExit(7)
++assert json.loads(commit.read_text()) == {'commit': True}
++record('committed')
++if mode == 'keyboard_backend': receipt['backend'] = 'coredevice-keyboard'
++if mode == 'virtual_keyboard': receipt['virtual_service_registered'] = True
++if mode == 'wrong_button': receipt['button'] = 'power'
++if mode == 'false_service': receipt['button_service_ready'] = False
++if mode == 'numeric_service': receipt['button_service_ready'] = 1
++print(json.dumps(receipt), flush=True)
++"""#
++    }
++
++    @Test func nativeHomeUsesButtonPayloadAndReadyCommitReceipt() throws {
++        let harness = try Harness()
++        var validations = 0
++        let receipt = try harness.perform(beforeCommit: {
++            validations += 1
++            let events = try harness.events()
++            #expect(events.last?["stage"] as? String == "ready")
++            #expect(events.allSatisfy { $0["commit_seen"] as? Bool == false })
++        })
++        #expect(validations == 2)
++        #expect(receipt["backend"] as? String == "coredevice-button")
++        #expect(receipt["button"] as? String == "home")
++        #expect(receipt["input_status"] as? String == "sent_unverified")
++        #expect(receipt["hid_input_status"] as? String == "sent_unverified")
++        #expect(receipt["clipboard_status"] as? String == "not_requested")
++        #expect(receipt["reports_attempted"] as? Int == 2 && receipt["reports_locally_sent"] as? Int == 2)
++        #expect(receipt["host_commit_received"] as? Bool == true)
++        #expect(receipt["surface_deregistration"] as? String == "not_applicable")
++        #expect((receipt["cleanup_release"] as? [String: String])?["status"] == "sent_unverified")
++        let cleanup = try #require(receipt["cleanup"] as? [String: Any])
++        #expect((cleanup["errors"] as? [[String: Any]])?.isEmpty == true)
++        #expect(["connection_closed", "tunnel_closed", "pairing_scratch_removed"].allSatisfy { cleanup[$0] as? Bool == true })
++        #expect(try harness.events().last?["stage"] as? String == "committed")
++        #expect(CoreDeviceKeyboard.response(receipt, device: Self.device).status == 200)
++    }
++
++    @Test func wrongTargetAndPrecommitRevalidationCannotCommitHome() throws {
++        let harness = try Harness()
++        var environment = harness.environment
++        environment[DeviceClipboard.deviceKey] = "22222222-2222222222222222"
++        #expect(throws: InputRequestError.self) {
++            try CoreDeviceKeyboard.perform(CoreDeviceKeyboardProgram.home(), device: Self.device, environment: environment)
++        }
++        #expect(!FileManager.default.fileExists(atPath: harness.marker.path))
++        var validations = 0
++        let receipt = try harness.perform(beforeCommit: {
++            validations += 1
++            if validations == 2 { throw Stop.targetChanged }
++        })
++        #expect(validations == 2)
++        #expect(receipt["input_status"] as? String == "not_sent")
++        let events = try harness.events()
++        #expect(events.contains { $0["stage"] as? String == "ready" })
++        #expect(!events.contains { $0["stage"] as? String == "committed" })
++        #expect(events.allSatisfy { $0["commit_seen"] as? Bool == false })
++    }
++
++    @Test(arguments: ["ready_keyboard", "ready_wrong_button", "ready_false_service", "ready_numeric_service", "ready_wrong_phase"])
++    func keyboardOrMalformedButtonReadyCannotAuthorizeHome(_ mode: String) throws {
++        let harness = try Harness(mode)
++        var validations = 0
++        let receipt = try harness.perform(beforeCommit: { validations += 1 })
++        #expect(validations == 0)
++        #expect(receipt["input_status"] as? String == "unconfirmed")
++        #expect(try harness.events().allSatisfy { $0["commit_seen"] as? Bool == false })
++    }
++
++    @Test(arguments: ["keyboard_backend", "virtual_keyboard", "wrong_button", "false_service", "numeric_service"])
++    func incompatibleHomeSuccessClaimIsUnconfirmed(_ mode: String) throws {
++        let harness = try Harness(mode)
++        let receipt = try harness.perform()
++        #expect(try harness.events().last?["stage"] as? String == "committed")
++        #expect(receipt["input_status"] as? String == "unconfirmed")
++        #expect(receipt["clipboard_status"] as? String == "not_requested")
++        let response = CoreDeviceKeyboard.response(receipt, device: Self.device)
++        #expect(response.status == 409)
++        let body = try #require(try JSONSerialization.jsonObject(with: response.body) as? [String: Any])
++        #expect(body["input_sent"] == nil)
++    }
++
++    @Test func homeRejectsClipboardBeforeStartingAnyChildOrCallback() throws {
++        let harness = try Harness()
++        var validations = 0, clipboardCalls = 0
++        #expect(throws: InputRequestError.self) {
++            try harness.perform(beforeCommit: { validations += 1 }, clipboard: { clipboardCalls += 1 })
++        }
++        #expect(validations == 0 && clipboardCalls == 0)
++        #expect(!FileManager.default.fileExists(atPath: harness.marker.path))
++    }
++}
+diff --git a/Tests/iPhoneUseTests/Input/DeviceClipboardTests.swift b/Tests/iPhoneUseTests/Input/DeviceClipboardTests.swift
+index 6743237..32692f5 100644
+--- a/Tests/iPhoneUseTests/Input/DeviceClipboardTests.swift
++++ b/Tests/iPhoneUseTests/Input/DeviceClipboardTests.swift
+@@ -41,6 +41,7 @@ final class DeviceClipboardTests: XCTestCase {
+             [DeviceClipboard.pythonKey: "relative/python", DeviceClipboard.deviceKey: deviceID],
+             [DeviceClipboard.pythonKey: "/missing/python", DeviceClipboard.deviceKey: ""],
+             [DeviceClipboard.pythonKey: "/missing/python", DeviceClipboard.deviceKey: "another phone"],
++            [DeviceClipboard.pythonKey: "/missing/python", DeviceClipboard.deviceKey: deviceID + "\n"],
+         ] {
+             XCTAssertTrue(DeviceClipboard.isConfigured(environment: environment))
+             XCTAssertThrowsError(try DeviceClipboard.Configuration(environment: environment))
+@@ -63,7 +64,7 @@ final class DeviceClipboardTests: XCTestCase {
+         XCTAssertEqual(try String(contentsOf: directory.appendingPathComponent("target"), encoding: .utf8), deviceID)
+         XCTAssertEqual(try String(contentsOf: directory.appendingPathComponent("native"), encoding: .utf8), "")
+         let arguments = try String(contentsOf: directory.appendingPathComponent("arguments"), encoding: .utf8)
+-        XCTAssertEqual(arguments, "-m\npymobiledevice3\ndeveloper\ncore-device\ncopy\n--userspace\n")
++        XCTAssertEqual(arguments, "-I\n-B\n-m\npymobiledevice3\ndeveloper\ncore-device\ncopy\n--userspace\n")
+         XCTAssertFalse(arguments.contains(text))
+     }
+ 
+@@ -77,6 +78,7 @@ final class DeviceClipboardTests: XCTestCase {
+             try request.perform(on: input, clipboard: { try DeviceClipboard.write($0, environment: environment) })
+         ) { error in
+             XCTAssertTrue(String(describing: error).contains("service unavailable"))
++            XCTAssertEqual((error as? DeviceClipboard.WriteFailure)?.status, .unconfirmed)
+         }
+         XCTAssertEqual(reports, 0)
+     }
+@@ -88,6 +90,7 @@ final class DeviceClipboardTests: XCTestCase {
+         let started = ProcessInfo.processInfo.systemUptime
+         XCTAssertThrowsError(try DeviceClipboard.write("text", environment: environment, timeout: 0.2)) {
+             XCTAssertTrue(String(describing: $0).contains("delivery is uncertain"))
++            XCTAssertEqual(($0 as? DeviceClipboard.WriteFailure)?.status, .unconfirmed)
+         }
+         XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - started, 3)
+         // Under a busy test runner the deadline can precede the child's main.
+diff --git a/Tests/iPhoneUseTests/Input/DeviceInputKeyboardTests.swift b/Tests/iPhoneUseTests/Input/DeviceInputKeyboardTests.swift
+index 7947163..256e00e 100644
+--- a/Tests/iPhoneUseTests/Input/DeviceInputKeyboardTests.swift
++++ b/Tests/iPhoneUseTests/Input/DeviceInputKeyboardTests.swift
+@@ -5,8 +5,17 @@ import XCTest
+ /// Exercises the public input entry points so payload refactors also preserve
+ /// report ordering, validation before sending, and held modifier lifetimes.
+ final class DeviceInputKeyboardTests: XCTestCase {
+-    func testUSBHomeKeepsCommandHeldUntilHIsReleased() throws {
+-        let samples = try CoreDeviceKeyboardProgram.home().samples
++    func testUSBHomeUsesOnlyTheNativeButtonProgram() throws {
++        let home = try CoreDeviceKeyboardProgram.home()
++        XCTAssertEqual(home.payload as? [String: String], ["button": "home"])
++        XCTAssertTrue(home.samples.isEmpty)
++        XCTAssertEqual(home.reportCount, 2)
++        XCTAssertEqual(home.programmedSeconds, 0.05)
++        XCTAssertEqual(home.backend, "coredevice-button")
++    }
++
++    func testExplicitCommandHKeepsCommandHeldUntilHIsReleased() throws {
++        let samples = try CoreDeviceKeyboardProgram.key(KeyRequest(["key": "h", "modifiers": ["command"]])).samples
+         XCTAssertEqual(samples.compactMap { $0["at_ms"] as? Int }, [0, 100, 220, 320])
+         XCTAssertEqual(samples.compactMap { $0["usages"] as? [Int] }, [[227], [227, 11], [227], []])
+     }
+diff --git a/Tests/iPhoneUseTests/Input/KeyboardClipboardReceiptTests.swift b/Tests/iPhoneUseTests/Input/KeyboardClipboardReceiptTests.swift
+new file mode 100644
+index 0000000..7562bac
+--- /dev/null
++++ b/Tests/iPhoneUseTests/Input/KeyboardClipboardReceiptTests.swift
+@@ -0,0 +1,227 @@
++import Foundation
++import Testing
++@testable import iPhoneUse
++
++@Suite(.serialized) struct KeyboardClipboardReceiptTests {
++    private enum Stop: Error { case identityChanged }
++
++    private final class Harness {
++        let directory: URL
++        let helper: URL
++        let phases: URL
++        let commitPath: URL
++
++        init() throws {
++            directory = FileManager.default.temporaryDirectory.appendingPathComponent("keyboard-clipboard-receipt-\(UUID().uuidString)")
++            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
++            helper = directory.appendingPathComponent("keyboard.py")
++            phases = directory.appendingPathComponent("phases")
++            commitPath = directory.appendingPathComponent("commit-path")
++            try Self.script.write(to: helper, atomically: true, encoding: .utf8)
++        }
++
++        deinit { try? FileManager.default.removeItem(at: directory) }
++
++        var environment: [String: String] {
++            var env = ProcessInfo.processInfo.environment
++            env[CoreDeviceKeyboard.helperKey] = helper.path
++            env["IPHONE_USE_DEVICE_ID"] = "11111111-1111111111111111"
++            env[DeviceClipboard.deviceKey] = "11111111-1111111111111111"
++            env[DeviceClipboard.pythonKey] = ProcessInfo.processInfo.environment["PHONE_USE_TEST_PYTHON"] ?? "/usr/bin/python3"
++            env["RECEIPT_TEST_PHASES"] = phases.path
++            env["RECEIPT_TEST_COMMIT_PATH"] = commitPath.path
++            // These must not change the interpreter or its import path.
++            env["PYTHONPATH"] = "/untrusted/python-path"
++            env["PYTHONHOME"] = "/untrusted/python-home"
++            return env
++        }
++
++        func perform(beforeCommit: () throws -> Void = {}, clipboard: (() throws -> Void)? = nil) throws -> [String: Any] {
++            try CoreDeviceKeyboard.perform(CoreDeviceKeyboardProgram.key(KeyRequest(["key": "v", "modifiers": ["command"]])),
++                device: "11111111-1111111111111111", environment: environment, beforeCommit: beforeCommit, clipboard: clipboard)
++        }
++
++        func observedPhases() throws -> [String] {
++            try String(contentsOf: phases, encoding: .utf8).split(separator: "\n").map(String.init)
++        }
++
++        func preventCommitFile() throws {
++            let path = try String(contentsOf: commitPath, encoding: .utf8)
++            let pending = URL(fileURLWithPath: path).deletingLastPathComponent().appendingPathComponent("commit.pending")
++            try FileManager.default.createDirectory(at: pending, withIntermediateDirectories: false)
++        }
++
++        func clipboardEnvironment(_ script: String) throws -> [String: String] {
++            let executable = directory.appendingPathComponent("clipboard-helper")
++            try ("#!/bin/sh\n" + script).write(to: executable, atomically: true, encoding: .utf8)
++            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
++            return [DeviceClipboard.pythonKey: executable.path,
++                DeviceClipboard.deviceKey: "11111111-1111111111111111",
++                "CLIPBOARD_TEST_MARKER": directory.appendingPathComponent("clipboard-started").path]
++        }
++
++        private static let script = #"""
++import json, os, pathlib, sys, time
++assert sys.flags.isolated == 1 and sys.dont_write_bytecode
++assert 'PYTHONPATH' not in os.environ and 'PYTHONHOME' not in os.environ
++assert sys.argv[1] == '--commit-file'
++json.load(sys.stdin)
++commit = pathlib.Path(sys.argv[2])
++pathlib.Path(os.environ['RECEIPT_TEST_COMMIT_PATH']).write_text(str(commit))
++phases = pathlib.Path(os.environ['RECEIPT_TEST_PHASES'])
++phases.write_text('ready\n')
++print(json.dumps({'phase':'ready', 'keyboard_surface_registered':True}), flush=True)
++while not commit.exists(): time.sleep(.005)
++with phases.open('a') as file: file.write('committed\n')
++print(json.dumps({'schema_version':1, 'backend':'coredevice-keyboard',
++    'input_status':'not_sent', 'reports_attempted':0, 'reports_locally_sent':0,
++    'host_commit_received':True, 'cleanup_release':{'status':'not_needed'},
++    'cleanup':{'errors':[], 'connection_closed':True, 'tunnel_closed':True,
++               'pairing_scratch_removed':True}}), flush=True)
++"""#
++    }
++
++    private func expectPartialClipboardEffect(_ receipt: [String: Any], clipboard: String, directory: URL) throws {
++        #expect(receipt["hid_input_status"] as? String == "not_sent")
++        #expect(receipt["clipboard_status"] as? String == clipboard)
++        #expect(receipt["input_status"] as? String == "unconfirmed")
++        let leaf = CoreDeviceKeyboard.response(receipt, device: "11111111-1111111111111111")
++        let leafBody = try #require(try JSONSerialization.jsonObject(with: leaf.body) as? [String: Any])
++        #expect(leaf.status == 409 && leafBody["input_sent"] == nil)
++
++        let act = try ActRequest(["steps": [["type": "type", "text": "synthetic"], ["type": "key", "key": "enter"]]])
++        var attemptedLeaves = 0
++        let batch = try act.perform(device: "11111111-1111111111111111", capture: { _, _ in throw Stop.identityChanged }, execute: { _, _, _ in
++            attemptedLeaves += 1
++            return leaf
++        })
++        #expect(attemptedLeaves == 1 && batch.status == 409)
++        let error = MCPHTTPClient.check(batch.body, status: batch.status, language: .en)
++        #expect(error.completedSteps == 0 && error.failedStep == 1 && !error.inputNotSent)
++        let recording = MCPContextRecording(device: "11111111-1111111111111111", tool: "act", arguments: [:], kind: "input",
++            directory: directory.appendingPathComponent("context"))
++        recording.requestStarted()
++        recording.fail(error)
++        let result = recording.attach(to: ["isError": true])
++        let metadata = try #require(result["structuredContent"] as? [String: Any])
++        let input = try #require(metadata["input_receipt"] as? [String: Any])
++        #expect(input["status"] as? String == "unconfirmed")
++        #expect(metadata["input_sent"] == nil)
++        let text = (result["content"] as? [[String: Any]] ?? []).compactMap { $0["text"] as? String }.joined(separator: "\n")
++        #expect(!text.contains("Input: not sent."))
++        #expect(text.contains("HID: not sent.") && text.contains("Clipboard:"))
++        #expect(text.contains("Phone side effects: possible") && text.contains("do not replay automatically"))
++    }
++
++    @Test func mismatchedUSBTargetIsRejectedBeforeChildOrClipboard() throws {
++        let harness = try Harness()
++        var environment = harness.environment
++        environment[DeviceClipboard.deviceKey] = "22222222-2222222222222222"
++        var validations = 0, clipboards = 0
++        #expect(throws: (any Error).self) {
++            try CoreDeviceKeyboard.perform(CoreDeviceKeyboardProgram.key(KeyRequest(["key": "a"])),
++                device: "11111111-1111111111111111", environment: environment,
++                beforeCommit: { validations += 1 }, clipboard: { clipboards += 1 })
++        }
++        #expect(validations == 0 && clipboards == 0)
++        #expect(!FileManager.default.fileExists(atPath: harness.phases.path))
++        #expect(!FileManager.default.fileExists(atPath: harness.commitPath.path))
++    }
++
++    @Test func acknowledgedClipboardThenCaptureRejectionIsPartialInput() throws {
++        let harness = try Harness()
++        var validations = 0, writes = 0
++        let receipt = try harness.perform(beforeCommit: {
++            validations += 1
++            if validations == 2 { throw Stop.identityChanged }
++        }, clipboard: { writes += 1 })
++        #expect(validations == 2 && writes == 1)
++        #expect(try harness.observedPhases() == ["ready"])
++        try expectPartialClipboardEffect(receipt, clipboard: "written_unverified", directory: harness.directory)
++    }
++
++    @Test func acknowledgedClipboardThenCommitFileFailurePreservesBothAxes() throws {
++        let harness = try Harness()
++        var validations = 0, writes = 0
++        let receipt = try harness.perform(beforeCommit: {
++            validations += 1
++            if validations == 2 { try harness.preventCommitFile() }
++        }, clipboard: { writes += 1 })
++        #expect(validations == 2 && writes == 1)
++        #expect(try harness.observedPhases() == ["ready"])
++        try expectPartialClipboardEffect(receipt, clipboard: "written_unverified", directory: harness.directory)
++    }
++
++    @Test func acknowledgedClipboardThenHIDNotSentCannotClaimNoSideEffect() throws {
++        let harness = try Harness()
++        var writes = 0
++        let receipt = try harness.perform(clipboard: { writes += 1 })
++        #expect(writes == 1)
++        #expect(try harness.observedPhases() == ["ready", "committed"])
++        try expectPartialClipboardEffect(receipt, clipboard: "written_unverified", directory: harness.directory)
++    }
++
++    @Test func clipboardTimeoutIsUnconfirmedEvenWithUncommittedHID() throws {
++        let harness = try Harness()
++        let environment = try harness.clipboardEnvironment("printf 'called' > \"$CLIPBOARD_TEST_MARKER\"\nexec /bin/sleep 5\n")
++        var failure: DeviceClipboard.WriteFailure?
++        let receipt = try harness.perform(clipboard: {
++            do { try DeviceClipboard.write("synthetic", environment: environment, timeout: 0.2) }
++            catch {
++                failure = error as? DeviceClipboard.WriteFailure
++                throw error
++            }
++        })
++        #expect(failure?.status == .unconfirmed)
++        #expect(try harness.observedPhases() == ["ready"])
++        try expectPartialClipboardEffect(receipt, clipboard: "unconfirmed", directory: harness.directory)
++    }
++
++    @Test func rejectionBeforeClipboardLaunchRemainsDefinitivelyNotSent() throws {
++        let harness = try Harness()
++        let environment = try harness.clipboardEnvironment("printf 'called' > \"$CLIPBOARD_TEST_MARKER\"\n")
++        var failure: DeviceClipboard.WriteFailure?
++        let receipt = try harness.perform(clipboard: {
++            do { try DeviceClipboard.write("synthetic", environment: environment, beforeWrite: { throw Stop.identityChanged }) }
++            catch {
++                failure = error as? DeviceClipboard.WriteFailure
++                throw error
++            }
++        })
++        #expect(failure?.status == .notWritten)
++        #expect(!FileManager.default.fileExists(atPath: environment["CLIPBOARD_TEST_MARKER"]!))
++        #expect(try harness.observedPhases() == ["ready"])
++        #expect(receipt["input_status"] as? String == "not_sent")
++        #expect(receipt["hid_input_status"] as? String == "not_sent")
++        #expect(receipt["clipboard_status"] as? String == "not_written")
++        let response = CoreDeviceKeyboard.response(receipt, device: "11111111-1111111111111111")
++        let body = try #require(try JSONSerialization.jsonObject(with: response.body) as? [String: Any])
++        #expect(body["input_sent"] as? Bool == false)
++    }
++
++    @Test func legacyClipboardReceiptCannotReintroduceNoInputOrNoOpClaims() throws {
++        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("clipboard-legacy-receipt-\(UUID().uuidString)")
++        defer { try? FileManager.default.removeItem(at: directory) }
++        for clipboard in ["written_unverified", "unconfirmed"] {
++            for asBatch in [false, true] {
++                let transport: [String: Any] = ["backend": "coredevice-keyboard", "input_status": "not_sent",
++                    "hid_input_status": "not_sent", "clipboard_status": clipboard, "no_op": true]
++                let steps: [[String: Any]] = [["step": 1, "type": "type", "ok": false,
++                    "keyboard_receipt": transport, "input_sent": false]]
++                let recording = MCPContextRecording(device: UUID().uuidString, tool: "act", arguments: [:], kind: "input", directory: directory)
++                recording.requestStarted()
++                recording.fail(MCPServer.MCPError("legacy receipt", httpStatus: 409, inputNotSent: true,
++                    transportReceipt: transport, stepReceipts: asBatch ? steps : nil))
++                let result = recording.attach(to: ["structuredContent": ["input_sent": false, "ok": true]])
++                let metadata = try #require(result["structuredContent"] as? [String: Any])
++                let input = try #require(metadata["input_receipt"] as? [String: Any])
++                #expect(input["status"] as? String == "unconfirmed")
++                #expect(metadata["input_sent"] == nil && metadata["ok"] as? Bool == false)
++                #expect(result["isError"] as? Bool == true)
++                let text = try #require(MCPResultSummary.text(metadata))
++                #expect(text.contains("Input: unconfirmed") && text.contains("HID: not sent."))
++                #expect(!text.contains("nothing sent") && !text.contains("Input: not sent."))
++            }
++        }
++    }
++}
+diff --git a/Tests/iPhoneUseTests/MCP/MCPObservationTests.swift b/Tests/iPhoneUseTests/MCP/MCPObservationTests.swift
+index 191ce8d..7c62a8c 100644
+--- a/Tests/iPhoneUseTests/MCP/MCPObservationTests.swift
++++ b/Tests/iPhoneUseTests/MCP/MCPObservationTests.swift
+@@ -13,6 +13,98 @@ final class MCPObservationTests: XCTestCase {
+             signature: signature)
+     }
+ 
++    private func ocrSample(_ texts: [String], hash: String) -> MCPServer.ObservationFrame {
++        var frame = sample(hash, sequence: 1, at: 10)
++        frame.ocr = ScreenOCR.Result(width: 500, height: 1000,
++            items: texts.map { .init(text: $0, x: 20, y: 30) }, screenHash: hash)
++        return frame
++    }
++
++    func testOCRDiffUsesSameCallBaselineInsteadOfThePreviousToolObservation() throws {
++        let history = ocrSample(["prior-client-history"], hash: "history")
++        let baseline = ocrSample(["before-input", "kept"], hash: "before")
++        let current = ocrSample(["after-input", "kept"], hash: "after")
++        _ = MCPServer.screenshotContent(history, includeImage: false, diff: false)
++        let observation = MCPServer.ObservationResult(status: .changed, frame: current, baselineFrame: baseline.identity)
++        for _ in 0..<2 {
++            let result = MCPServer.observationContent(observation, includeImage: true, diff: true, baseline: baseline)
++            let metadata = try XCTUnwrap(result["structuredContent"] as? [String: Any])
++            let comparison = try XCTUnwrap(metadata["ocr_diff"] as? [String: Any])
++            XCTAssertEqual(comparison["status"] as? String, "compared")
++            XCTAssertEqual(comparison["comparison_reference"] as? String, "this_call_pre_input_capture")
++            XCTAssertEqual(comparison["baseline_screen_hash"] as? String, "before")
++            XCTAssertEqual(comparison["current_screen_hash"] as? String, "after")
++            XCTAssertEqual(comparison["added"] as? [String], ["after-input"])
++            XCTAssertEqual(comparison["removed"] as? [String], ["before-input"])
++            XCTAssertEqual(comparison["unchanged"] as? Bool, false)
++            let blocks = try XCTUnwrap(result["content"] as? [[String: Any]])
++            let text = try XCTUnwrap(blocks.first?["text"] as? String)
++            XCTAssertTrue(text.contains("+after-input"))
++            XCTAssertTrue(text.contains("-before-input"))
++            XCTAssertFalse(text.contains("prior-client-history"))
++            XCTAssertFalse(blocks.contains { $0["type"] as? String == "image" })
++        }
++    }
++
++    func testUnavailableOCRBaselineNeverBecomesAnEmptyScreenOrClientHistory() throws {
++        let current = ocrSample(["current"], hash: "current")
++        _ = MCPServer.screenshotContent(ocrSample(["history"], hash: "history"), includeImage: false, diff: false)
++        for baseline in [nil, ocrSample([], hash: "")] as [MCPServer.ObservationFrame?] {
++            let result = MCPServer.ocrDifferenceContent(current, baseline: baseline)
++            let metadata = try XCTUnwrap(result["structuredContent"] as? [String: Any])
++            let comparison = try XCTUnwrap(metadata["ocr_diff"] as? [String: Any])
++            XCTAssertEqual(comparison["status"] as? String, "baseline_unavailable")
++            XCTAssertEqual(comparison["baseline_available"] as? Bool, false)
++            XCTAssertEqual(comparison["current_available"] as? Bool, true)
++            XCTAssertTrue(comparison["unchanged"] is NSNull)
++            XCTAssertNil(comparison["added"])
++            XCTAssertNil(comparison["removed"])
++            let text = try XCTUnwrap((result["content"] as? [[String: Any]])?.first?["text"] as? String)
++            XCTAssertTrue(text.contains("baseline_unavailable"))
++            XCTAssertFalse(text.contains("+current"))
++        }
++        let validEmpty = ocrSample([], hash: "recognized-empty")
++        let comparison = try XCTUnwrap((MCPServer.ocrDifferenceContent(current, baseline: validEmpty)["structuredContent"]
++            as? [String: Any])?["ocr_diff"] as? [String: Any])
++        XCTAssertEqual(comparison["status"] as? String, "compared")
++        XCTAssertEqual(comparison["added"] as? [String], ["current"])
++    }
++
++    func testMissingPostInputOCRRemainsExplicitInActionMetadata() throws {
++        for frame in [nil, ocrSample([], hash: "")] as [MCPServer.ObservationFrame?] {
++            let observation = MCPServer.ObservationResult(status: .unobserved, frame: frame)
++            let result = MCPServer.observationContent(observation, includeImage: false, diff: true,
++                baseline: ocrSample(["before"], hash: "before"))
++            let metadata = try XCTUnwrap(result["structuredContent"] as? [String: Any])
++            let comparison = try XCTUnwrap(metadata["ocr_diff"] as? [String: Any])
++            XCTAssertEqual(comparison["status"] as? String, "current_unavailable")
++            XCTAssertEqual(comparison["baseline_available"] as? Bool, true)
++            XCTAssertEqual(comparison["current_available"] as? Bool, false)
++            XCTAssertTrue(comparison["unchanged"] is NSNull)
++            XCTAssertNil(comparison["removed"])
++        }
++    }
++
++    func testOnlyStandaloneScreenshotContentExposesATouchReference() throws {
++        var frame = ocrSample(["visible"], hash: "pixels")
++        frame.frameID = "00000000-0000-4000-8000-000000000123"
++        let screenshot = MCPServer.screenshotContent(frame, includeImage: true, diff: false)
++        let screenshotMetadata = try XCTUnwrap(screenshot["structuredContent"] as? [String: Any])
++        XCTAssertEqual((screenshotMetadata["frame"] as? [String: Any])?["id"] as? String, frame.frameID)
++        for diff in [false, true] {
++            let observation = MCPServer.ObservationResult(status: .stable, frame: frame)
++            let result = MCPServer.observationContent(observation, includeImage: true, diff: diff, baseline: frame)
++            let metadata = try XCTUnwrap(result["structuredContent"] as? [String: Any])
++            XCTAssertNil(metadata["frame"])
++            XCTAssertEqual(metadata["touch_reference"] as? [String: String],
++                ["status": "not_issued", "reason": "action_observation_only", "next_tool": "screenshot"])
++            let content = try XCTUnwrap(result["content"] as? [[String: Any]])
++            let text = content.compactMap { $0["text"] as? String }.joined(separator: "\n")
++            XCTAssertFalse(text.contains(frame.frameID!))
++            XCTAssertTrue(text.contains("screenshot"))
++        }
++    }
++
+     func testDelayedTransitionCannotFinishOnTwoEqualOldFrames() {
+         var clock: TimeInterval = 10
+         var sequence: UInt64 = 1
+@@ -178,7 +270,7 @@ final class MCPObservationTests: XCTestCase {
+         for raw: Any in [true, "1", 0, 0.1, 5.01, Double.nan, Double.infinity, -Double.infinity] {
+             XCTAssertThrowsError(try MCPServer.observationTimeout(raw))
+         }
+-        XCTAssertEqual(try MCPServer.observationTimeout(nil), 1.5)
++        XCTAssertEqual(try MCPServer.observationTimeout(nil), 3.0)
+         XCTAssertEqual(try MCPServer.observationTimeout(0.2), 0.2)
+         XCTAssertEqual(try MCPServer.observationTimeout(5), 5)
+         for timestamp in ["nan", "inf", "-1", "missing"] {
+diff --git a/codex/skills/iphone-use/SKILL.md b/codex/skills/iphone-use/SKILL.md
+index bd807ef..1c933dc 100644
+--- a/codex/skills/iphone-use/SKILL.md
++++ b/codex/skills/iphone-use/SKILL.md
+@@ -14,7 +14,7 @@ description: "通过受管 USB MCP 操作连接到 Mac 的真实 iPhone，读取
+ 
+ 开始或恢复时先读 `session_context`，再检查新截图。checkpoint 是历史手记，
+ 不是当前画面；runtime identity 只比较已加载的原生程序，不证明 helper 或配置一致。
+-有多台手机时用 `list_devices` 核对目标；受管启动器只允许配置中的确切手机。
++当前受管模式只支持同时连接一台 iPhone；截图和输入共同绑定配置中的物理 USB UDID。
+ 
+ 触控使用刚看到的截图 `frame.id` 与其像素坐标，图片长边最多 1000 像素。
+ 不要拿 AX 坐标或缩放后的网页坐标当作触控引用。示例需按实际截图替换：
+@@ -25,13 +25,16 @@ description: "通过受管 USB MCP 操作连接到 Mac 的真实 iPhone，读取
+ 
+ 每批最多一个 `tap`、`swipe` 或 `touch`，且必须放第一步。长按用 `tap.hold`。
+ 其后可接无需中间判断的 `type`、`key`、`home`、`delay` 或 `wait_text`。
+-下一次坐标判断必须重新观察；frame 只能尝试使用一次，不冻结界面，也没有年龄 TTL。
++动作观察图和 burst 没有触控 token；下一次触控必须调用独立 `screenshot`。
++frame 只能尝试使用一次，不冻结界面，也没有年龄 TTL。
+ 批次预先校验，出错停止后续步骤，不自动重放。
+ 
+ `type` 默认写手机剪贴板再发 USB Cmd+V；`use_clipboard:false` 才是 USB HID 输入。
++HID 和剪贴板副作用分开汇报；剪贴板已写入或状态不明不等于“没有输入”。
+ HID 结果受当前输入法影响；剪贴板回执也不等于字段内容已正确。提交前检查字段。
+ `clear_before` 的 Cmd+A 可能失败而 Backspace 仍生效，不能盲目重试。
+-`home` 已封装 USB Home 操作，无需调用旧的独立 Home 工具。
++`home` 发送同一物理目标上的原生 USB Home 按钮，并经过同一个提交校验。
++旧的 Cmd+H 实现在设置搜索框内未导航，已替换；不自动改用快捷键或底部手势。
+ 
+ 观察动作结果，分别判断本地发送、后续画面与应用是否完成。工具超时或断连可能发生在
+ 输入之后；先看新画面，不重复整组动作。原生锁只串行单次调用，不能阻止别的会话在
+@@ -69,7 +72,7 @@ python3 <本技能目录>/scripts/mcp_call.py screenshot
+ 若受管 host 尚未运行，`python3 <本技能目录>/scripts/ensure_service.py` 只调用同一个
+ 受管 `start`，复用匹配的 host 或启动预构建的 USB host。它不会因缺设备重启服务、
+ 停止不相关进程或切换手机。启动超时可能已经完成，先读受管 `status`。
+-仍失败时报告具体错误；USB 信任、解锁或相机授权不足需要处理，不能伪称连接成功。
++仍失败时报告具体错误；USB 信任、解锁或 CoreDevice 截图能力不足需要处理，不能伪称连接成功。
+ 
+ 查看实时画面时可打开 `http://127.0.0.1:7390/viewer`；该页只读，输入继续走 `act`。
+ 完成时在 `session_context` 保存简短 checkpoint：做了什么、看到了什么、尚不确定什么、
+diff --git a/docs/architecture.md b/docs/architecture.md
+index 81e5b8c..ab65d12 100644
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -1,6 +1,8 @@
+ # 代码结构与维护约束
+ 
+-本项目通过 USB 采集 iPhone 画面，通过 Bluetooth LE HID 发送输入。窗口、HTTP API 和 MCP 最终使用同一个手机输入队列；重构或扩展功能时，应以这一共享状态为基础。
++受管入口使用一个物理 USB UDID：`USBScreenCapture.swift` 通过同一 CoreDevice 目标读截图，`USBControlAPI.swift` 在任何旧设备发现或输入路由之前接管请求。截图前后与输入 commit 前复查物理 USB attachment；不以 AVFoundation ID、尺寸或画面相似度证明同机。受管进程不启动或停止旧 AV/Valeria/Bluetooth 生命周期。
++
++以下桌面窗口、AV 采集与 Bluetooth 队列说明保留上游内部实现的维护背景；它们不属于受管 USB 产品入口。
+ 
+ ## 入口与模块
+ 
+diff --git a/docs/user-guide.md b/docs/user-guide.md
+index f10e851..d51eb4c 100644
+--- a/docs/user-guide.md
++++ b/docs/user-guide.md
+@@ -16,7 +16,8 @@ node ios/phone.mjs build
+ ```
+ 
+ Copy `ios/config.example.json` to `.local/iphone-use.json` and supply the exact
+-capture ID and physical USB UDID. Keep the file private. The port is fixed to
++physical USB UDID. Connect exactly one iPhone. Screenshots and input open that same
++physical USB target; AVFoundation capture IDs are not accepted as its identity. Keep the file private. The port is fixed to
+ loopback 7390. The launcher enables both USB touch and keyboard, clears inherited
+ Bluetooth settings and rejects legacy/mixed configurations. No Bluetooth pairing
+ or AssistiveTouch is needed for this route.
+@@ -54,7 +55,8 @@ and image pixels in the first `act` step for touch. A batch can contain at most
+ one `tap`, `swipe` or `touch` step, first; `tap.hold` provides long press. Additional
+ `type`, `key`, `home`, `delay` or `wait_text` steps can follow when no intermediate
+ decision is needed. The whole batch is validated before input. Failure stops later
+-steps without fallback or replay. Another coordinate decision needs another frame.
++steps without fallback or replay. Action observations and burst images have no touch token. Another coordinate
++decision requires a standalone `screenshot` and its fresh frame.
+ 
+ A frame is consumed once and does not freeze the UI. AX coordinates and OCR text
+ are not touch references. Frames have no age TTL; observe again after a pause,
+@@ -63,8 +65,18 @@ not an entire multi-call task.
+ 
+ `type` defaults to phone clipboard plus USB Cmd+V; `use_clipboard:false` requests
+ USB HID typing. Input methods, editor state and paste permission can affect the
+-result. Inspect the field before submitting. `home` uses the USB keyboard path.
++result. Inspect the field before submitting. `home` sends the native USB Home button through the same target and commit guard.
+ Local sends and cleanup receipts do not establish phone delivery or app completion.
++The former Command-H shortcut failed in a measured Settings search field and
++was replaced by the native button, which navigated Home in that case. Neither
++keyboard shortcuts nor system-edge swipes are automatic fallbacks. System paste
++permission prompts remain visible.
++Receipts distinguish HID input from clipboard side effects; an uncertain or
++acknowledged clipboard write cannot be reported as no input. `ocr_diff` compares
++this call's retained pre-input screenshot with its post-input screenshot; missing
++OCR remains explicitly unavailable. Baseline capture has a 2-second budget and
++default post-input observation has a 3-second budget. One-shot USB screenshot
++latency can cause a bounded observation or burst to be partial.
+ If a call times out after input, observe before deciding whether any action is
+ needed; do not replay an uncertain batch.
+ 

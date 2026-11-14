@@ -1,0 +1,583 @@
+diff --git a/Sources/iPhoneUse/API/ControlAPI.swift b/Sources/iPhoneUse/API/ControlAPI.swift
+index 41e220b..ec80d91 100644
+--- a/Sources/iPhoneUse/API/ControlAPI.swift
++++ b/Sources/iPhoneUse/API/ControlAPI.swift
+@@ -175,6 +175,7 @@ enum ControlAPI {
+                 guard controlPaths.contains(request.path) else { return frameReady }
+                 if CoreDeviceTouch.isConfigured, request.body["frame_id"] != nil,
+                     ["/tap", "/swipe"].contains(request.path) { return frameReady }
++                if CoreDeviceKeyboard.isConfigured, ["/key", "/type"].contains(request.path) { return frameReady }
+                 return frameReady && target.host != nil
+                     && (try? DeviceRegistry.shared.input(for: target).isPointerReady) == true
+             }
+@@ -233,6 +234,7 @@ enum ControlAPI {
+             "bluetoothHosts": hosts,
+             "bluetoothHostSelection": HIDPeripheral.shared.selectedHostDescription,
+             "directTouch": CoreDeviceTouch.isConfigured,
++            "directKeyboard": CoreDeviceKeyboard.isConfigured,
+             "capture": captureStatus(),
+             "devices": DeviceRegistry.shared.status(),
+             "unmatchedHosts": DeviceRegistry.shared.unmatchedHosts().map(\.uuidString),
+@@ -376,6 +378,25 @@ enum ControlAPI {
+             }
+         }
+         try validateLeaf(path: action.rawValue, body: body, screenSize: device.screen.size)
++        if CoreDeviceKeyboard.isConfigured, action == .key || action == .type {
++            guard ProcessInfo.processInfo.environment["IPHONE_USE_DEVICE_ID"] == device.id else {
++                throw InputRequestError("USB keyboard requires the exact configured capture device")
++            }
++            let request = try action == .type ? TypeTextRequest(body, language: AppLanguageStore.shared.language) : nil
++            let switchIME = request?.ensureChineseIME == true && device.screen.snapshot(png: false, maxEdge: 1600)
++                .map { ChineseIMEHeuristic.isEnglish(ScreenOCR.recognize($0, device: device.id)) } == true
++            let program = try request.map { try CoreDeviceKeyboardProgram.text($0, switchIME: switchIME) }
++                ?? CoreDeviceKeyboardProgram.key(KeyRequest(body))
++            let captureSource = device.screen.sourceInstanceID
++            DeviceRegistry.shared.cancelBackgroundMotion(for: device)
++            let receipt = try CoreDeviceKeyboard.perform(program, device: device.id, beforeCommit: {
++                let current = try DeviceRegistry.shared.find(device.id)
++                guard current.id == device.id, current.screen.sourceInstanceID == captureSource else {
++                    throw InputRequestError("The selected capture changed during USB keyboard preflight")
++                }
++            }, clipboard: request?.hasClipboard == true ? { try request!.writeClipboard() } : nil)
++            return CoreDeviceKeyboard.response(receipt, device: device.id)
++        }
+         // The configured direct route handles only explicitly frame-bound touch
+         // gestures. Legacy unbound calls and mouse hover retain their own path.
+         if action == .touch || (CoreDeviceTouch.isConfigured && reference != nil && (action == .tap || action == .swipe)) {
+@@ -621,7 +642,8 @@ struct TextTapRequest {
+ struct ActRequest {
+     let steps: [[String: Any]]
+ 
+-    init(_ body: [String: Any], screenSize: CGSize? = nil, requireGeometry: Bool = false) throws {
++    init(_ body: [String: Any], screenSize: CGSize? = nil, requireGeometry: Bool = false,
++        directKeyboardConfigured: Bool = CoreDeviceKeyboard.isConfigured) throws {
+         guard let steps = body["steps"] as? [[String: Any]], (1...16).contains(steps.count) else {
+             throw DeviceError("steps must contain 1...16 actions")
+         }
+@@ -641,7 +663,7 @@ struct ActRequest {
+                 }
+             }
+             switch type {
+-            case "type": _ = try TypeTextRequest(step)
++            case "type": _ = try TypeTextRequest(step, directKeyboardConfigured: directKeyboardConfigured)
+             case "tap_text", "wait_text":
+                 _ = try TextTapRequest(step)
+                 _ = try OCRRequest.maxEdge(step)
+@@ -707,11 +729,12 @@ struct ActRequest {
+                     if response.status != 200 {
+                         let body = (try? JSONSerialization.jsonObject(with: response.body)) as? [String: Any]
+                         let message = body?["error"] as? String ?? String(decoding: response.body, as: UTF8.self)
+-                        return .json(
+-                            [
++                        var failure: [String: Any] = [
+                                 "ok": false, "failed_step": index + 1, "completed": index,
+                                 "error": message,
+-                            ], status: response.status)
++                            ]
++                        if let receipt = body?["keyboard_receipt"] { failure["keyboard_receipt"] = receipt }
++                        return .json(failure, status: response.status)
+                     }
+                 }
+             } catch {
+diff --git a/Sources/iPhoneUse/Input/CoreDeviceKeyboard.swift b/Sources/iPhoneUse/Input/CoreDeviceKeyboard.swift
+new file mode 100644
+index 0000000..3cb9577
+--- /dev/null
++++ b/Sources/iPhoneUse/Input/CoreDeviceKeyboard.swift
+@@ -0,0 +1,262 @@
++import Darwin
++import Foundation
++
++/// US-layout strokes share KeyboardMap with BLE. This is one finite program,
++/// not a persistent keyboard session or a second public input language.
++struct CoreDeviceKeyboardProgram {
++    private(set) var samples: [[String: Any]] = []
++    private var nextMS = 0
++
++    private mutating func append(_ usages: [Int]) throws {
++        guard samples.count < 128, nextMS <= 6000 else {
++            throw InputRequestError("USB keyboard program exceeds 128 reports or 6 seconds; use clipboard for longer text")
++        }
++        samples.append(["at_ms": nextMS, "usages": usages])
++    }
++
++    private mutating func stroke(_ stroke: KeyboardMap.Stroke) throws {
++        let modifiers = (0..<8).filter { stroke.modifiers & (1 << $0) != 0 }.map { 224 + $0 }
++        if !modifiers.isEmpty { try append(modifiers); nextMS += 100 }
++        try append(modifiers + [Int(stroke.code)]); nextMS += 120
++        try append(modifiers)
++        if !modifiers.isEmpty { nextMS += 100; try append([]) }
++        nextMS += 80
++    }
++
++    private mutating func key(_ name: String, _ modifiers: [String]) throws {
++        guard let code = KeyboardMap.code(for: name), let mask = KeyboardMap.modifierMask(for: modifiers) else {
++            throw InputRequestError("Unknown or invalid keyboard stroke")
++        }
++        try stroke(KeyboardMap.Stroke(code: code, modifiers: mask))
++    }
++
++    static func key(_ request: KeyRequest) throws -> Self {
++        var program = Self()
++        try program.key(request.key, request.modifiers)
++        return program
++    }
++
++    static func text(_ request: TypeTextRequest, switchIME: Bool) throws -> Self {
++        var program = Self()
++        if switchIME {
++            try program.key("space", ["control"])
++            program.nextMS += 250
++        }
++        for action in request.actions {
++            switch action {
++            case .key(let key, let modifiers): try program.key(key, modifiers)
++            case .clipboard: try program.key("v", ["command"])
++            case .text(let text, _):
++                guard let converted = KeyboardMap.keyboardText(for: text) else {
++                    throw InputRequestError("Text cannot be represented by the configured keyboard layout")
++                }
++                for character in converted {
++                    guard let stroke = KeyboardMap.stroke(for: character) else {
++                        throw InputRequestError("Text cannot be represented by the configured keyboard layout")
++                    }
++                    try program.stroke(stroke)
++                }
++            }
++        }
++        return program
++    }
++}
++
++/// One owned child, exact configured USB target, and a one-use host commit.
++/// The caller holds DeviceCommandLocks. No media, BLE fallback or action replay.
++enum CoreDeviceKeyboard {
++    static let helperKey = "IPHONE_USE_KEYBOARD_HELPER"
++    static var isConfigured: Bool { ProcessInfo.processInfo.environment[helperKey] != nil }
++
++    static func perform(
++        _ program: CoreDeviceKeyboardProgram, device: String,
++        environment: [String: String] = ProcessInfo.processInfo.environment,
++        beforeCommit: () throws -> Void = {},
++        clipboard: (() throws -> Void)? = nil
++    ) throws -> [String: Any] {
++        guard environment["IPHONE_USE_DEVICE_ID"] == device,
++            let helper = environment[helperKey], helper.hasPrefix("/"), !helper.contains("\0"),
++            FileManager.default.isReadableFile(atPath: helper) else {
++            throw InputRequestError("USB keyboard requires its configured helper and exact capture device")
++        }
++        let configuration = try DeviceClipboard.Configuration(environment: environment)
++        guard FileManager.default.isExecutableFile(atPath: configuration.python.path) else {
++            throw InputRequestError("USB keyboard Python is unavailable")
++        }
++        var committed = false
++        var clipboardStatus = clipboard == nil ? "not_requested" : "not_written"
++        func receipt(_ status: String, reason: String? = nil) -> [String: Any] {
++            var result: [String: Any] = [
++                "schema_version": 1, "backend": "coredevice-keyboard", "input_status": status,
++                "device_bound": true, "frame_bound": false, "device_delivery": "unverified",
++                "application_effect": "unverified", "clipboard_status": clipboardStatus,
++            ]
++            if let reason { result["reason"] = reason }
++            return result
++        }
++        if program.samples.isEmpty {
++            var result = receipt("not_sent")
++            result["no_op"] = true
++            return result
++        }
++        let data = try JSONSerialization.data(withJSONObject: ["samples": program.samples])
++        guard data.count <= 16384 else { throw InputRequestError("USB keyboard plan exceeds 16 KiB") }
++        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("iphone-use-keyboard-\(UUID().uuidString)")
++        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
++        defer { try? FileManager.default.removeItem(at: directory) }
++        let inputURL = directory.appendingPathComponent("plan.json")
++        let outputURL = directory.appendingPathComponent("receipt.jsonl")
++        let commitURL = directory.appendingPathComponent("commit.json")
++        guard FileManager.default.createFile(atPath: inputURL.path, contents: data, attributes: [.posixPermissions: 0o600]),
++            FileManager.default.createFile(atPath: outputURL.path, contents: nil, attributes: [.posixPermissions: 0o600]) else {
++            throw InputRequestError("Cannot prepare USB keyboard helper files")
++        }
++        let input = try FileHandle(forReadingFrom: inputURL), output = try FileHandle(forWritingTo: outputURL)
++        defer { try? input.close(); try? output.close() }
++        let process = Process(), finished = DispatchSemaphore(value: 0)
++        process.executableURL = configuration.python
++        process.arguments = ["-B", helper, "--commit-file", commitURL.path]
++        process.environment = configuration.childEnvironment(environment)
++        process.standardInput = input; process.standardOutput = output; process.standardError = FileHandle.nullDevice
++        process.terminationHandler = { _ in finished.signal() }
++        defer {
++            if process.isRunning {
++                process.terminate()
++                if finished.wait(timeout: .now() + 7) == .timedOut, process.isRunning {
++                    kill(process.processIdentifier, SIGKILL)
++                    _ = finished.wait(timeout: .now() + 1)
++                }
++            }
++        }
++        func failure(_ reason: String) -> [String: Any] {
++            receipt(committed ? "unconfirmed" : "not_sent", reason: reason)
++        }
++        func messages() throws -> [[String: Any]] {
++            let file = try FileHandle(forReadingFrom: outputURL)
++            defer { try? file.close() }
++            let bytes = try file.read(upToCount: 32769) ?? Data()
++            guard bytes.count <= 32768 else { throw InputRequestError("USB keyboard receipt exceeds byte limit") }
++            guard let newline = bytes.lastIndex(of: 10) else { return [] }
++            return try bytes[..<newline].split(separator: 10, omittingEmptySubsequences: false).map {
++                guard let value = try JSONSerialization.jsonObject(with: Data($0)) as? [String: Any] else {
++                    throw InputRequestError("Invalid USB keyboard protocol record")
++                }
++                return value
++            }
++        }
++        func exchange() throws -> [String: Any] {
++            do { try process.run() } catch { return failure("USB keyboard helper did not start") }
++            let deadline = ProcessInfo.processInfo.systemUptime + 8
++            var ready = false
++            while ProcessInfo.processInfo.systemUptime < deadline {
++                if try messages().contains(where: {
++                    $0["phase"] as? String == "ready" && TextEntry.isBoolean($0["keyboard_surface_registered"])
++                        && $0["keyboard_surface_registered"] as? Bool == true
++                }) { ready = true; break }
++                if !process.isRunning { break }
++                Thread.sleep(forTimeInterval: 0.01)
++            }
++            if ready {
++                do {
++                    try beforeCommit()
++                    if let clipboard {
++                        clipboardStatus = "unconfirmed"
++                        try clipboard()
++                        clipboardStatus = "written_unverified"
++                    }
++                    // Clipboard setup may take time; do not use a replaced capture selector.
++                    try beforeCommit()
++                } catch {
++                    // Child/clipboard diagnostic text may contain user input. Keep it private.
++                    return failure("USB keyboard preparation failed; no keyboard reports were committed")
++                }
++                committed = true
++                let pending = directory.appendingPathComponent("commit.pending")
++                guard FileManager.default.createFile(atPath: pending.path, contents: Data("{\"commit\":true}".utf8),
++                    attributes: [.posixPermissions: 0o600]), rename(pending.path, commitURL.path) == 0 else {
++                    return failure("USB keyboard commit failed; do not replay")
++                }
++                if finished.wait(timeout: .now() + 15) == .timedOut {
++                    return failure("USB keyboard helper timed out after commit; do not replay")
++                }
++            } else if process.isRunning {
++                return failure("USB keyboard preflight did not become ready")
++            }
++            guard let raw = try messages().last(where: { $0["schema_version"] as? Int == 1 }),
++                raw["backend"] as? String == "coredevice-keyboard",
++                let status = raw["input_status"] as? String, ["not_sent", "sent_unverified", "unconfirmed"].contains(status),
++                let attempted = exactCount(raw["reports_attempted"]),
++                let sent = exactCount(raw["reports_locally_sent"]), sent <= attempted else {
++                return failure("USB keyboard helper ended without a valid receipt")
++            }
++            if !committed && (status != "not_sent" || attempted != 0 || sent != 0) {
++                return receipt("unconfirmed", reason: "Helper reported keyboard input without a host commit")
++            }
++            let release = raw["cleanup_release"] as? [String: Any] ?? [:]
++            let cleanup = raw["cleanup"] as? [String: Any] ?? [:]
++            let errors = cleanup["errors"] as? [[String: Any]]
++            let validSuccess = committed && TextEntry.isBoolean(raw["host_commit_received"])
++                && raw["host_commit_received"] as? Bool == true
++                && TextEntry.isBoolean(raw["virtual_service_registered"]) && raw["virtual_service_registered"] as? Bool == true
++                && TextEntry.isBoolean(raw["media_started"]) && raw["media_started"] as? Bool == false
++                && attempted == program.samples.count && sent == attempted
++                && release["status"] as? String == "sent_unverified" && errors?.isEmpty == true
++                && ["connection_closed", "tunnel_closed", "pairing_scratch_removed"].allSatisfy {
++                    TextEntry.isBoolean(cleanup[$0]) && cleanup[$0] as? Bool == true
++                }
++                && raw["error_type"] == nil
++                && process.terminationReason == .exit && process.terminationStatus == 0
++            let finalStatus = status == "not_sent" && (attempted > 0 || sent > 0) ? "unconfirmed"
++                : status == "sent_unverified" && !validSuccess ? "unconfirmed"
++                : (process.terminationReason != .exit || process.terminationStatus != 0) && committed ? "unconfirmed" : status
++            var result = receipt(finalStatus)
++            result["reports_attempted"] = attempted
++            result["reports_locally_sent"] = sent
++            result["host_commit_received"] = raw["host_commit_received"] as? Bool == true
++            result["cleanup_release"] = ["status": ["not_needed", "sent_unverified", "unconfirmed"].contains(release["status"] as? String ?? "")
++                ? release["status"] as! String : "unconfirmed"]
++            result["cleanup"] = sanitizedCleanup(cleanup)
++            result["surface_deregistration"] = "not_independently_observed"
++            if raw["error_type"] != nil { result["error_type"] = safeError(raw["error_type"]) }
++            if finalStatus != "sent_unverified" { result["reason"] = "USB keyboard did not complete cleanly; do not replay automatically" }
++            return result
++        }
++        do { return try exchange() }
++        catch { return failure(committed ? "USB keyboard receipt failed after commit; do not replay" : "USB keyboard preflight receipt was invalid") }
++    }
++
++    private static func exactCount(_ value: Any?) -> Int? {
++        guard let number = value as? NSNumber, !TextEntry.isBoolean(number), number.doubleValue.isFinite,
++            (0...128).contains(number.doubleValue), number.doubleValue.rounded() == number.doubleValue else { return nil }
++        return number.intValue
++    }
++
++    private static func safeError(_ value: Any?) -> String {
++        let known = ["ValueError", "RuntimeError", "TimeoutError", "CancelledError", "OSError", "ConnectionTerminatedError"]
++        return known.contains(value as? String ?? "") ? value as! String : "OtherError"
++    }
++
++    private static func sanitizedCleanup(_ raw: [String: Any]) -> [String: Any] {
++        var clean: [String: Any] = [:]
++        for key in ["connection_closed", "tunnel_closed", "pairing_scratch_removed", "not_started"] {
++            if TextEntry.isBoolean(raw[key]) { clean[key] = raw[key] }
++        }
++        if let errors = raw["errors"] as? [[String: Any]], errors.count <= 16 {
++            let stages = ["hid_close", "runtime_close", "cleanup_budget", "cleanup_task", "socket-close", "tunnel-close", "pairing-scratch-remove"]
++            clean["errors"] = errors.map { ["stage": stages.contains($0["stage"] as? String ?? "") ? $0["stage"] as! String : "other",
++                "error_type": safeError($0["error_type"] ?? $0["type"])] }
++        } else { clean["errors"] = [["stage": "receipt", "error_type": "InvalidCleanup"]] }
++        return clean
++    }
++
++    static func response(_ receipt: [String: Any], device: String) -> HTTPResponse {
++        let ok = receipt["input_status"] as? String == "sent_unverified" || receipt["no_op"] as? Bool == true
++        var body: [String: Any] = ["ok": ok, "device": device, "keyboard_receipt": receipt]
++        if !ok {
++            body["error"] = receipt["reason"] ?? "USB keyboard input was not confirmed; inspect before retrying"
++            body["input_sent"] = receipt["input_status"] as? String == "not_sent" ? false : nil
++        }
++        // Non-200 stops both HTTP act and MCP keyboard_sequence immediately.
++        return .json(body, status: ok ? 200 : 409)
++    }
++}
+diff --git a/Sources/iPhoneUse/Input/TextEntry.swift b/Sources/iPhoneUse/Input/TextEntry.swift
+index 6b81ca7..2eeeb10 100644
+--- a/Sources/iPhoneUse/Input/TextEntry.swift
++++ b/Sources/iPhoneUse/Input/TextEntry.swift
+@@ -53,7 +53,8 @@ struct TypeTextRequest {
+ 
+     init(
+         _ body: [String: Any], language: AppLanguage = .en,
+-        deviceClipboardConfigured: Bool = DeviceClipboard.isConfigured
++        deviceClipboardConfigured: Bool = DeviceClipboard.isConfigured,
++        directKeyboardConfigured: Bool = CoreDeviceKeyboard.isConfigured
+     ) throws {
+         let table = StringsAPI(language: language)
+         guard let text = body["text"] as? String else { throw DeviceError(table.textRequired) }
+@@ -80,6 +81,19 @@ struct TypeTextRequest {
+         if body["press_enter"] as? Bool == true { actions.append(key("enter")) }
+         self.actions = actions
+         ensureChineseIME = !clipboard && ((body["ensure_chinese_ime"] as? Bool) ?? KeyboardMap.containsHanzi(text))
++        // Batch parsers construct TypeTextRequest for every later step too.
++        // Reserve the optional IME switch before any earlier step can mutate UI.
++        if directKeyboardConfigured {
++            _ = try CoreDeviceKeyboardProgram.text(self, switchIME: ensureChineseIME)
++        }
++    }
++
++    var hasClipboard: Bool { actions.contains { if case .clipboard = $0 { return true }; return false } }
++
++    func writeClipboard(using clipboard: (String) throws -> Void = TextEntry.writeClipboard) throws {
++        for action in actions {
++            if case .clipboard(let text) = action { try clipboard(text) }
++        }
+     }
+ 
+     func perform(
+@@ -89,9 +103,7 @@ struct TypeTextRequest {
+         clipboard: (String) throws -> Void = TextEntry.writeClipboard
+     ) throws {
+         // A clipboard failure must precede clear_before and any other input.
+-        for action in actions {
+-            if case .clipboard(let text) = action { try clipboard(text) }
+-        }
++        try writeClipboard(using: clipboard)
+         if ensureChineseIME, let result = ocr(), ChineseIMEHeuristic.isEnglish(result) {
+             try input.key("space", modifiers: ["control"])
+             sleep(0.25)
+diff --git a/Sources/iPhoneUse/Localization/StringsMCP.swift b/Sources/iPhoneUse/Localization/StringsMCP.swift
+index abeaf9a..14c4dc7 100644
+--- a/Sources/iPhoneUse/Localization/StringsMCP.swift
++++ b/Sources/iPhoneUse/Localization/StringsMCP.swift
+@@ -83,9 +83,9 @@ struct StringsMCP: LocalizedTable {
+         toolLongPress: "长按某个点，例如打开上下文菜单。配置 directTouch 且传入 frame_id 时走 USB；省略 frame_id 仍走 BLE。",
+         toolSwipe: "沿至少两个点的有序路径持续拖动，直到最后一个点才抬起。配置 directTouch 且传入 frame_id 时走 USB；省略 frame_id 仍走 BLE。默认使用最新截图像素；normalized=true 时每轴使用 0...1000。",
+         toolTypeText:
+-            "配置 USB 剪贴板后，默认将原样 Unicode（中文、emoji 等）写入指定手机剪贴板再按 Cmd+V；use_clipboard=false 显式选择 HID。未配置时默认 HID，true 使用 Mac 剪贴板。会覆盖所用剪贴板，不读取旧内容。clear_before 先清空；commit_ime 发送空格以确认拼音候选，原样粘贴时应省略；press_enter 最后按回车；请检查字段结果，剪贴板送达不代表字段验证。HID 中文转拼音选首词；ensure_chinese_ime=false 保持当前输入法，拼音可能消费数字/回车；可 Ctrl+Space 切换后观察。",
++            "directKeyboard 配置开启时，按键与粘贴快捷键使用 USB，否则使用 BLE。USB HID 单次最多 6 秒；较长文字使用默认剪贴板。配置 USB 剪贴板后，默认将原样 Unicode（中文、emoji 等）写入指定手机剪贴板再按 Cmd+V；use_clipboard=false 显式选择 HID。未配置时默认 HID，true 使用 Mac 剪贴板。会覆盖所用剪贴板，不读取旧内容。clear_before 先清空；commit_ime 发送空格以确认拼音候选，原样粘贴时应省略；press_enter 最后按回车；请检查字段结果，剪贴板送达不代表字段验证。HID 中文转拼音选首词；ensure_chinese_ime=false 保持当前输入法，拼音可能消费数字/回车；可 Ctrl+Space 切换后观察。",
+         toolPressKey:
+-            "按下按键，可带修饰键。按键：enter、escape、backspace、tab、space、up、down、left、right 或单个字符。修饰键：cmd、shift、alt、ctrl。cmd+space 打开聚焦搜索。",
++            "按下按键，可带修饰键。directKeyboard 配置开启时使用指定手机的 USB 键盘，否则使用 BLE；失败不回退或重放。按键：enter、escape、backspace、tab、space、up、down、left、right 或单个字符。修饰键：cmd、shift、alt、ctrl。cmd+space 打开聚焦搜索。",
+         toolKeyboardSequence:
+             "执行简短键盘序列，最后返回截图；预先校验全部步骤，同一手机全程加锁，失败即停且不重放。支持 steps/actions、可选 type、0...5 秒 delay/wait；最多 16 步、文字总量 256 字符。文字步骤使用与 type_text 相同的传输和选项：配置 USB 剪贴板后默认原样 Unicode，use_clipboard=false 保留 HID。每个文字步骤保留为一次请求，剪贴板写入失败不会先清空该字段。会覆盖所用剪贴板；观察字段以确认结果。",
+         toolHome: "回到主屏幕。",
+@@ -142,9 +142,9 @@ struct StringsMCP: LocalizedTable {
+         toolSwipe:
+             "Drag continuously through an ordered path of at least two points, keeping contact until the last point. With directTouch configured, pass frame_id for USB; omitting it still uses BLE. Coordinates default to pixels of the latest screenshot; normalized=true uses 0...1000 per axis.",
+         toolTypeText:
+-            "With USB clipboard configured, default pastes literal Unicode (Chinese, emoji, etc.) through the selected phone clipboard and Cmd+V; use_clipboard=false explicitly selects HID. Otherwise default is HID and true uses the Mac clipboard. Overwrites that clipboard without reading its old content. clear_before clears first; commit_ime sends Space to commit a pinyin candidate, so omit it for literal paste; press_enter sends Enter last. Inspect the field: clipboard delivery is not field verification. HID turns Hanzi into pinyin; ensure_chinese_ime=false preserves the active IME. Pinyin may consume digits/Enter; cycle with Ctrl+Space then inspect.",
++            "With directKeyboard configured, keys and paste chords use USB; otherwise BLE. USB HID requests are bounded to 6 seconds; use the default clipboard for longer text. With USB clipboard configured, default pastes literal Unicode (Chinese, emoji, etc.) through the selected phone clipboard and Cmd+V; use_clipboard=false explicitly selects HID. Otherwise default is HID and true uses the Mac clipboard. Overwrites that clipboard without reading its old content. clear_before clears first; commit_ime sends Space to commit a pinyin candidate, so omit it for literal paste; press_enter sends Enter last. Inspect the field: clipboard delivery is not field verification. HID turns Hanzi into pinyin; ensure_chinese_ime=false preserves the active IME. Pinyin may consume digits/Enter; cycle with Ctrl+Space then inspect.",
+         toolPressKey:
+-            "Press a key, optionally with modifiers. Keys: enter, escape, backspace, tab, space, up, down, left, right, or a character. Modifiers: cmd, shift, alt, ctrl. cmd+space opens Spotlight.",
++            "Press a key, optionally with modifiers. With directKeyboard configured, uses the exact selected USB phone; otherwise BLE. No fallback or replay on failure. Keys: enter, escape, backspace, tab, space, up, down, left, right, or a character. Modifiers: cmd, shift, alt, ctrl. cmd+space opens Spotlight.",
+         toolKeyboardSequence:
+             "Run a short keyboard sequence with one final screenshot. Validates all steps first, locks the phone throughout and stops on error without replay. Accepts steps/actions, optional type tags, 0...5-second delay/wait; maximum 16 steps and 256 text characters. Text uses type_text's transport/options: configured USB clipboard defaults to literal Unicode; use_clipboard=false selects HID. Each text step stays one request so clipboard failure precedes clearing that field. Overwrites the selected clipboard; inspect the field to verify the result.",
+         toolHome: "Go to the Home Screen.",
+diff --git a/Sources/iPhoneUse/MCP/MCPContextStore.swift b/Sources/iPhoneUse/MCP/MCPContextStore.swift
+index d62d1b1..e07a1e9 100644
+--- a/Sources/iPhoneUse/MCP/MCPContextStore.swift
++++ b/Sources/iPhoneUse/MCP/MCPContextStore.swift
+@@ -277,11 +277,11 @@ final class MCPContextRecording {
+     private let inputFrameID: String?
+     private let isInput: Bool
+ 
+-    init(device: String, tool: String, arguments: [String: Any], kind: String) {
++    init(device: String, tool: String, arguments: [String: Any], kind: String, directory: URL? = nil) {
+         inputFrameID = arguments["frame_id"] as? String
+         isInput = kind == "input"
+         do {
+-            let store = try MCPContextStore(device: device)
++            let store = try MCPContextStore(device: device, directory: directory)
+             let event = try store.begin(tool: tool, arguments: arguments, kind: kind)
+             self.store = store
+             self.event = event
+@@ -295,7 +295,7 @@ final class MCPContextRecording {
+     func requestAcknowledged() { requestsAcknowledged += 1; update { $0.requests_acknowledged += 1; $0.state = "acknowledged" } }
+     func recordTransport(_ response: Data) {
+         guard let body = (try? JSONSerialization.jsonObject(with: response)) as? [String: Any],
+-            let receipt = body["touch_receipt"] as? [String: Any] else { return }
++            let receipt = (body["keyboard_receipt"] ?? body["touch_receipt"]) as? [String: Any] else { return }
+         transportReceipt = receipt
+     }
+     func finish(_ observation: MCPServer.ObservationResult? = nil) {
+@@ -313,6 +313,21 @@ final class MCPContextRecording {
+         }
+     }
+     func fail(_ error: Error) {
++        if let failure = error as? MCPServer.MCPError, var receipt = failure.transportReceipt {
++            if (failure.completedSteps ?? 0) > 0 {
++                receipt["failed_step_input_status"] = receipt["input_status"]
++                receipt["input_status"] = "unconfirmed"
++                receipt["completed_steps"] = failure.completedSteps
++            }
++            transportReceipt = receipt
++        } else if var receipt = transportReceipt {
++            // A later timeout has no leaf receipt. Do not report an earlier
++            // successful leaf as completion of this whole keyboard sequence.
++            receipt["last_completed_input_status"] = receipt["input_status"]
++            receipt["input_status"] = "unconfirmed"
++            receipt["reason"] = "A later request failed without a transport receipt"
++            transportReceipt = receipt
++        }
+         rejectedBeforeInput = (error as? MCPServer.MCPError)?.inputNotSent == true
+             && requestsStarted == 1 && requestsAcknowledged == 0
+         update {
+@@ -357,7 +372,7 @@ final class MCPContextRecording {
+             if let transportReceipt {
+                 receipt["status"] = transportReceipt["input_status"] ?? "unconfirmed"
+                 receipt["transport"] = transportReceipt
+-                if transportReceipt["input_status"] as? String != "sent_unverified" {
++                if transportReceipt["input_status"] as? String != "sent_unverified", transportReceipt["no_op"] as? Bool != true {
+                     result["isError"] = true
+                 }
+             }
+diff --git a/Sources/iPhoneUse/MCP/MCPKeyboardSequence.swift b/Sources/iPhoneUse/MCP/MCPKeyboardSequence.swift
+index 88cbcaf..b4466c3 100644
+--- a/Sources/iPhoneUse/MCP/MCPKeyboardSequence.swift
++++ b/Sources/iPhoneUse/MCP/MCPKeyboardSequence.swift
+@@ -41,7 +41,8 @@ enum MCPKeyboardSequence {
+         ]
+     }()
+ 
+-    static func actions(arguments: [String: Any], language: AppLanguage = .en) throws -> [MCPKeyboardAction] {
++    static func actions(arguments: [String: Any], language: AppLanguage = .en,
++        directKeyboardConfigured: Bool = CoreDeviceKeyboard.isConfigured) throws -> [MCPKeyboardAction] {
+         let table = StringsMCP(language: language)
+         guard
+             Set(arguments.keys).isSubset(of: [
+@@ -68,7 +69,7 @@ enum MCPKeyboardSequence {
+                 textCount += text.count
+                 guard !text.isEmpty, textCount <= 256
+                 else { throw MCPServer.MCPError(table.kbAscii(label)) }
+-                do { _ = try TypeTextRequest(step, language: language) } catch {
++                do { _ = try TypeTextRequest(step, language: language, directKeyboardConfigured: directKeyboardConfigured) } catch {
+                     throw MCPServer.MCPError("\(label): \(error)")
+                 }
+                 // Keep clear/type/submit within one preflighted request. Expanding
+diff --git a/Sources/iPhoneUse/MCP/MCPServer.swift b/Sources/iPhoneUse/MCP/MCPServer.swift
+index 789d882..ad341fc 100644
+--- a/Sources/iPhoneUse/MCP/MCPServer.swift
++++ b/Sources/iPhoneUse/MCP/MCPServer.swift
+@@ -219,7 +219,8 @@ enum MCPServer {
+                                 throw MCPError(
+                                     table.keyboardStopped(index + 1, actions.count, "\(error)"),
+                                     httpStatus: (error as? MCPError)?.httpStatus,
+-                                    completedSteps: index, failedStep: index + 1)
++                                    completedSteps: index, failedStep: index + 1,
++                                    transportReceipt: (error as? MCPError)?.transportReceipt)
+                             }
+                             if index < actions.count - 1 {
+                                 // Let focus changes settle without capturing every intermediate field.
+@@ -303,8 +304,12 @@ enum MCPServer {
+         }
+         return try MCPAccess.withService(port: base.port ?? 7390, language: language) {
+             try MCPAccess.withDevice(port: base.port ?? 7390, id: device, language: language) {
+-                let context = try MCPContextStore(device: device).context(
++                var context = try MCPContextStore(device: device).context(
+                     checkpoint: arguments["checkpoint"], clear: clear)
++                context["keyboard_configuration"] = [
++                    "transport": CoreDeviceKeyboard.isConfigured ? "coredevice" : "ble",
++                    "readiness": "not_checked", "application_effect": "unverified",
++                ]
+                 let data = try JSONSerialization.data(withJSONObject: context, options: [.sortedKeys])
+                 return [
+                     "content": [["type": "text", "text": String(decoding: data, as: UTF8.self)]],
+@@ -688,12 +693,15 @@ enum MCPServer {
+         let completedSteps: Int?
+         let failedStep: Int?
+         let inputNotSent: Bool
+-        init(_ description: String, httpStatus: Int? = nil, completedSteps: Int? = nil, failedStep: Int? = nil, inputNotSent: Bool = false) {
++        let transportReceipt: [String: Any]?
++        init(_ description: String, httpStatus: Int? = nil, completedSteps: Int? = nil, failedStep: Int? = nil,
++            inputNotSent: Bool = false, transportReceipt: [String: Any]? = nil) {
+             self.description = description
+             self.httpStatus = httpStatus
+             self.completedSteps = completedSteps
+             self.failedStep = failedStep
+             self.inputNotSent = inputNotSent
++            self.transportReceipt = transportReceipt
+         }
+     }
+ }
+@@ -701,7 +709,7 @@ enum MCPServer {
+ /// The stdio server's synchronous bridge to the app's local HTTP API.
+ /// Keep the semaphore wait and URLSession callback together: each MCP tool completes
+ /// its HTTP action before the server reads and processes the next input line.
+-private struct MCPHTTPClient {
++struct MCPHTTPClient {
+     let base: URL
+     let language: AppLanguage
+ 
+@@ -718,12 +726,13 @@ private struct MCPHTTPClient {
+         return try self.request(request, timeout: 60).0
+     }
+ 
+-    private static func check(_ data: Data, status: Int, language: AppLanguage) -> MCPServer.MCPError {
++    static func check(_ data: Data, status: Int, language: AppLanguage) -> MCPServer.MCPError {
+         let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+         let message = body?["error"] as? String ?? "HTTP \(status)"
+         guard let body, body["failed_step"] != nil || body["completed"] != nil else {
+             return MCPServer.MCPError(message, httpStatus: status,
+-                inputNotSent: body?["input_sent"] as? Bool == false)
++                inputNotSent: body?["input_sent"] as? Bool == false,
++                transportReceipt: body?["keyboard_receipt"] as? [String: Any])
+         }
+         var progress: [String: Any] = ["error": message]
+         progress["failed_step"] = body["failed_step"]
+@@ -732,7 +741,8 @@ private struct MCPHTTPClient {
+         let details = encoded.map { String(decoding: $0, as: UTF8.self) } ?? message
+         return MCPServer.MCPError(
+             details + "\n" + StringsMCP(language: language).actStopped,
+-            httpStatus: status, completedSteps: body["completed"] as? Int, failedStep: body["failed_step"] as? Int)
++            httpStatus: status, completedSteps: body["completed"] as? Int, failedStep: body["failed_step"] as? Int,
++            transportReceipt: body["keyboard_receipt"] as? [String: Any])
+     }
+ 
+     private func request(_ request: URLRequest, timeout: TimeInterval) throws -> (Data, HTTPURLResponse) {

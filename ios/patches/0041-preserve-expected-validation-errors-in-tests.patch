@@ -1,0 +1,16 @@
+diff --git a/Tests/iPhoneUseTests/MCP/MCPProtocolTests.swift b/Tests/iPhoneUseTests/MCP/MCPProtocolTests.swift
+index 75f8533..c8f3f20 100644
+--- a/Tests/iPhoneUseTests/MCP/MCPProtocolTests.swift
++++ b/Tests/iPhoneUseTests/MCP/MCPProtocolTests.swift
+@@ -10,7 +10,10 @@ private func firstActionStep(_ request: MCPToolRequest) throws -> [String: Any]
+ private func actRequest(_ steps: [[String: Any]], device: String? = nil, longEdge: Int = 1000) throws -> MCPToolRequest {
+     var arguments: [String: Any] = ["steps": steps]
+     if let device { arguments["device"] = device }
+-    return try XCTUnwrap(MCPToolRequest.action(named: "act", arguments: arguments, longEdge: longEdge))
++    // Let expected validation errors reach XCTAssertThrowsError without recording
++    // an unexpected failure inside XCTUnwrap's throwing autoclosure.
++    let request = try MCPToolRequest.action(named: "act", arguments: arguments, longEdge: longEdge)
++    return try XCTUnwrap(request)
+ }
+ private func actStepSchema(_ type: String, language: AppLanguage = .en) throws -> [String: Any] {
+     let action = try XCTUnwrap(MCPToolCatalog.tools(for: language).first { $0["name"] as? String == "act" })

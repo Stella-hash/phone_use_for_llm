@@ -1,0 +1,40 @@
+diff --git a/Tests/iPhoneUseTests/Input/DeviceAccessibilityTests.swift b/Tests/iPhoneUseTests/Input/DeviceAccessibilityTests.swift
+index 7eebde7..da77e4c 100644
+--- a/Tests/iPhoneUseTests/Input/DeviceAccessibilityTests.swift
++++ b/Tests/iPhoneUseTests/Input/DeviceAccessibilityTests.swift
+@@ -50,7 +50,7 @@ final class DeviceAccessibilityTests: XCTestCase {
+         XCTAssertEqual(try String(contentsOf: directory.appendingPathComponent("native"), encoding: .utf8), "")
+         XCTAssertEqual(
+             try String(contentsOf: directory.appendingPathComponent("arguments"), encoding: .utf8),
+-            directory.appendingPathComponent("tree.py").path + "\n")
++            "-I\n-B\n" + directory.appendingPathComponent("tree.py").path + "\n")
+     }
+ 
+     func testUnavailableNativeCapabilityRemainsAnExplicitResult() throws {
+@@ -76,7 +76,7 @@ final class DeviceAccessibilityTests: XCTestCase {
+         XCTAssertEqual(try String(contentsOf: directory.appendingPathComponent("target"), encoding: .utf8), deviceID)
+         XCTAssertEqual(
+             try String(contentsOf: directory.appendingPathComponent("arguments"), encoding: .utf8),
+-            directory.appendingPathComponent("tree.py").path + "\n--display-only\n")
++            "-I\n-B\n" + directory.appendingPathComponent("tree.py").path + "\n--display-only\n")
+     }
+ 
+     func testInvalidOptionsFailBeforeLaunchingHelper() throws {
+diff --git a/Tests/iPhoneUseTests/Localization/LocalizationTests.swift b/Tests/iPhoneUseTests/Localization/LocalizationTests.swift
+index 1437755..11e9daf 100644
+--- a/Tests/iPhoneUseTests/Localization/LocalizationTests.swift
++++ b/Tests/iPhoneUseTests/Localization/LocalizationTests.swift
+@@ -218,10 +218,12 @@ final class LocalizationTests: XCTestCase {
+         let en = try actDescription(for: .en)
+         XCTAssertTrue(zh.contains("每批最多一个触控步骤且必须第一步"))
+         XCTAssertTrue(en.contains("At most one touch step, first in the batch"))
++        XCTAssertTrue(zh.contains("Home 使用原生 USB 按钮"))
++        XCTAssertTrue(en.contains("Home uses a native USB button"))
+         for description in [zh, en] {
+             XCTAssertTrue(description.contains("frame_id"))
+             XCTAssertTrue(description.contains("USB"))
+-            XCTAssertTrue(description.contains("Cmd+H"))
++            XCTAssertFalse(description.contains("Cmd+H"))
+         }
+         XCTAssertNotEqual(zh, en)
+     }

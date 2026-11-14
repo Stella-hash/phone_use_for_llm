@@ -17,4 +17,6 @@ disposable synthetic fixtures or separately authorized isolated environments.
 
 Security fixes target `main`. Coordinate disclosure with the maintainer and an
 independent reviewer to assess the affected boundary and exact repaired commit
-before publishing details. The [deployment boundary](SAFETY.md) applies in every profile.
+before publishing details. The [Android deployment boundary](SAFETY.md) applies in every Android profile.
+The separate [iOS host boundary](ios/SECURITY.md) applies to the USB source preview;
+its local host does not inherit Android authentication or approval controls.

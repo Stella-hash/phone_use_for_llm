@@ -1,0 +1,536 @@
+diff --git a/Sources/iPhoneUse/App/QuietModeActivityController.swift b/Sources/iPhoneUse/App/QuietModeActivityController.swift
+index 90f0fbe..3d70dda 100644
+--- a/Sources/iPhoneUse/App/QuietModeActivityController.swift
++++ b/Sources/iPhoneUse/App/QuietModeActivityController.swift
+@@ -17,6 +17,11 @@ final class QuietModeActivityController {
+     private let suspendCapture: () -> ScreenCaptureStopResult
+     private let resumeCapture: () -> Void
+     private let checkIdleUnplug: () -> Void
++    private let beginActivity: (ProcessInfo.ActivityOptions, String) -> NSObjectProtocol
++    private let endActivity: (NSObjectProtocol) -> Void
++    private var captureActivity: NSObjectProtocol?
++    private var captureTransitions = 0
++    private var updatingActivity = false
+     private var shutdownClean = true
+     private var resumedAt: TimeInterval?
+ 
+@@ -37,13 +42,19 @@ final class QuietModeActivityController {
+         resumeCapture: @escaping () -> Void = {
+             DeviceRegistry.shared.prewakeBluetoothForIdleResume()
+             ScreenCaptureManager.shared.start()
+-        }
++        },
++        beginActivity: @escaping (ProcessInfo.ActivityOptions, String) -> NSObjectProtocol = {
++            ProcessInfo.processInfo.beginActivity(options: $0, reason: $1)
++        },
++        endActivity: @escaping (NSObjectProtocol) -> Void = { ProcessInfo.processInfo.endActivity($0) }
+     ) {
+         self.mode = mode
+         self.now = now
+         self.suspendCapture = suspendCapture
+         self.resumeCapture = resumeCapture
+         self.checkIdleUnplug = checkIdleUnplug
++        self.beginActivity = beginActivity
++        self.endActivity = endActivity
+         let value = environment["IPHONE_USE_IDLE_TIMEOUT"].flatMap(Double.init)
+         timeout = value.flatMap { $0.isFinite && $0 > 0 ? $0 : nil } ?? 60
+     }
+@@ -52,6 +63,10 @@ final class QuietModeActivityController {
+         precondition(Thread.isMainThread)
+         guard timer == nil else { return }
+         lastActivity = now()
++        suspended = false
++        activeRequests = 0
++        shutdownClean = true
++        resumedAt = nil
+         runningLock.withLock { running = true }
+         observer = NotificationCenter.default.addObserver(
+             forName: AppRunModeStore.didChangeNotification, object: AppRunModeStore.shared, queue: .main
+@@ -62,6 +77,7 @@ final class QuietModeActivityController {
+         let timer = Timer(timeInterval: min(timeout, 1), repeats: true) { [weak self] _ in self?.checkIdle() }
+         self.timer = timer
+         RunLoop.main.add(timer, forMode: .common)
++        updateCaptureActivity()
+     }
+ 
+     func stop() {
+@@ -71,9 +87,14 @@ final class QuietModeActivityController {
+         timer = nil
+         if let observer { NotificationCenter.default.removeObserver(observer) }
+         observer = nil
++        activeRequests = 0
++        resumedAt = nil
++        updateCaptureActivity()
+     }
+ 
+     func modeChanged() {
++        precondition(Thread.isMainThread)
++        guard timer != nil else { return }
+         if mode() == .desktop { wake() }
+         lastActivity = now()
+     }
+@@ -119,6 +140,7 @@ final class QuietModeActivityController {
+ 
+     @discardableResult
+     private func wake() -> Bool {
++        guard let currentTimer = timer else { return false }
+         lastActivity = now()
+         guard suspended else { return false }
+         if !shutdownClean {
+@@ -127,11 +149,20 @@ final class QuietModeActivityController {
+         shutdownClean = true
+         suspended = false
+         resumedAt = now()
++        captureTransitions += 1
++        defer {
++            captureTransitions -= 1
++            updateCaptureActivity()
++        }
++        updateCaptureActivity()
++        guard timer === currentTimer, !suspended else { return false }
+         resumeCapture()
+         return true
+     }
+ 
+     func checkIdle() {
++        precondition(Thread.isMainThread)
++        guard let currentTimer = timer else { return }
+         if suspended {
+             checkIdleUnplug()
+             return
+@@ -141,7 +172,15 @@ final class QuietModeActivityController {
+         else { return }
+         suspended = true
+         resumedAt = nil
++        // Keep the activity through synchronous capture/USB cleanup, including
++        // callbacks that stop, restart or wake this controller before it returns.
++        captureTransitions += 1
++        defer {
++            captureTransitions -= 1
++            updateCaptureActivity()
++        }
+         let result = suspendCapture()
++        guard timer === currentTimer, suspended else { return }
+         shutdownClean = result.isClean
+         if !result.isClean {
+             log(
+@@ -150,6 +189,28 @@ final class QuietModeActivityController {
+         }
+     }
+ 
++    private func updateCaptureActivity() {
++        // Capture and lifecycle callbacks can reenter on the main thread. Clear
++        // the stored token before ending it and reconcile again after callbacks.
++        guard !updatingActivity else { return }
++        updatingActivity = true
++        defer { updatingActivity = false }
++        while true {
++            let needed = (timer != nil && !suspended) || captureTransitions > 0
++            if needed, captureActivity == nil {
++                // Declare active capture work without preventing idle system or
++                // display sleep. Quiet idle and stop both relinquish this token.
++                captureActivity = beginActivity(
++                    .userInitiatedAllowingIdleSystemSleep, "iPhone USB capture and input")
++            } else if !needed, let activity = captureActivity {
++                captureActivity = nil
++                endActivity(activity)
++            } else {
++                return
++            }
++        }
++    }
++
+     private func onMain<T>(_ body: () -> T) -> T {
+         if Thread.isMainThread { return body() }
+         return DispatchQueue.main.sync(execute: body)
+diff --git a/Tests/iPhoneUseTests/UI/QuietModeActivityControllerTests.swift b/Tests/iPhoneUseTests/UI/QuietModeActivityControllerTests.swift
+index df32fdc..e23477d 100644
+--- a/Tests/iPhoneUseTests/UI/QuietModeActivityControllerTests.swift
++++ b/Tests/iPhoneUseTests/UI/QuietModeActivityControllerTests.swift
+@@ -38,7 +38,8 @@ final class QuietModeActivityControllerTests: XCTestCase {
+             },
+             checkIdleUnplug: {
+                 if manager.clearIdleUSBDemandIfUnplugged(observeUSBTopology: { topology }) { syncDemand() }
+-            }, resumeCapture: { XCTFail("No request should wake capture") })
++            }, resumeCapture: { XCTFail("No request should wake capture") },
++            beginActivity: { _, _ in NSObject() }, endActivity: { _ in })
+         controller.start()
+         defer { controller.stop() }
+         clock = 59.99
+@@ -87,7 +88,8 @@ final class QuietModeActivityControllerTests: XCTestCase {
+             },
+             checkIdleUnplug: {
+                 if manager.clearIdleUSBDemandIfUnplugged(observeUSBTopology: { topology }) { syncDemand() }
+-            }, resumeCapture: {})
++            }, resumeCapture: {},
++            beginActivity: { _, _ in NSObject() }, endActivity: { _ in })
+         controller.start()
+         defer { controller.stop() }
+ 
+@@ -164,7 +166,8 @@ final class QuietModeActivityControllerTests: XCTestCase {
+             suspendCapture: {
+                 suspends += 1
+                 return ScreenCaptureStopResult(initiated: true, captureDrained: true, usbRestored: true)
+-            }, resumeCapture: { resumes += 1 })
++            }, resumeCapture: { resumes += 1 },
++            beginActivity: { _, _ in NSObject() }, endActivity: { _ in })
+         controller.start()
+         defer { controller.stop() }
+         clock = 0.09
+@@ -207,7 +210,8 @@ final class QuietModeActivityControllerTests: XCTestCase {
+             environment: ["IPHONE_USE_IDLE_TIMEOUT": "0.08"], mode: { .residentQuiet }, now: { clock },
+             suspendCapture: {
+                 ScreenCaptureStopResult(initiated: true, captureDrained: false, usbRestored: false)
+-            }, resumeCapture: { resumes += 1 })
++            }, resumeCapture: { resumes += 1 },
++            beginActivity: { _, _ in NSObject() }, endActivity: { _ in })
+         controller.start()
+         defer { controller.stop() }
+         clock = 1
+@@ -230,7 +234,8 @@ final class QuietModeActivityControllerTests: XCTestCase {
+             environment: ["IPHONE_USE_IDLE_TIMEOUT": "0.08"], mode: { .residentQuiet }, now: { clock },
+             suspendCapture: {
+                 ScreenCaptureStopResult(initiated: true, captureDrained: true, usbRestored: true)
+-            }, resumeCapture: {})
++            }, resumeCapture: {},
++            beginActivity: { _, _ in NSObject() }, endActivity: { _ in })
+         controller.start()
+         defer { controller.stop() }
+         XCTAssertFalse(controller.isWithinWakeGraceWindow)
+@@ -257,7 +262,8 @@ final class QuietModeActivityControllerTests: XCTestCase {
+             environment: ["IPHONE_USE_IDLE_TIMEOUT": "0.08"], mode: { .residentQuiet }, now: { clock },
+             suspendCapture: {
+                 ScreenCaptureStopResult(initiated: true, captureDrained: true, usbRestored: true)
+-            }, resumeCapture: {})
++            }, resumeCapture: {},
++            beginActivity: { _, _ in NSObject() }, endActivity: { _ in })
+         controller.start()
+         defer { controller.stop() }
+         clock = 1
+@@ -278,4 +284,326 @@ final class QuietModeActivityControllerTests: XCTestCase {
+         XCTAssertFalse(controller.isWithinWakeGraceWindow)
+     }
+ 
++    private final class ActivityRecorder {
++        var events: [String] = []
++        var options: [ProcessInfo.ActivityOptions] = []
++        var active: Set<ObjectIdentifier> = []
++        var ended = 0
++
++        func begin(_ options: ProcessInfo.ActivityOptions, _ reason: String) -> NSObjectProtocol {
++            XCTAssertFalse(reason.isEmpty)
++            let token = NSObject()
++            self.options.append(options)
++            XCTAssertTrue(active.insert(ObjectIdentifier(token)).inserted)
++            events.append("begin")
++            return token
++        }
++
++        func end(_ token: NSObjectProtocol) {
++            XCTAssertNotNil(active.remove(ObjectIdentifier(token)), "Each token must end exactly once")
++            ended += 1
++            events.append("end")
++        }
++    }
++
++    func testCaptureActivityCoversRequestsGraceAndCleanupWhileAllowingSleep() {
++        var clock = 0.0
++        var suspends = 0
++        let activity = ActivityRecorder()
++        let controller = QuietModeActivityController(
++            environment: ["IPHONE_USE_IDLE_TIMEOUT": "2"], mode: { .residentQuiet }, now: { clock },
++            suspendCapture: {
++                XCTAssertEqual(activity.active.count, 1, "Cleanup must remain inside the activity")
++                activity.events.append("suspend")
++                suspends += 1
++                return ScreenCaptureStopResult(initiated: true, captureDrained: true, usbRestored: true)
++            }, resumeCapture: { XCTFail("Initial capture is already active") },
++            beginActivity: activity.begin, endActivity: activity.end)
++        controller.start()
++        controller.start()
++        defer { controller.stop() }
++        XCTAssertEqual(activity.options, [.userInitiatedAllowingIdleSystemSleep])
++        XCTAssertFalse(activity.options[0].contains(.idleSystemSleepDisabled))
++        XCTAssertFalse(activity.options[0].contains(.idleDisplaySleepDisabled))
++        XCTAssertFalse(controller.requestStarted())
++        XCTAssertFalse(controller.requestStarted())
++        clock = 100
++        controller.checkIdle()
++        controller.requestFinished()
++        controller.checkIdle()
++        XCTAssertEqual(suspends, 0, "One unfinished request must still prevent idle")
++        controller.requestFinished()
++        clock = 101.99
++        controller.checkIdle()
++        XCTAssertEqual(activity.active.count, 1, "The existing idle grace retains the activity")
++        clock = 102
++        controller.checkIdle()
++        XCTAssertTrue(controller.isSuspended)
++        XCTAssertEqual(activity.events, ["begin", "suspend", "end"])
++        controller.checkIdle()
++        controller.stop()
++        controller.stop()
++        XCTAssertEqual(activity.ended, 1)
++        XCTAssertTrue(activity.active.isEmpty)
++    }
++
++    func testWindowAndDesktopWakeAcquireBeforeCaptureAndStoppedCallbacksStayInactive() {
++        var clock = 0.0
++        var mode = AppRunMode.residentQuiet
++        var resumes = 0
++        let activity = ActivityRecorder()
++        let controller = QuietModeActivityController(
++            environment: ["IPHONE_USE_IDLE_TIMEOUT": "1"], mode: { mode }, now: { clock },
++            suspendCapture: {
++                ScreenCaptureStopResult(initiated: true, captureDrained: true, usbRestored: true)
++            },
++            resumeCapture: {
++                XCTAssertEqual(activity.active.count, 1)
++                resumes += 1
++            }, beginActivity: activity.begin, endActivity: activity.end)
++        controller.start()
++        defer { controller.stop() }
++        clock = 1
++        controller.checkIdle()
++        controller.setOpenWindows(true)
++        XCTAssertEqual(resumes, 1)
++        clock = 10
++        controller.checkIdle()
++        XCTAssertEqual(activity.active.count, 1)
++        controller.setOpenWindows(false)
++        controller.checkIdle()
++        XCTAssertTrue(activity.active.isEmpty)
++        mode = .desktop
++        controller.modeChanged()
++        XCTAssertEqual(resumes, 2)
++        clock = 100
++        controller.checkIdle()
++        XCTAssertEqual(activity.active.count, 1, "Desktop mode must keep its existing capture policy")
++        controller.stop()
++        controller.setOpenWindows(true)
++        controller.modeChanged()
++        controller.checkIdle()
++        XCTAssertFalse(controller.requestStarted())
++        controller.requestFinished()
++        XCTAssertEqual(resumes, 2)
++        XCTAssertEqual(activity.options.count, 3)
++        XCTAssertEqual(activity.ended, 3)
++    }
++
++    func testIncompleteIdleCleanupEndsActivityAndNextRequestAcquiresAgain() {
++        var clock = 0.0
++        let activity = ActivityRecorder()
++        let controller = QuietModeActivityController(
++            environment: ["IPHONE_USE_IDLE_TIMEOUT": "1"], mode: { .residentQuiet }, now: { clock },
++            suspendCapture: {
++                XCTAssertEqual(activity.active.count, 1)
++                return ScreenCaptureStopResult(initiated: true, captureDrained: false, usbRestored: false)
++            }, resumeCapture: { XCTAssertEqual(activity.active.count, 1) },
++            beginActivity: activity.begin, endActivity: activity.end)
++        controller.start()
++        defer { controller.stop() }
++        clock = 1
++        controller.checkIdle()
++        XCTAssertTrue(controller.isSuspended)
++        XCTAssertTrue(activity.active.isEmpty, "An incomplete stop must not retain a permanent activity")
++        XCTAssertTrue(controller.requestStarted())
++        controller.requestFinished()
++        XCTAssertEqual(activity.options.count, 2)
++        clock = 2
++        controller.checkIdle()
++        XCTAssertEqual(activity.ended, 2)
++    }
++
++    func testStopAndRestartResetIdleRequestAndWakeState() {
++        var clock = 0.0
++        let activity = ActivityRecorder()
++        let controller = QuietModeActivityController(
++            environment: ["IPHONE_USE_IDLE_TIMEOUT": "1"], mode: { .residentQuiet }, now: { clock },
++            suspendCapture: {
++                ScreenCaptureStopResult(initiated: true, captureDrained: true, usbRestored: true)
++            }, resumeCapture: {}, beginActivity: activity.begin, endActivity: activity.end)
++        controller.start()
++        defer { controller.stop() }
++        clock = 1
++        controller.checkIdle()
++        XCTAssertTrue(controller.requestStarted())
++        XCTAssertTrue(controller.isWithinWakeGraceWindow)
++        controller.stop()
++        controller.start()
++        XCTAssertFalse(controller.isSuspended)
++        XCTAssertFalse(controller.isWithinWakeGraceWindow)
++        clock = 2
++        controller.checkIdle()
++        XCTAssertTrue(controller.isSuspended, "The previous lifecycle's request count must not prevent idle")
++        controller.stop()
++        controller.start()
++        XCTAssertFalse(controller.isSuspended, "A fresh lifecycle starts with capture active")
++        XCTAssertEqual(activity.active.count, 1)
++        controller.stop()
++        XCTAssertEqual(activity.options.count, activity.ended)
++    }
++
++    func testWakeDuringIdleCleanupKeepsActivityThroughReturningOldCallback() {
++        var clock = 0.0
++        var suspends = 0
++        let activity = ActivityRecorder()
++        var controller: QuietModeActivityController!
++        defer {
++            controller?.stop()
++            controller = nil
++        }
++        controller = QuietModeActivityController(
++            environment: ["IPHONE_USE_IDLE_TIMEOUT": "1"], mode: { .residentQuiet }, now: { clock },
++            suspendCapture: {
++                suspends += 1
++                if suspends == 1 {
++                    XCTAssertTrue(controller.requestStarted())
++                    XCTAssertEqual(activity.active.count, 1)
++                }
++                return ScreenCaptureStopResult(initiated: true, captureDrained: true, usbRestored: true)
++            }, resumeCapture: { XCTAssertEqual(activity.active.count, 1) },
++            beginActivity: activity.begin, endActivity: activity.end)
++        controller.start()
++        clock = 1
++        controller.checkIdle()
++        XCTAssertFalse(controller.isSuspended)
++        XCTAssertEqual(activity.options.count, 1, "Reentrant wake must reuse the still-active token")
++        XCTAssertEqual(activity.ended, 0)
++        clock = 2
++        controller.checkIdle()
++        XCTAssertEqual(suspends, 1)
++        controller.requestFinished()
++        clock = 3
++        controller.checkIdle()
++        XCTAssertEqual(activity.ended, 1)
++    }
++
++    func testStopDuringIdleCleanupReleasesOnlyAfterCleanupReturns() {
++        var clock = 0.0
++        let activity = ActivityRecorder()
++        var controller: QuietModeActivityController!
++        defer {
++            controller?.stop()
++            controller = nil
++        }
++        controller = QuietModeActivityController(
++            environment: ["IPHONE_USE_IDLE_TIMEOUT": "1"], mode: { .residentQuiet }, now: { clock },
++            suspendCapture: {
++                controller.stop()
++                XCTAssertEqual(activity.active.count, 1)
++                XCTAssertEqual(activity.ended, 0)
++                return ScreenCaptureStopResult(initiated: true, captureDrained: true, usbRestored: true)
++            }, resumeCapture: {}, beginActivity: activity.begin, endActivity: activity.end)
++        controller.start()
++        clock = 1
++        controller.checkIdle()
++        XCTAssertTrue(activity.active.isEmpty)
++        XCTAssertEqual(activity.ended, 1)
++        controller.checkIdle()
++        controller.stop()
++        XCTAssertEqual(activity.ended, 1)
++    }
++
++    func testRestartDuringIdleCleanupDoesNotReleaseNewActiveLifecycle() {
++        var clock = 0.0
++        var suspends = 0
++        let activity = ActivityRecorder()
++        var controller: QuietModeActivityController!
++        defer {
++            controller?.stop()
++            controller = nil
++        }
++        controller = QuietModeActivityController(
++            environment: ["IPHONE_USE_IDLE_TIMEOUT": "1"], mode: { .residentQuiet }, now: { clock },
++            suspendCapture: {
++                suspends += 1
++                if suspends == 1 {
++                    controller.stop()
++                    controller.start()
++                    XCTAssertEqual(activity.active.count, 1)
++                }
++                return ScreenCaptureStopResult(initiated: true, captureDrained: false, usbRestored: false)
++            }, resumeCapture: {}, beginActivity: activity.begin, endActivity: activity.end)
++        controller.start()
++        clock = 1
++        controller.checkIdle()
++        XCTAssertFalse(controller.isSuspended)
++        XCTAssertEqual(activity.options.count, 1)
++        XCTAssertEqual(activity.ended, 0)
++        clock = 2
++        controller.checkIdle()
++        XCTAssertTrue(controller.isSuspended)
++        XCTAssertEqual(activity.ended, 1)
++    }
++
++    func testStopDuringResumeKeepsActivityUntilResumeReturns() {
++        var clock = 0.0
++        let activity = ActivityRecorder()
++        var controller: QuietModeActivityController!
++        defer {
++            controller?.stop()
++            controller = nil
++        }
++        controller = QuietModeActivityController(
++            environment: ["IPHONE_USE_IDLE_TIMEOUT": "1"], mode: { .residentQuiet }, now: { clock },
++            suspendCapture: {
++                ScreenCaptureStopResult(initiated: true, captureDrained: true, usbRestored: true)
++            },
++            resumeCapture: {
++                XCTAssertEqual(activity.active.count, 1)
++                controller.stop()
++                XCTAssertEqual(activity.active.count, 1)
++            }, beginActivity: activity.begin, endActivity: activity.end)
++        controller.start()
++        clock = 1
++        controller.checkIdle()
++        XCTAssertTrue(controller.requestStarted())
++        controller.requestFinished()
++        XCTAssertTrue(activity.active.isEmpty)
++        XCTAssertEqual(activity.options.count, 2)
++        XCTAssertEqual(activity.ended, 2)
++    }
++
++    func testActivityCallbacksCanStopAndRestartWithoutLeakingOrDoubleEnding() {
++        let activity = ActivityRecorder()
++        var stopFromBegin = true
++        var restartFromEnd = false
++        var controller: QuietModeActivityController!
++        defer {
++            controller?.stop()
++            controller = nil
++        }
++        controller = QuietModeActivityController(
++            environment: [:], mode: { .residentQuiet },
++            suspendCapture: {
++                XCTFail("No idle transition expected")
++                return ScreenCaptureStopResult(initiated: true, captureDrained: true, usbRestored: true)
++            }, resumeCapture: {},
++            beginActivity: { options, reason in
++                let token = activity.begin(options, reason)
++                if stopFromBegin {
++                    stopFromBegin = false
++                    controller.stop()
++                }
++                return token
++            },
++            endActivity: { token in
++                activity.end(token)
++                if restartFromEnd {
++                    restartFromEnd = false
++                    controller.start()
++                }
++            })
++        controller.start()
++        XCTAssertTrue(activity.active.isEmpty)
++        XCTAssertEqual(activity.ended, 1)
++        controller.start()
++        restartFromEnd = true
++        controller.stop()
++        XCTAssertEqual(activity.active.count, 1)
++        XCTAssertEqual(activity.options.count, 3)
++        controller.stop()
++        XCTAssertEqual(activity.ended, 3)
++    }
++
+ }

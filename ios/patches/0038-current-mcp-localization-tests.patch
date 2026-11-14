@@ -1,0 +1,214 @@
+diff --git a/Tests/iPhoneUseTests/Localization/LocalizationTests.swift b/Tests/iPhoneUseTests/Localization/LocalizationTests.swift
+index 53956cc..1437755 100644
+--- a/Tests/iPhoneUseTests/Localization/LocalizationTests.swift
++++ b/Tests/iPhoneUseTests/Localization/LocalizationTests.swift
+@@ -3,6 +3,17 @@ import XCTest
+ 
+ @testable import iPhoneUse
+ 
++private func localizedActStepSchema(_ type: String, language: AppLanguage) throws -> [String: Any] {
++    let act = try XCTUnwrap(MCPToolCatalog.tools(for: language).first { $0["name"] as? String == "act" })
++    let schema = try XCTUnwrap(act["inputSchema"] as? [String: Any])
++    let properties = try XCTUnwrap(schema["properties"] as? [String: [String: Any]])
++    let items = try XCTUnwrap(properties["steps"]?["items"] as? [String: Any])
++    let choices = try XCTUnwrap(items["oneOf"] as? [[String: Any]])
++    return try XCTUnwrap(choices.first {
++        (($0["properties"] as? [String: [String: Any]])?["type"]?["enum"] as? [String]) == [type]
++    })
++}
++
+ final class LocalizationTests: XCTestCase {
+     private var previousLanguage: AppLanguage = .en
+ 
+@@ -142,13 +153,21 @@ final class LocalizationTests: XCTestCase {
+         let enTools = MCPToolCatalog.tools(for: .en)
+         let zhTools = MCPToolCatalog.tools(for: .zh)
+         let required: Set<String> = [
+-            "session_context", "accessibility_tree",
+-            "list_devices", "screenshot", "screenshot_burst", "ocr_screen", "touch_sequence", "tap_text",
+-            "tap", "long_press", "swipe", "type_text", "press_key", "keyboard_sequence", "home", "act",
++            "session_context", "accessibility_tree", "list_devices", "screenshot",
++            "screenshot_burst", "ocr_screen", "act",
+         ]
+         func names(_ tools: [[String: Any]]) -> Set<String> {
+             Set(tools.compactMap { $0["name"] as? String })
+         }
++        func withoutDescriptions(_ value: Any) -> Any {
++            if let object = value as? [String: Any] {
++                return object.filter { $0.key != "description" }.mapValues { withoutDescriptions($0) }
++            }
++            if let array = value as? [Any] { return array.map { withoutDescriptions($0) } }
++            return value
++        }
++        XCTAssertEqual(enTools.count, 7)
++        XCTAssertEqual(zhTools.count, 7)
+         XCTAssertEqual(names(enTools), required)
+         XCTAssertEqual(names(zhTools), required)
+ 
+@@ -157,81 +176,116 @@ final class LocalizationTests: XCTestCase {
+             XCTAssertNotEqual(enTool["description"] as? String, zhTool["description"] as? String)
+             let enSchema = try XCTUnwrap(enTool["inputSchema"] as? [String: Any])
+             let zhSchema = try XCTUnwrap(zhTool["inputSchema"] as? [String: Any])
+-            let enProperties = try XCTUnwrap(enSchema["properties"] as? [String: Any])
+-            let zhProperties = try XCTUnwrap(zhSchema["properties"] as? [String: Any])
+-            XCTAssertEqual(Set(enProperties.keys), Set(zhProperties.keys))
+-            XCTAssertEqual(enSchema["required"] as? [String], zhSchema["required"] as? [String])
++            // Compare nested constraints too; only human-facing descriptions localize.
++            XCTAssertEqual(
++                try JSONSerialization.data(withJSONObject: withoutDescriptions(enSchema), options: [.sortedKeys]),
++                try JSONSerialization.data(withJSONObject: withoutDescriptions(zhSchema), options: [.sortedKeys]))
+         }
+ 
+-        // Numeric constraints are part of the contract and never localize.
+-        let touch = try XCTUnwrap(zhTools.first { $0["name"] as? String == "touch_sequence" })
+-        let samples = try XCTUnwrap(
+-            ((touch["inputSchema"] as? [String: Any])?["properties"] as? [String: Any])?["samples"]
+-                as? [String: Any])
+-        XCTAssertEqual(samples["minItems"] as? Int, 2)
+-        XCTAssertEqual(samples["maxItems"] as? Int, 256)
++        for language: AppLanguage in [.en, .zh] {
++            for type in ["tap", "swipe", "touch"] {
++                let step = try localizedActStepSchema(type, language: language)
++                let properties = try XCTUnwrap(step["properties"] as? [String: [String: Any]])
++                XCTAssertEqual(step["additionalProperties"] as? Bool, false)
++                XCTAssertTrue(try XCTUnwrap(step["required"] as? [String]).contains("frame_id"))
++                XCTAssertEqual(properties["frame_id"]?["type"] as? String, "string")
++                XCTAssertNil(properties["normalized"])
++                XCTAssertNil(properties["fraction"])
++            }
++            let touch = try localizedActStepSchema("touch", language: language)
++            let properties = try XCTUnwrap(touch["properties"] as? [String: [String: Any]])
++            let samples = try XCTUnwrap(properties["samples"])
++            XCTAssertEqual(samples["minItems"] as? Int, 2)
++            XCTAssertEqual(samples["maxItems"] as? Int, 256)
++        }
+     }
+ 
+     func testMCPServerServesToolsInTheConfiguredLanguage() throws {
+         let previous = MCPServer.language
+         defer { MCPServer.language = previous }
+ 
+-        func homeDescription(for language: AppLanguage) throws -> String {
++        func actDescription(for language: AppLanguage) throws -> String {
+             MCPServer.language = language
+             let reply = try XCTUnwrap(
+                 MCPServer.response(to: ["id": 1, "method": "tools/list"]) { _, _ in [:] })
+             let tools = try XCTUnwrap((reply["result"] as? [String: Any])?["tools"] as? [[String: Any]])
+-            let home = try XCTUnwrap(tools.first { $0["name"] as? String == "home" })
+-            return try XCTUnwrap(home["description"] as? String)
++            let act = try XCTUnwrap(tools.first { $0["name"] as? String == "act" })
++            XCTAssertFalse(tools.contains { $0["name"] as? String == "home" })
++            return try XCTUnwrap(act["description"] as? String)
+         }
+ 
+-        XCTAssertEqual(try homeDescription(for: .zh), "回到主屏幕。")
+-        XCTAssertEqual(try homeDescription(for: .en), "Go to the Home Screen.")
++        let zh = try actDescription(for: .zh)
++        let en = try actDescription(for: .en)
++        XCTAssertTrue(zh.contains("每批最多一个触控步骤且必须第一步"))
++        XCTAssertTrue(en.contains("At most one touch step, first in the batch"))
++        for description in [zh, en] {
++            XCTAssertTrue(description.contains("frame_id"))
++            XCTAssertTrue(description.contains("USB"))
++            XCTAssertTrue(description.contains("Cmd+H"))
++        }
++        XCTAssertNotEqual(zh, en)
+     }
+ 
+-    func testMCPValidationErrorsLocalize() {
+-        XCTAssertThrowsError(
+-            try MCPToolRequest.action(
+-                named: "tap", arguments: ["x": -1, "y": 2, "normalized": true], longEdge: 1200, language: .zh)
+-        ) { error in
+-            XCTAssertEqual(String(describing: error), StringsMCP(language: .zh).normalizedRange("x"))
+-        }
+-        XCTAssertThrowsError(
+-            try MCPKeyboardSequence.actions(arguments: ["steps": []], language: .zh)
+-        ) { error in
+-            XCTAssertEqual(
+-                String(describing: error), StringsMCP(language: .zh).keyboardSequenceRange)
+-        }
+-        XCTAssertThrowsError(
+-            try MCPToolRequest.action(named: "tap_text", arguments: ["text": ""], longEdge: 1200, language: .zh)
+-        ) { error in
+-            XCTAssertEqual(String(describing: error), StringsAPI.zh.ocrParameterInvalid("text"))
++    func testMCPValidationPreservesLocalizedOCRAndSharedFrameDiagnostics() {
++        let frame = "00000000-0000-4000-8000-000000000001"
++        let tap: [String: Any] = ["type": "tap", "frame_id": frame, "x": 1, "y": 2]
++        let invalid: [([[String: Any]], String)] = [
++            ([["type": "tap", "x": 1, "y": 2]],
++             "Invalid act parameters; touch requires frame_id and screenshot pixels"),
++            ([tap.merging(["normalized": true]) { _, value in value }],
++             "frame_id is valid only for a first touch step using screenshot pixels"),
++            ([["type": "home"], tap],
++             "At most one touch step is allowed, and it must be the first step"),
++        ]
++        for language: AppLanguage in [.en, .zh] {
++            XCTAssertThrowsError(
++                try MCPToolRequest.action(named: "ocr_screen", arguments: ["maxEdge": 0],
++                                          longEdge: 1000, language: language)
++            ) { error in
++                XCTAssertEqual(String(describing: error), StringsAPI(language: language).ocrParameterInvalid("maxEdge"))
++            }
++            // Shared input validation is deliberately language-independent.
++            for (steps, diagnostic) in invalid {
++                XCTAssertThrowsError(
++                    try MCPToolRequest.action(named: "act", arguments: ["steps": steps],
++                                              longEdge: 1000, language: language)
++                ) { error in
++                    XCTAssertTrue(error is InputRequestError)
++                    XCTAssertEqual(String(describing: error), diagnostic)
++                }
++            }
+         }
+         XCTAssertNotEqual(StringsAPI.en.ocrTextNotFound, StringsAPI.zh.ocrTextNotFound)
+-        // The MCP coordinate context remains localized for default callers.
+-        XCTAssertThrowsError(
+-            try MCPToolRequest.action(named: "tap", arguments: ["x": -1, "y": 2, "normalized": true], longEdge: 1200)
+-        ) { error in
+-            XCTAssertEqual(String(describing: error), StringsMCP(language: .en).normalizedRange("x"))
+-        }
++        XCTAssertNotEqual(StringsAPI.en.ocrParameterInvalid("maxEdge"), StringsAPI.zh.ocrParameterInvalid("maxEdge"))
+     }
+ }
+ 
+ final class KeyboardOptionLocalizationTests: XCTestCase {
+-    func testNewValidationAndDescriptionsCoverBothLanguages() {
++    func testActKeyboardDescriptionsAndValidationCoverBothLanguages() throws {
+         for language: AppLanguage in [.en, .zh] {
+             let table = StringsMCP(language: language)
+-            XCTAssertTrue(table.toolTypeText.contains("clear_before"))
+-            XCTAssertTrue(table.toolTypeText.contains("commit_ime"))
+-            XCTAssertTrue(table.toolTypeText.contains("press_enter"))
+-            XCTAssertTrue(table.toolKeyboardSequence.contains("steps/actions"))
+-            XCTAssertTrue(table.deviceParam.contains("device_id"))
+-            XCTAssertThrowsError(
+-                try MCPKeyboardSequence.actions(arguments: ["actions": [["delay": true]]], language: language)
+-            ) { XCTAssertEqual(String(describing: $0), table.kbDelay(table.kbStepLabel(1))) }
+-            XCTAssertThrowsError(try TypeTextRequest(["text": "a", "commit_ime": 1], language: language)) {
+-                XCTAssertEqual(String(describing: $0), table.booleanRequired("commit_ime"))
++            let typing = try localizedActStepSchema("type", language: language)
++            let properties = try XCTUnwrap(typing["properties"] as? [String: [String: Any]])
++            XCTAssertEqual(typing["description"] as? String, table.toolTypeText)
++            XCTAssertEqual(typing["required"] as? [String], ["type", "text"])
++            XCTAssertEqual(typing["additionalProperties"] as? Bool, false)
++            XCTAssertEqual(Set(properties.keys), Set(["type", "text"] + TextEntry.textOptions))
++            for option in TextEntry.textOptions {
++                XCTAssertEqual(properties[option]?["type"] as? String, "boolean")
++                XCTAssertThrowsError(
++                    try TypeTextRequest(["text": "a", option: 1], language: language,
++                                        deviceClipboardConfigured: false, directKeyboardConfigured: false)
++                ) { XCTAssertEqual(String(describing: $0), table.booleanRequired(option)) }
++            }
++            for option in ["clear_before", "commit_ime", "press_enter"] {
++                XCTAssertTrue(table.toolTypeText.contains(option))
+             }
++            let key = try localizedActStepSchema("key", language: language)
++            XCTAssertEqual(key["description"] as? String, table.toolPressKey)
++            XCTAssertEqual(key["required"] as? [String], ["type", "key"])
++            XCTAssertTrue(table.deviceParam.contains("device_id"))
+         }
++        XCTAssertNotEqual(StringsMCP.en.toolTypeText, StringsMCP.zh.toolTypeText)
++        XCTAssertNotEqual(StringsMCP.en.toolPressKey, StringsMCP.zh.toolPressKey)
+     }
+ }

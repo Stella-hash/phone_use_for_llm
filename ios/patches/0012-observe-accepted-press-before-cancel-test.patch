@@ -1,0 +1,31 @@
+diff --git a/Tests/iPhoneUseTests/Input/DeviceInputPointerTests.swift b/Tests/iPhoneUseTests/Input/DeviceInputPointerTests.swift
+index 3b00a8c..225a78e 100644
+--- a/Tests/iPhoneUseTests/Input/DeviceInputPointerTests.swift
++++ b/Tests/iPhoneUseTests/Input/DeviceInputPointerTests.swift
+@@ -71,11 +71,17 @@ final class DeviceInputPointerTests: XCTestCase {
+             })
+ 
+         input.press(x: 0.5, y: 0.5)
++        // This case starts with an accepted touch. Cancelling an unsent press
++        // is a separate contract and may correctly suppress every report.
++        try input.type("")
++        XCTAssertEqual(reports.last?.1, [1, 0, 0, 0])
++        XCTAssertFalse(allowed, "the accepted press must invalidate capture before cancellation")
+         input.cancelPointer()
+         try input.nudge(dx: 0, dy: 0, click: false)
+ 
+         removeInitialAbsolutePrime(&reports)
+         XCTAssertEqual(reports.map { $0.0 }, [.absolutePointer, .relativeMouse, .relativeMouse])
++        guard reports.count == 3 else { return }
+         XCTAssertEqual(reports[1].1, [1, 0, 0, 0])
+         XCTAssertEqual(reports[2].1, [0, 0, 0, 0])
+     }
+@@ -757,6 +763,8 @@ final class DeviceInputPointerTests: XCTestCase {
+         var reports: [(ReportID, [UInt8])] = []
+         let input = DeviceInput(host: UUID(), session: UUID(), reportSender: { reports.append(($0, $1)) })
+         input.press(x: 0, y: 0)
++        try input.type("")
++        XCTAssertEqual(reports.last?.1, [1, 0, 0, 0], "focus loss must occur after the touch was accepted")
+         input.cancelPointer()
+         // A stale AppKit mouse-up after cancellation must not reposition the phone.
+         input.release(x: 1, y: 1)

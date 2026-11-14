@@ -1,0 +1,481 @@
+diff --git a/Sources/iPhoneUse/main.swift b/Sources/iPhoneUse/main.swift
+index 669c0a4..7b0c422 100644
+--- a/Sources/iPhoneUse/main.swift
++++ b/Sources/iPhoneUse/main.swift
+@@ -9,6 +9,11 @@ if CommandLine.arguments.dropFirst().first == USBIdentityScreenshot.workerArgume
+             physicalID: CommandLine.arguments[2], output: URL(fileURLWithPath: CommandLine.arguments[3])))
+ }
+ 
++if CommandLine.arguments.dropFirst().first == USBSetupDiscovery.workerArgument {
++    guard CommandLine.arguments.count == 2 else { exit(64) }
++    exit(USBSetupDiscovery.run())
++}
++
+ if CommandLine.arguments.dropFirst().first == "mcp" {
+     MCPServer.run()
+ }
+diff --git a/Sources/iPhoneUse/Capture/USBSetupDiscovery.swift b/Sources/iPhoneUse/Capture/USBSetupDiscovery.swift
+new file mode 100644
+index 0000000..16eb74c
+--- /dev/null
++++ b/Sources/iPhoneUse/Capture/USBSetupDiscovery.swift
+@@ -0,0 +1,255 @@
++import AVFoundation
++import CoreMediaIO
++import Darwin
++import Foundation
++
++/// Setup inventory only. Reuses the host's USB activation/restore owner and never
++/// starts Application, DeviceRegistry, capture sessions, Bluetooth or input.
++enum USBSetupDiscovery {
++    static let workerArgument = "--discover-usb-setup"
++    struct Capture: Equatable {
++        let id: String
++        let name: String
++    }
++    struct Dependencies {
++        var physical: () throws -> [String]
++        var captures: () -> [Capture]
++        var singlePin: () -> USBValeriaConfigurator.PinnedUSBDevice?
++        var pendingRestore: () -> Bool
++        var activate: (String, USBValeriaConfigurator.PinnedUSBDevice) -> USBValeriaConfigurator.ActivationOutcome
++        var restore: () -> Bool
++        var wait: () -> Void
++        var cancelled: () -> Bool
++    }
++
++    /// A sole topology provides a configuration candidate, not screenshot identity
++    /// proof. Never infer a mapping between multiple opaque capture/USB IDs.
++    static func candidate(captures: [Capture], physical: [String]) -> [String: Any]? {
++        guard captures.count == 1, physical.count == 1,
++            let capture = captures.first, let usb = physical.first,
++            USBValeriaConfigurator.isOpaqueCaptureUUID(capture.id)
++                || USBValeriaConfigurator.normalizedSerial(capture.id) == USBValeriaConfigurator.normalizedSerial(usb)
++        else { return nil }
++        return ["captureId": capture.id, "port": 7390, "usbDeviceId": usb]
++    }
++
++    static func collect(_ dependencies: Dependencies) -> [String: Any] {
++        var captures: [Capture] = []
++        var physical: [String] = []
++        var failure: String?
++        var activation = "not_attempted"
++        var cleanup = "not_needed"
++        var changed = false
++        var observedPin: USBValeriaConfigurator.PinnedUSBDevice?
++        // The existing persisted ledger owns recovery after an earlier abnormal
++        // exit. Do not activate again while its restoration is unresolved.
++        if dependencies.pendingRestore() {
++            guard dependencies.restore() else {
++                return report(captures: [], physical: [], failure: "previous_usb_restore_pending",
++                              activation: activation, cleanup: "pending")
++            }
++            cleanup = "settled"
++        }
++        do {
++            physical = try dependencies.physical()
++            captures = dependencies.captures()
++            if dependencies.cancelled() { failure = "cancelled_or_deadline" }
++            if failure == nil, physical.count == 1, let usb = physical.first {
++                guard let pin = dependencies.singlePin(),
++                    USBValeriaConfigurator.normalizedSerial(pin.serial) == USBValeriaConfigurator.normalizedSerial(usb)
++                else {
++                    return report(captures: captures, physical: physical, failure: "usb_topology_unconfirmed",
++                                  activation: activation, cleanup: cleanup)
++                }
++                observedPin = pin
++            }
++            if failure == nil, captures.isEmpty, let usb = physical.first, let pin = observedPin {
++                switch dependencies.activate(usb, pin) {
++                case .switched:
++                    activation = "temporarily_activated"
++                    changed = true
++                case .unconfirmedSwitch:
++                    activation = "activation_unconfirmed"
++                    changed = true
++                case .blockedByActiveUSBNetwork:
++                    activation = "blocked_by_usb_network"
++                case .blockedByUSBResourceShortage:
++                    activation = "blocked_by_usb_resource"
++                case .notActivated:
++                    activation = "not_activated"
++                }
++                // Wait for CoreMediaIO publication, without opening any capture
++                // session. A finite sample budget is secondary to the worker deadline.
++                for _ in 0..<20 where !dependencies.cancelled() {
++                    if !captures.isEmpty { break }
++                    dependencies.wait()
++                    captures = dependencies.captures()
++                }
++            }
++            let after = try dependencies.physical()
++            if after != physical || (observedPin != nil && dependencies.singlePin() != observedPin) {
++                failure = "usb_topology_changed"
++            }
++            if dependencies.cancelled() { failure = "cancelled_or_deadline" }
++        } catch {
++            failure = "physical_usb_inventory_unavailable"
++        }
++        if changed {
++            // The aggregate restore API treats detached/superseded entries as
++            // terminal too. "settled" never claims the original config was restored.
++            cleanup = dependencies.restore() ? "settled" : "pending"
++            if cleanup == "pending" {
++                failure = "usb_restore_pending"
++            } else {
++                // Cleanup itself can coincide with unplug/replug or an external
++                // topology change. Do not return the pre-cleanup candidate then.
++                do {
++                    let finalPhysical = try dependencies.physical()
++                    let finalPin = dependencies.singlePin()
++                    if finalPhysical != physical || finalPin != observedPin {
++                        failure = failure ?? "usb_topology_changed_during_cleanup"
++                    }
++                } catch {
++                    failure = failure ?? "physical_usb_inventory_unavailable_after_cleanup"
++                }
++            }
++        }
++        if dependencies.cancelled() {
++            failure = cleanup == "pending" ? "usb_restore_pending" : "cancelled_or_deadline"
++        }
++        return report(captures: captures, physical: physical, failure: failure,
++                      activation: activation, cleanup: cleanup)
++    }
++
++    static func report(captures: [Capture], physical: [String], failure: String?,
++                       activation: String, cleanup: String) -> [String: Any] {
++        let possible = failure == nil ? candidate(captures: captures, physical: physical) : nil
++        let status = failure ?? (possible != nil ? "configuration_candidate" :
++            (physical.count > 1 || captures.count > 1) ? "ambiguous_devices" :
++            physical.isEmpty ? "no_usb_device" : captures.isEmpty ? "capture_unavailable" : "identity_mismatch")
++        var result: [String: Any] = [
++            "schema_version": 1, "status": status, "selected_device": NSNull(),
++            "capture_devices": captures.map { ["captureId": $0.id, "name": $0.name] },
++            "usb_devices": physical.map { ["usbDeviceId": $0] },
++            "usb_configuration": activation, "cleanup": cleanup,
++            "cleanup_scope": "settled means no tracked restore remains; restored, detached or superseded are all terminal",
++            "capture_inventory_phase": activation == "temporarily_activated" || activation == "activation_unconfirmed"
++                ? "before_usb_cleanup" : "inventory",
++            "phone_input_sent": false, "capture_session_started": false,
++            "bluetooth_started": false, "pairing_attempted": false,
++            "config_written": false,
++        ]
++        if let possible {
++            result["config_candidate"] = possible
++            result["identity_basis"] = "single_attached_USB_and_capture_inventory; not image verification"
++        }
++        return result
++    }
++
++    static func run() -> Int32 {
++        let cancellation = DiscoveryCancellation(deadline: ProcessInfo.processInfo.systemUptime + 10)
++        let signals = cancellation.installSignals()
++        return withExtendedLifetime(signals) {
++            // This property is process-local exposure, not capture startup.
++            var address = CMIOObjectPropertyAddress(
++                mSelector: CMIOObjectPropertySelector(kCMIOHardwarePropertyAllowScreenCaptureDevices),
++                mScope: CMIOObjectPropertyScope(kCMIOObjectPropertyScopeGlobal),
++                mElement: CMIOObjectPropertyElement(kCMIOObjectPropertyElementMain))
++            var allow: UInt32 = 1
++            let exposure = CMIOObjectSetPropertyData(
++                CMIOObjectID(kCMIOObjectSystemObject), &address, 0, nil,
++                UInt32(MemoryLayout<UInt32>.size), &allow)
++            var result = collect(Dependencies(
++                physical: { try USBSetupPhysicalDevices.identifiers() },
++                captures: {
++                    guard exposure == noErr else { return [] }
++                    return AVCaptureDevice.DiscoverySession(
++                        deviceTypes: [.external], mediaType: .muxed, position: .unspecified
++                    ).devices.filter { $0.modelID.contains("iOS") && $0.isConnected }
++                        .map { Capture(id: $0.uniqueID, name: $0.localizedName) }.sorted { $0.id < $1.id }
++                },
++                singlePin: USBValeriaConfigurator.currentSingleIOSDeviceIdentity,
++                pendingRestore: { USBValeriaConfigurator.requiresStartupReconciliation },
++                activate: { usb, pin in
++                    guard exposure == noErr else { return .notActivated }
++                    return USBValeriaConfigurator.activateDormantValeriaConfiguration(
++                        preferredSerial: usb, allowSingleIOSFallback: false, pinnedSingleDevice: pin,
++                        shouldProceed: { !cancellation.isCancelled })
++                },
++                restore: {
++                    USBValeriaConfigurator.restorePreviousConfigurations(
++                        deadlineUptime: ProcessInfo.processInfo.systemUptime + 3)
++                },
++                wait: { RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.25)) },
++                cancelled: { cancellation.isCancelled }))
++            result["capture_discovery_exposure_status"] = exposure
++            result["camera_authorization"] = cameraAuthorization()
++            result["scope"] = "Local setup inventory; no trust, capture readiness or input-effect verification."
++            guard let data = try? JSONSerialization.data(withJSONObject: result, options: [.sortedKeys]) else { return 70 }
++            FileHandle.standardOutput.write(data + Data([0x0a]))
++            return result["status"] as? String == "configuration_candidate" ? 0 : 2
++        }
++    }
++
++    private static func cameraAuthorization() -> String {
++        switch AVCaptureDevice.authorizationStatus(for: .video) {
++        case .authorized: return "authorized"
++        case .denied: return "denied"
++        case .restricted: return "restricted"
++        case .notDetermined: return "not_determined"
++        @unknown default: return "unknown"
++        }
++    }
++}
++
++private final class DiscoveryCancellation {
++    private let lock = NSLock()
++    private var requested = false
++    private let deadline: TimeInterval
++    init(deadline: TimeInterval) { self.deadline = deadline }
++    var isCancelled: Bool {
++        lock.withLock { requested } || ProcessInfo.processInfo.systemUptime >= deadline
++    }
++    func installSignals() -> [DispatchSourceSignal] {
++        [SIGINT, SIGTERM, SIGHUP].map { sig in
++            signal(sig, SIG_IGN)
++            let source = DispatchSource.makeSignalSource(signal: sig, queue: .global())
++            source.setEventHandler { self.lock.withLock { self.requested = true } }
++            source.resume()
++            return source
++        }
++    }
++}
++
++/// Uses the same USB-only MobileDevice identity ABI as USBIdentityScreenshot,
++/// loading only enumeration symbols. No connect, session, service or pairing call.
++private enum USBSetupPhysicalDevices {
++    enum Failure: Error { case unavailable }
++    private typealias CreateDevices = @convention(c) () -> Unmanaged<CFArray>?
++    private typealias CopyIdentifier = @convention(c) (UnsafeRawPointer) -> Unmanaged<CFString>?
++    private typealias InterfaceType = @convention(c) (UnsafeRawPointer) -> Int32
++
++    static func identifiers() throws -> [String] {
++        guard let library = dlopen("/System/Library/PrivateFrameworks/MobileDevice.framework/MobileDevice", RTLD_NOW | RTLD_LOCAL)
++        else { throw Failure.unavailable }
++        defer { dlclose(library) }
++        guard let create = dlsym(library, "AMDCreateDeviceList"),
++            let copy = dlsym(library, "AMDeviceCopyDeviceIdentifier"),
++            let interface = dlsym(library, "AMDeviceGetInterfaceType")
++        else { throw Failure.unavailable }
++        let createDevices = unsafeBitCast(create, to: CreateDevices.self)
++        let copyIdentifier = unsafeBitCast(copy, to: CopyIdentifier.self)
++        let interfaceType = unsafeBitCast(interface, to: InterfaceType.self)
++        guard let devices = createDevices()?.takeRetainedValue() else { throw Failure.unavailable }
++        return try withExtendedLifetime(devices) {
++            var ids = Set<String>()
++            for index in 0..<CFArrayGetCount(devices) {
++                guard let device = CFArrayGetValueAtIndex(devices, index) else { throw Failure.unavailable }
++                guard interfaceType(device) == 1 else { continue }
++                guard let id = copyIdentifier(device)?.takeRetainedValue(), !(id as String).isEmpty else { throw Failure.unavailable }
++                ids.insert(id as String)
++            }
++            return ids.sorted()
++        }
++    }
++}
+diff --git a/Tests/iPhoneUseTests/Capture/USBSetupDiscoveryTests.swift b/Tests/iPhoneUseTests/Capture/USBSetupDiscoveryTests.swift
+new file mode 100644
+index 0000000..a26c35b
+--- /dev/null
++++ b/Tests/iPhoneUseTests/Capture/USBSetupDiscoveryTests.swift
+@@ -0,0 +1,198 @@
++import Foundation
++import Testing
++@testable import iPhoneUse
++
++@Suite struct USBSetupDiscoveryTests {
++    private let usb = "00000000-1111111111111111"
++    private let capture = USBSetupDiscovery.Capture(id: "00000000-0000-4000-8000-000000000001", name: "Fixture phone")
++
++    private final class Fixture {
++        var physical = ["00000000-1111111111111111"]
++        var captureSamples: [[USBSetupDiscovery.Capture]] = []
++        var pin: USBValeriaConfigurator.PinnedUSBDevice? = .init(registryEntryID: 1, serial: "000000001111111111111111")
++        var pending = false
++        var restoreOK = true
++        var currentConfiguration = 6
++        var terminalConfiguration = 6
++        var duringRestore: ((Fixture) -> Void)?
++        var cancelled = false
++        var topologyChanges = false
++        var throwAfterActivation = false
++        var outcome: USBValeriaConfigurator.ActivationOutcome = .switched(.init(registryEntryID: 1, previousConfiguration: 6, requestedConfiguration: 5))
++        var events: [String] = []
++        var reads = 0
++        enum Failure: Error { case unavailable }
++        func dependencies() -> USBSetupDiscovery.Dependencies {
++            .init(physical: {
++                self.events.append("physical")
++                self.reads += 1
++                if self.throwAfterActivation && self.reads > 1 { throw Failure.unavailable }
++                return self.topologyChanges && self.reads > 1 ? [] : self.physical
++            }, captures: {
++                self.events.append("captures")
++                if self.captureSamples.count > 1 { return self.captureSamples.removeFirst() }
++                return self.captureSamples.first ?? []
++            }, singlePin: {
++                self.events.append("pin")
++                return self.pin
++            }, pendingRestore: { self.pending }, activate: { _, _ in
++                self.events.append("activate")
++                self.currentConfiguration = 5
++                return self.outcome
++            }, restore: {
++                self.events.append("restore")
++                self.currentConfiguration = self.terminalConfiguration
++                self.duringRestore?(self)
++                return self.restoreOK
++            }, wait: { self.events.append("wait") }, cancelled: { self.cancelled })
++        }
++    }
++
++    @Test func exposedSoleDeviceProducesCandidateWithoutUSBMutation() {
++        let fixture = Fixture()
++        fixture.captureSamples = [[capture]]
++        let result = USBSetupDiscovery.collect(fixture.dependencies())
++        #expect(result["status"] as? String == "configuration_candidate")
++        #expect((result["config_candidate"] as? [String: Any])?["usbDeviceId"] as? String == usb)
++        #expect(result["config_written"] as? Bool == false)
++        #expect(!fixture.events.contains("activate"))
++        #expect(!fixture.events.contains("restore"))
++    }
++
++    @Test func dormantSoleDeviceActivatesOnceThenRestoresBeforeReturning() {
++        let fixture = Fixture()
++        fixture.captureSamples = [[], [capture]]
++        let result = USBSetupDiscovery.collect(fixture.dependencies())
++        #expect(result["status"] as? String == "configuration_candidate")
++        #expect(result["usb_configuration"] as? String == "temporarily_activated")
++        #expect(result["cleanup"] as? String == "settled")
++        #expect(fixture.events.filter { $0 == "activate" }.count == 1)
++        #expect(fixture.events.contains("restore"))
++        #expect(fixture.events.lastIndex(of: "physical")! > fixture.events.lastIndex(of: "restore")!)
++    }
++
++    @Test func multiplePhonesHaveNoAutomaticPairingOrActivation() {
++        let fixture = Fixture()
++        fixture.physical.append("00000000-2222222222222222")
++        fixture.captureSamples = [[capture]]
++        let result = USBSetupDiscovery.collect(fixture.dependencies())
++        #expect(result["status"] as? String == "ambiguous_devices")
++        #expect(result["config_candidate"] == nil)
++        #expect(!fixture.events.contains("activate"))
++    }
++
++    @Test func topologyFailureStillRestoresAndSuppressesCandidate() {
++        let fixture = Fixture()
++        fixture.captureSamples = [[], [capture]]
++        fixture.topologyChanges = true
++        let result = USBSetupDiscovery.collect(fixture.dependencies())
++        #expect(result["status"] as? String == "usb_topology_changed")
++        #expect(result["config_candidate"] == nil)
++        #expect(fixture.events.contains("restore"))
++        #expect(fixture.events.lastIndex(of: "physical")! > fixture.events.lastIndex(of: "restore")!)
++    }
++
++    @Test func restoreFailureCannotReportAConfigurationCandidate() {
++        let fixture = Fixture()
++        fixture.captureSamples = [[], [capture]]
++        fixture.restoreOK = false
++        let result = USBSetupDiscovery.collect(fixture.dependencies())
++        #expect(result["status"] as? String == "usb_restore_pending")
++        #expect(result["cleanup"] as? String == "pending")
++        #expect(result["config_candidate"] == nil)
++    }
++
++    @Test func cancelledOrUnconfirmedTopologyNeverActivates() {
++        for mode in ["cancelled", "unknown", "mismatch"] {
++            let fixture = Fixture()
++            fixture.cancelled = mode == "cancelled"
++            if mode == "unknown" { fixture.pin = nil }
++            if mode == "mismatch" { fixture.pin = .init(registryEntryID: 2, serial: "different") }
++            let result = USBSetupDiscovery.collect(fixture.dependencies())
++            #expect(result["config_candidate"] == nil)
++            #expect(!fixture.events.contains("activate"))
++        }
++    }
++
++    @Test func pendingOldRestoreBlocksDiscoveryUntilSettled() {
++        let fixture = Fixture()
++        fixture.pending = true
++        fixture.restoreOK = false
++        let result = USBSetupDiscovery.collect(fixture.dependencies())
++        #expect(result["status"] as? String == "previous_usb_restore_pending")
++        #expect(fixture.events == ["restore"])
++    }
++
++    @Test func USBNetworkProtectionDoesNotBecomeAForcedFallback() {
++        let fixture = Fixture()
++        fixture.outcome = .blockedByActiveUSBNetwork
++        let result = USBSetupDiscovery.collect(fixture.dependencies())
++        #expect(result["status"] as? String == "capture_unavailable")
++        #expect(result["usb_configuration"] as? String == "blocked_by_usb_network")
++        #expect(result["config_candidate"] == nil)
++        #expect(fixture.events.filter { $0 == "activate" }.count == 1)
++        #expect(!fixture.events.contains("restore"))
++    }
++
++    @Test func unavailableFinalInventoryStillRestores() {
++        let fixture = Fixture()
++        fixture.captureSamples = [[], [capture]]
++        fixture.throwAfterActivation = true
++        let result = USBSetupDiscovery.collect(fixture.dependencies())
++        #expect(result["status"] as? String == "physical_usb_inventory_unavailable")
++        #expect(result["config_candidate"] == nil)
++        #expect(fixture.events.contains("restore"))
++        #expect(fixture.events.lastIndex(of: "physical")! > fixture.events.lastIndex(of: "restore")!)
++    }
++
++
++    @Test func detachDuringTerminalCleanupSuppressesTheOldCandidate() {
++        let fixture = Fixture()
++        fixture.captureSamples = [[], [capture]]
++        fixture.duringRestore = { state in state.physical = []; state.pin = nil }
++        let result = USBSetupDiscovery.collect(fixture.dependencies())
++        #expect(result["cleanup"] as? String == "settled")
++        #expect(result["status"] as? String == "usb_topology_changed_during_cleanup")
++        #expect(result["config_candidate"] == nil)
++    }
++
++    @Test func reattachDuringCleanupIsDetectedEvenWithTheSameUDID() {
++        let fixture = Fixture()
++        fixture.captureSamples = [[], [capture]]
++        fixture.duringRestore = { state in
++            state.pin = .init(registryEntryID: 2, serial: "000000001111111111111111")
++        }
++        let result = USBSetupDiscovery.collect(fixture.dependencies())
++        #expect(result["status"] as? String == "usb_topology_changed_during_cleanup")
++        #expect(result["config_candidate"] == nil)
++    }
++
++    @Test func supersededTerminalCleanupNeverClaimsOriginalConfigurationRestored() {
++        let fixture = Fixture()
++        fixture.captureSamples = [[], [capture]]
++        // Mirrors the aggregate API's true result for an external configuration
++        // superseding our change. USB identity stays the same; configuration 6 was not restored.
++        fixture.terminalConfiguration = 7
++        let result = USBSetupDiscovery.collect(fixture.dependencies())
++        #expect(fixture.currentConfiguration == 7)
++        #expect(result["cleanup"] as? String == "settled")
++        #expect((result["cleanup_scope"] as? String)?.contains("superseded") == true)
++        #expect(result["capture_inventory_phase"] as? String == "before_usb_cleanup")
++        #expect(fixture.events.lastIndex(of: "physical")! > fixture.events.lastIndex(of: "restore")!)
++    }
++
++    @Test func cancellationDuringCleanupCannotReturnSuccess() {
++        let fixture = Fixture()
++        fixture.captureSamples = [[], [capture]]
++        fixture.duringRestore = { $0.cancelled = true }
++        let result = USBSetupDiscovery.collect(fixture.dependencies())
++        #expect(result["cleanup"] as? String == "settled")
++        #expect(result["status"] as? String == "cancelled_or_deadline")
++        #expect(result["config_candidate"] == nil)
++    }
++
++    @Test func distinctNonopaqueIdentifiersDoNotBecomeAMapping() {
++        let other = USBSetupDiscovery.Capture(id: "00000000-2222222222222222", name: "Other")
++        #expect(USBSetupDiscovery.candidate(captures: [other], physical: [usb]) == nil)
++    }
++}

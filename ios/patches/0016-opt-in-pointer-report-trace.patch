@@ -1,0 +1,464 @@
+diff --git a/Sources/iPhoneUse/Bluetooth/HIDConnectionState.swift b/Sources/iPhoneUse/Bluetooth/HIDConnectionState.swift
+index 3c665b3..7adccbd 100644
+--- a/Sources/iPhoneUse/Bluetooth/HIDConnectionState.swift
++++ b/Sources/iPhoneUse/Bluetooth/HIDConnectionState.swift
+@@ -23,6 +23,8 @@ struct HIDConnectionState {
+         let data: Data
+         let session: UUID?
+         let isAllowed: (() -> Bool)?
++        /// Temporary diagnostics only; never changes the on-wire HID payload.
++        let traceID: String?
+ 
+         var permissionIsCurrent: Bool {
+             // Releases cannot move a pointer and must survive invalidation so
+@@ -39,6 +41,9 @@ struct HIDConnectionState {
+     private(set) var subscriptions: [UUID: Set<Channel>] = [:]
+     private(set) var sessions: [UUID: UUID] = [:]
+     private(set) var pending: [PendingReport] = []
++    /// Installed only by the opt-in pointer trace. Observers must not read or
++    /// mutate this state, or evaluate permission callbacks again.
++    var onTrace: ((_ event: String, _ report: PendingReport, _ reason: String?) -> Void)? = nil
+ 
+     /// A connected keyboard does not imply that the host has subscribed to its
+     /// pointer reports yet. Check the report as well as the current session.
+@@ -55,10 +60,19 @@ struct HIDConnectionState {
+ 
+     mutating func unsubscribe(_ channel: Channel, host: UUID) {
+         subscriptions[host]?.remove(channel)
+-        pending.removeAll { $0.host == host && $0.channel == channel }
++        let trace = onTrace
++        pending.removeAll {
++            guard $0.host == host && $0.channel == channel else { return false }
++            trace?("discard", $0, "unsubscribed")
++            return true
++        }
+         if !(subscriptions[host]?.contains(where: \.isInput) ?? false) {
+             sessions[host] = nil
+-            pending.removeAll { $0.host == host && $0.channel.isInput }
++            pending.removeAll {
++                guard $0.host == host && $0.channel.isInput else { return false }
++                trace?("discard", $0, "session_ended")
++                return true
++            }
+         }
+         if subscriptions[host]?.isEmpty == true { subscriptions[host] = nil }
+     }
+@@ -66,24 +80,28 @@ struct HIDConnectionState {
+     /// An old DeviceInput may still have work queued when the same phone reconnects.
+     /// Its token must match the current session, as well as the subscription.
+     mutating func enqueue(
+-        _ channel: Channel, data: Data, host: UUID, session: UUID? = nil, isAllowed: (() -> Bool)? = nil
++        _ channel: Channel, data: Data, host: UUID, session: UUID? = nil, isAllowed: (() -> Bool)? = nil,
++        traceID: String? = nil
+     ) {
+-        guard hostSelection.allows(host) else { return }
+-        guard subscriptions[host]?.contains(channel) == true else { return }
++        let report = PendingReport(
++            host: host, channel: channel, data: data, session: session, isAllowed: isAllowed, traceID: traceID)
++        guard hostSelection.allows(host) else { onTrace?("discard", report, "host_excluded"); return }
++        guard subscriptions[host]?.contains(channel) == true else { onTrace?("discard", report, "not_subscribed"); return }
+         if channel.isInput {
+-            guard let session, sessions[host] == session else { return }
++            guard let session, sessions[host] == session else { onTrace?("discard", report, "stale_session"); return }
+         }
+-        let report = PendingReport(host: host, channel: channel, data: data, session: session, isAllowed: isAllowed)
+-        guard report.permissionIsCurrent else { return }
++        guard report.permissionIsCurrent else { onTrace?("discard", report, "association_denied"); return }
+         // Under backpressure only replace consecutive absolute positions with the
+         // same button state. Never merge a key, click or relative displacement.
+         if channel == .report(.absolutePointer), let last = pending.last,
+             last.host == host, last.channel == channel, last.data.first == data.first
+         {
++            onTrace?("discard", last, "absolute_coalesced")
+             pending[pending.count - 1] = report
+         } else {
+             pending.append(report)
+         }
++        onTrace?("enqueued", report, nil)
+     }
+ 
+     /// Backpressure can leave a report queued across identity or connection
+@@ -106,10 +124,16 @@ struct HIDConnectionState {
+             let subscribed = subscriptions[report.host]?.contains(report.channel) == true
+             let currentSession =
+                 !report.channel.isInput || (report.session != nil && sessions[report.host] == report.session)
+-            if hostSelection.allows(report.host), subscribed, currentSession, report.permissionIsCurrent {
+-                return (index, report)
+-            }
++            // Determine the actual rejecting gate once, preserving short-circuit
++            // order. Logging must not re-evaluate a live permission callback.
++            let reason: String
++            if !hostSelection.allows(report.host) { reason = "host_excluded" }
++            else if !subscribed { reason = "not_subscribed" }
++            else if !currentSession { reason = "stale_session" }
++            else if !report.permissionIsCurrent { reason = "association_denied" }
++            else { return (index, report) }
+             pending.remove(at: index)
++            onTrace?("discard", report, reason)
+             onDrop?(report)
+         }
+         return nil
+@@ -126,6 +150,7 @@ struct HIDConnectionState {
+     mutating func removeFirst() { pending.removeFirst() }
+ 
+     mutating func reset() {
++        if let onTrace { for report in pending { onTrace("discard", report, "connection_reset") } }
+         subscriptions.removeAll()
+         sessions.removeAll()
+         pending.removeAll()
+diff --git a/Sources/iPhoneUse/Bluetooth/HIDPeripheral.swift b/Sources/iPhoneUse/Bluetooth/HIDPeripheral.swift
+index 18033f0..c24c964 100644
+--- a/Sources/iPhoneUse/Bluetooth/HIDPeripheral.swift
++++ b/Sources/iPhoneUse/Bluetooth/HIDPeripheral.swift
+@@ -2,6 +2,56 @@ import CoreBluetooth
+ import CoreGraphics
+ import Foundation
+ 
++/// Temporary, opt-in diagnostic rows in the existing host log. No file, queue,
++/// protocol or delivery acknowledgement is introduced. Clock values share the
++/// capture-frame systemUptime domain; repeated notify rows with one ID are retries.
++enum HIDPointerTrace {
++    static let enabled = ProcessInfo.processInfo.environment["IPHONE_USE_TRACE_POINTER"] == "1"
++
++    static func makeID(_ report: ReportID) -> String? {
++        enabled && (report == .absolutePointer || report == .relativeMouse) ? UUID().uuidString : nil
++    }
++
++    static func row(
++        _ event: String, traceID: String?, host: UUID, session: UUID?, report: ReportID?,
++        bytes: [UInt8]?, reason: String? = nil, accepted: Bool? = nil,
++        uptime: TimeInterval, enabled: Bool
++    ) -> [String: Any]? {
++        guard enabled, report == nil || report == .absolutePointer || report == .relativeMouse else { return nil }
++        var row: [String: Any] = ["event": event, "uptime": uptime, "host": host.uuidString]
++        row["trace_id"] = traceID
++        row["session"] = session?.uuidString
++        row["report"] = report.map { String(describing: $0) }
++        row["bytes"] = bytes
++        row["reason"] = reason
++        // true means CoreBluetooth accepted the notification, never that iOS
++        // received/applied it. false leaves this report queued for another try.
++        row["corebluetooth_accepted"] = accepted
++        return row
++    }
++
++    static func emit(
++        _ event: String, traceID: String?, host: UUID, session: UUID?, report: ReportID? = nil,
++        bytes: [UInt8]? = nil, reason: String? = nil, accepted: Bool? = nil
++    ) {
++        guard enabled else { return }
++        guard let row = row(
++            event, traceID: traceID, host: host, session: session, report: report, bytes: bytes,
++            reason: reason, accepted: accepted, uptime: ProcessInfo.processInfo.systemUptime, enabled: enabled)
++        else { return }
++        do {
++            let data = try JSONSerialization.data(withJSONObject: row, options: [.sortedKeys])
++            log("pointer_trace " + String(decoding: data, as: UTF8.self))
++        } catch { log("pointer_trace encoding_failed; trace is incomplete") }
++    }
++
++    static func pending(_ event: String, _ report: HIDConnectionState.PendingReport, reason: String? = nil, accepted: Bool? = nil) {
++        guard enabled, case .report(let id) = report.channel else { return }
++        emit(event, traceID: report.traceID, host: report.host, session: report.session,
++            report: id, bytes: [UInt8](report.data), reason: reason, accepted: accepted)
++    }
++}
++
+ /// The Mac as a BLE keyboard + pointer (HID over GATT). Classic Bluetooth HID is out:
+ /// bluetoothd owns L2CAP PSM 17 and 19 on current macOS.
+ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate, CBCentralManagerDelegate {
+@@ -36,9 +86,7 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate, CBCentralManag
+ 
+     private var stateDescription = "starting"
+     var state: String { queue.sync { stateDescription } }
+-    private let tracePointer = ProcessInfo.processInfo.environment["IPHONE_USE_TRACE_POINTER"] == "1"
+-    private var lastPointerTrace = Date.distantPast
+-    private var lastSentPointerTrace = Date.distantPast
++    private let tracePointer = HIDPointerTrace.enabled
+ 
+     /// Called on the Bluetooth queue when a phone starts or stops listening for input.
+     var onHostsChanged: (() -> Void)?
+@@ -50,6 +98,9 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate, CBCentralManag
+         hostSelection = selection
+         connections = HIDConnectionState(hostSelection: selection)
+         super.init()
++        if tracePointer {
++            connections.onTrace = { event, report, reason in HIDPointerTrace.pending(event, report, reason: reason) }
++        }
+     }
+ 
+     var selectedHostDescription: String { hostSelection.description }
+@@ -385,18 +436,21 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate, CBCentralManag
+     func send(
+         _ id: ReportID, _ bytes: [UInt8], to host: UUID, session: UUID?, isAllowed: (() -> Bool)? = nil
+     ) {
++        let traceID = HIDPointerTrace.makeID(id)
++        HIDPointerTrace.emit("offered", traceID: traceID, host: host, session: session, report: id, bytes: bytes)
+         queue.async {
+-            if self.tracePointer, id == .absolutePointer || id == .relativeMouse,
+-                Date().timeIntervalSince(self.lastPointerTrace) > 0.5
+-            {
+-                self.lastPointerTrace = Date()
+-                log(
+-                    "pointer enqueue report=\(id) \(bytes) sessionCurrent=\(session != nil && self.connections.sessions[host] == session) subscribed=\(self.connections.subscriptions[host]?.contains(.report(id)) == true)"
+-                )
++            guard self.manager?.state == .poweredOn else {
++                HIDPointerTrace.emit("discard", traceID: traceID, host: host, session: session,
++                    report: id, bytes: bytes, reason: "manager_not_powered_on")
++                return
++            }
++            guard self.published else {
++                HIDPointerTrace.emit("discard", traceID: traceID, host: host, session: session,
++                    report: id, bytes: bytes, reason: "service_not_published")
++                return
+             }
+-            guard self.manager?.state == .poweredOn, self.published else { return }
+             self.connections.enqueue(
+-                .report(id), data: Data(bytes), host: host, session: session, isAllowed: isAllowed)
++                .report(id), data: Data(bytes), host: host, session: session, isAllowed: isAllowed, traceID: traceID)
+             self.drain()
+         }
+     }
+@@ -687,19 +741,18 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate, CBCentralManag
+         guard let manager, manager.state == .poweredOn, published else { return }
+         var blockedHosts: Set<UUID> = []
+         while let (index, report) = connections.nextPendingReportIndex(excludingHosts: blockedHosts) {
+-            guard let characteristic = characteristic(for: report.channel), let central = centrals[report.host] else {
++            guard let characteristic = characteristic(for: report.channel) else {
++                HIDPointerTrace.pending("discard", report, reason: "missing_characteristic")
+                 connections.removePending(at: index)
+                 continue
+             }
+-            let sent = manager.updateValue(report.data, for: characteristic, onSubscribedCentrals: [central])
+-            if tracePointer, report.channel == .report(.absolutePointer) || report.channel == .report(.relativeMouse),
+-                Date().timeIntervalSince(lastSentPointerTrace) > 0.5
+-            {
+-                lastSentPointerTrace = Date()
+-                log(
+-                    "pointer notify channel=\(report.channel) \([UInt8](report.data)) accepted=\(sent) host=\(report.host)"
+-                )
++            guard let central = centrals[report.host] else {
++                HIDPointerTrace.pending("discard", report, reason: "missing_central")
++                connections.removePending(at: index)
++                continue
+             }
++            let sent = manager.updateValue(report.data, for: characteristic, onSubscribedCentrals: [central])
++            HIDPointerTrace.pending("notify", report, accepted: sent)
+             guard sent else {
+                 blockedHosts.insert(report.host)
+                 continue
+diff --git a/Sources/iPhoneUse/Input/DeviceInput.swift b/Sources/iPhoneUse/Input/DeviceInput.swift
+index 6e97836..d0f6652 100644
+--- a/Sources/iPhoneUse/Input/DeviceInput.swift
++++ b/Sources/iPhoneUse/Input/DeviceInput.swift
+@@ -1043,7 +1043,13 @@ extension DeviceInput {
+     }
+ 
+     fileprivate func shouldContinueMotion(_ sequence: UInt64?) -> Bool {
+-        guard !isRetired, inputIsAllowed() else {
++        guard !isRetired else {
++            HIDPointerTrace.emit("motion_stopped", traceID: nil, host: host, session: session, reason: "input_retired")
++            clearPointerEstimate()
++            return false
++        }
++        guard inputIsAllowed() else {
++            HIDPointerTrace.emit("motion_stopped", traceID: nil, host: host, session: session, reason: "association_denied")
+             clearPointerEstimate()
+             return false
+         }
+@@ -1165,10 +1171,18 @@ extension DeviceInput {
+     }
+ 
+     fileprivate func send(_ id: ReportID, _ bytes: [UInt8]) {
+-        guard !isRetired else { return }
++        guard !isRetired else {
++            HIDPointerTrace.emit("source_discard", traceID: HIDPointerTrace.makeID(id), host: host, session: session,
++                report: id, bytes: bytes, reason: "input_retired")
++            return
++        }
+         // A capture can be invalidated while an input is queued. Stop stale
+         // movement and presses, while still releasing any held button or key.
+-        guard inputIsAllowed() || (id != .absolutePointer && bytes.allSatisfy { $0 == 0 }) else { return }
++        guard inputIsAllowed() || (id != .absolutePointer && bytes.allSatisfy { $0 == 0 }) else {
++            HIDPointerTrace.emit("source_discard", traceID: HIDPointerTrace.makeID(id), host: host, session: session,
++                report: id, bytes: bytes, reason: "association_denied")
++            return
++        }
+         if id == .absolutePointer, bytes.count == 5 {
+             lastAbsoluteReportPosition = (
+                 UInt16(bytes[1]) | UInt16(bytes[2]) << 8,
+diff --git a/Tests/iPhoneUseTests/Bluetooth/HIDPointerTraceTests.swift b/Tests/iPhoneUseTests/Bluetooth/HIDPointerTraceTests.swift
+new file mode 100644
+index 0000000..e06e114
+--- /dev/null
++++ b/Tests/iPhoneUseTests/Bluetooth/HIDPointerTraceTests.swift
+@@ -0,0 +1,169 @@
++import Foundation
++import XCTest
++
++@testable import iPhoneUse
++
++final class HIDPointerTraceTests: XCTestCase {
++    private let host = UUID()
++    private let other = UUID()
++
++    func testIdenticalRelativeReportsKeepDistinctIDsAndRetryKeepsTheSameHead() throws {
++        var state = HIDConnectionState()
++        var events: [String] = []
++        var permissionReads = 0
++        state.onTrace = { event, report, _ in events.append("\(event):\(report.traceID ?? "nil")") }
++        state.subscribe(.report(.relativeMouse), host: host)
++        let session = try XCTUnwrap(state.sessions[host])
++        for id in ["first", "second"] {
++            state.enqueue(.report(.relativeMouse), data: Data([1, 0, 8, 0]), host: host, session: session,
++                isAllowed: { permissionReads += 1; return true }, traceID: id)
++        }
++        XCTAssertEqual(events, ["enqueued:first", "enqueued:second"])
++        XCTAssertEqual(permissionReads, 2)
++        let blocked = try XCTUnwrap(state.nextPendingReportIndex())
++        XCTAssertEqual(blocked.report.traceID, "first")
++        // updateValue(false) leaves this entry in place. A later drain must retry
++        // its identity, not turn an identical second report into the same event.
++        let retried = try XCTUnwrap(state.nextPendingReportIndex())
++        XCTAssertEqual(retried.report.traceID, "first")
++        XCTAssertEqual(retried.report.data, Data([1, 0, 8, 0]))
++        XCTAssertEqual(state.pending.count, 2)
++        state.removePending(at: retried.index)
++        XCTAssertEqual(try XCTUnwrap(state.nextPendingReportIndex()).report.traceID, "second")
++        XCTAssertEqual(permissionReads, 5, "trace must not evaluate a permission a second time")
++        XCTAssertEqual(events.count, 2, "queue inspection/retry does not fabricate another enqueue")
++    }
++
++    func testEnqueueRejectionsHaveActualReasonsWithoutExtraPermissionReads() throws {
++        var state = HIDConnectionState(hostSelection: .only(host))
++        var discarded: [String] = []
++        var permissionReads = 0
++        state.onTrace = { event, report, reason in
++            if event == "discard" { discarded.append("\(report.traceID ?? "nil"):\(reason ?? "nil")") }
++        }
++        state.subscribe(.report(.relativeMouse), host: host)
++        state.subscribe(.report(.relativeMouse), host: other)
++        let session = try XCTUnwrap(state.sessions[host])
++        let permission = { permissionReads += 1; return false }
++        state.enqueue(.report(.relativeMouse), data: Data([1, 0, 8, 0]), host: other,
++            session: state.sessions[other], isAllowed: permission, traceID: "host")
++        state.enqueue(.report(.absolutePointer), data: Data([0, 1, 0, 2, 0]), host: host,
++            session: session, isAllowed: permission, traceID: "subscription")
++        state.enqueue(.report(.relativeMouse), data: Data([1, 0, 8, 0]), host: host,
++            session: UUID(), isAllowed: permission, traceID: "session")
++        XCTAssertEqual(permissionReads, 0)
++        state.enqueue(.report(.relativeMouse), data: Data([1, 0, 8, 0]), host: host,
++            session: session, isAllowed: permission, traceID: "association")
++        XCTAssertEqual(permissionReads, 1)
++        state.enqueue(.report(.relativeMouse), data: Data([0, 0, 0, 0]), host: host,
++            session: session, isAllowed: permission, traceID: "release")
++        XCTAssertEqual(permissionReads, 1, "neutral release retains the existing bypass")
++        XCTAssertEqual(discarded, ["host:host_excluded", "subscription:not_subscribed",
++            "session:stale_session", "association:association_denied"])
++        XCTAssertEqual(state.pending.map(\.traceID), ["release"])
++    }
++
++    func testCoalescingUnsubscribeAndResetTerminateTheOriginalReportIDs() throws {
++        var state = HIDConnectionState()
++        var discarded: [String] = []
++        state.onTrace = { event, report, reason in
++            if event == "discard" { discarded.append("\(report.traceID ?? "nil"):\(reason ?? "nil")") }
++        }
++        for id in [ReportID.absolutePointer, .relativeMouse] { state.subscribe(.report(id), host: host) }
++        state.subscribe(.report(.relativeMouse), host: other)
++        let session = try XCTUnwrap(state.sessions[host])
++        for id in ["abs-old", "abs-new"] {
++            state.enqueue(.report(.absolutePointer), data: Data([0, 1, 0, 2, 0]), host: host,
++                session: session, traceID: id)
++        }
++        for id in ["rel-first", "rel-second"] {
++            state.enqueue(.report(.relativeMouse), data: Data([1, 0, 8, 0]), host: host,
++                session: session, traceID: id)
++        }
++        XCTAssertEqual(state.pending.map(\.traceID), ["abs-new", "rel-first", "rel-second"])
++        state.unsubscribe(.report(.relativeMouse), host: host)
++        state.enqueue(.report(.relativeMouse), data: Data([1, 0, 8, 0]), host: other,
++            session: state.sessions[other], traceID: "other")
++        state.reset()
++        XCTAssertTrue(state.pending.isEmpty)
++        XCTAssertEqual(discarded, ["abs-old:absolute_coalesced", "rel-first:unsubscribed",
++            "rel-second:unsubscribed", "abs-new:connection_reset", "other:connection_reset"])
++    }
++
++    func testPendingInvalidationTracePreservesReleaseAndExistingDropObserver() throws {
++        var state = HIDConnectionState()
++        var discarded: [String] = []
++        var dropped: [String?] = []
++        var allowed = true
++        var permissionReads = 0
++        state.onTrace = { event, report, reason in
++            if event == "discard" { discarded.append("\(report.traceID ?? "nil"):\(reason ?? "nil")") }
++        }
++        state.subscribe(.report(.relativeMouse), host: host)
++        let session = try XCTUnwrap(state.sessions[host])
++        let permission = { permissionReads += 1; return allowed }
++        state.enqueue(.report(.relativeMouse), data: Data([1, 0, 8, 0]), host: host,
++            session: session, isAllowed: permission, traceID: "movement")
++        state.enqueue(.report(.relativeMouse), data: Data([0, 0, 0, 0]), host: host,
++            session: session, isAllowed: permission, traceID: "release")
++        allowed = false
++        let next = try XCTUnwrap(state.nextPendingReportIndex(onDrop: { dropped.append($0.traceID) }))
++        XCTAssertEqual(next.report.traceID, "release")
++        XCTAssertEqual(permissionReads, 2)
++        XCTAssertEqual(discarded, ["movement:association_denied"])
++        XCTAssertEqual(dropped, ["movement"])
++    }
++
++    func testTraceObserverLeavesQueueAndPermissionEvaluationUnchanged() throws {
++        var results: [[Data]] = []
++        var counts: [Int] = []
++        for tracing in [false, true] {
++            var state = HIDConnectionState()
++            if tracing { state.onTrace = { _, _, _ in } }
++            state.subscribe(.report(.relativeMouse), host: host)
++            let session = try XCTUnwrap(state.sessions[host])
++            var reads = 0
++            let permission = { reads += 1; return reads <= 2 }
++            for id in ["first", "second"] {
++                state.enqueue(.report(.relativeMouse), data: Data([1, 0, 8, 0]), host: host,
++                    session: session, isAllowed: permission, traceID: tracing ? id : nil)
++            }
++            state.enqueue(.report(.relativeMouse), data: Data([0, 0, 0, 0]), host: host,
++                session: session, isAllowed: permission)
++            var sent: [Data] = []
++            while let next = state.nextPendingReportIndex() {
++                sent.append(next.report.data)
++                state.removePending(at: next.index)
++            }
++            results.append(sent)
++            counts.append(reads)
++        }
++        XCTAssertEqual(results[0], results[1])
++        XCTAssertEqual(results[0], [Data([0, 0, 0, 0])])
++        XCTAssertEqual(counts, [4, 4])
++    }
++
++    func testTraceRowsKeepAcceptanceSeparateFromDeliveryAndExcludeKeyboardBytes() throws {
++        XCTAssertNil(HIDPointerTrace.row("offered", traceID: "a", host: host, session: nil,
++            report: .relativeMouse, bytes: [1, 0, 8, 0], uptime: 100, enabled: false))
++        XCTAssertNil(HIDPointerTrace.row("offered", traceID: "a", host: host, session: nil,
++            report: .keyboard, bytes: [0, 0, 4, 0, 0, 0, 0, 0], uptime: 100, enabled: true))
++        let row = try XCTUnwrap(HIDPointerTrace.row("notify", traceID: "same-on-every-retry", host: host,
++            session: UUID(), report: .relativeMouse, bytes: [1, 0, 8, 0], accepted: true,
++            uptime: 1234.56789, enabled: true))
++        let encoded = try JSONSerialization.data(withJSONObject: row)
++        let decoded = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
++        XCTAssertEqual(decoded["trace_id"] as? String, "same-on-every-retry")
++        XCTAssertEqual(decoded["uptime"] as? Double, 1234.56789)
++        XCTAssertEqual(decoded["bytes"] as? [Int], [1, 0, 8, 0])
++        XCTAssertEqual(decoded["corebluetooth_accepted"] as? Bool, true)
++        XCTAssertNil(decoded["delivered"])
++        XCTAssertNil(decoded["hid_delivery"])
++        let retry = try XCTUnwrap(HIDPointerTrace.row("notify", traceID: "same-on-every-retry", host: host,
++            session: nil, report: .relativeMouse, bytes: [1, 0, 8, 0], accepted: false,
++            uptime: 1234.5, enabled: true))
++        XCTAssertEqual(retry["trace_id"] as? String, decoded["trace_id"] as? String)
++        XCTAssertEqual(retry["corebluetooth_accepted"] as? Bool, false)
++        XCTAssertLessThan(retry["uptime"] as? Double ?? .infinity, decoded["uptime"] as? Double ?? -.infinity)
++    }
++}

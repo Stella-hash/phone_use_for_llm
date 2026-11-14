@@ -1,0 +1,14 @@
+diff --git a/Tests/iPhoneUseTests/Localization/LocalizationTests.swift b/Tests/iPhoneUseTests/Localization/LocalizationTests.swift
+index a1c7646..d96d042 100644
+--- a/Tests/iPhoneUseTests/Localization/LocalizationTests.swift
++++ b/Tests/iPhoneUseTests/Localization/LocalizationTests.swift
+@@ -140,7 +140,8 @@ final class LocalizationTests: XCTestCase {
+         let zhTools = MCPToolCatalog.tools(for: .zh)
+         let required: Set<String> = [
+             "session_context", "accessibility_tree",
+-            "list_devices", "screenshot", "ocr_screen", "tap_text", "move_pointer", "adjust_pointer", "click_pointer",
++            "list_devices", "screenshot", "screenshot_burst", "ocr_screen", "tap_text",
++            "move_pointer", "adjust_pointer", "click_pointer",
+             "tap", "long_press", "swipe", "type_text", "press_key", "keyboard_sequence", "home", "act",
+         ]
+         func names(_ tools: [[String: Any]]) -> Set<String> {

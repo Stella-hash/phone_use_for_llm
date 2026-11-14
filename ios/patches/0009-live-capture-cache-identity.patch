@@ -1,0 +1,110 @@
+diff --git a/Sources/iPhoneUse/Devices/DeviceRegistry.swift b/Sources/iPhoneUse/Devices/DeviceRegistry.swift
+index 817e88d..a177073 100644
+--- a/Sources/iPhoneUse/Devices/DeviceRegistry.swift
++++ b/Sources/iPhoneUse/Devices/DeviceRegistry.swift
+@@ -40,10 +40,22 @@ final class DeviceRegistry {
+     private var pairings: [String: UUID] = [:]
+     /// Cache identity includes both the BLE session and USB device. Keeping the
+     /// entry together prevents an DeviceInput from being reused for another screen.
+-    private struct CachedInput {
++    struct CachedInput {
+         let input: DeviceInput
+         let screenID: String?
+-        let screenObject: ObjectIdentifier?
++        // A raw ObjectIdentifier outlives its referent. Quiet capture restart
++        // may reuse that address while DeviceInput's weak screen is already nil.
++        // Keep a weak reference so a replacement can never revive the old key.
++        weak var screenObject: AnyObject?
++
++        func matches(session: UUID?, screenID: String?, screenObject: AnyObject?) -> Bool {
++            let cachedScreen = self.screenObject
++            guard !input.isRetired, input.session == session, self.screenID == screenID else { return false }
++            // An intentionally unbound probe can match nil; an expired bound
++            // capture cannot, even if a caller still supplies its former ID.
++            guard self.screenID == nil || cachedScreen != nil else { return false }
++            return cachedScreen === screenObject
++        }
+     }
+     private enum ReplacementRecovery {
+         case notApplicable
+@@ -296,15 +308,14 @@ final class DeviceRegistry {
+             // session cannot replace a newer DeviceInput and split the input queues.
+             let session = HIDPeripheral.shared.connectionSession(for: host)
+             let screenID = screen?.id
+-            if let cached = inputs[host], !cached.input.isRetired,
+-                cached.input.session == session, cached.screenID == screenID,
+-                cached.screenObject == screen.map(ObjectIdentifier.init)
++            if let cached = inputs[host],
++                cached.matches(session: session, screenID: screenID, screenObject: screen)
+             {
+                 return cached.input
+             }
+             let input = makeInput(host: host, session: session, screen: screen, associationVerified: verified)
+             inputs[host] = CachedInput(
+-                input: input, screenID: screenID, screenObject: screen.map(ObjectIdentifier.init))
++                input: input, screenID: screenID, screenObject: screen)
+             return input
+         }
+     }
+diff --git a/Tests/iPhoneUseTests/Devices/DeviceInputCacheTests.swift b/Tests/iPhoneUseTests/Devices/DeviceInputCacheTests.swift
+new file mode 100644
+index 0000000..6696fec
+--- /dev/null
++++ b/Tests/iPhoneUseTests/Devices/DeviceInputCacheTests.swift
+@@ -0,0 +1,56 @@
++import Foundation
++import XCTest
++
++@testable import iPhoneUse
++
++final class DeviceInputCacheTests: XCTestCase {
++    private func input(session: UUID) -> DeviceInput {
++        DeviceInput(
++            host: UUID(), session: session, sleep: { _ in },
++            reportSender: { _, _ in
++                XCTFail("cache matching must not send input")
++            })
++    }
++
++    func testExpiredCaptureCannotMatchAReplacementEvenWithTheSameDeviceID() {
++        let session = UUID()
++        var capture: NSObject? = NSObject()
++        weak var lifetimeWitness = capture
++        let cached = DeviceRegistry.CachedInput(
++            input: input(session: session), screenID: "phone", screenObject: capture)
++        XCTAssertTrue(cached.matches(session: session, screenID: "phone", screenObject: capture))
++
++        // Quiet suspension drops the capture objects but keeps the BLE session
++        // and cached input. No allocator address-reuse trick is needed: once the
++        // weak referent expires, this entry must miss for every replacement.
++        capture = nil
++        XCTAssertNil(lifetimeWitness, "the input cache must not keep stopped captures alive")
++        XCTAssertNil(cached.screenObject)
++        let replacement = NSObject()
++        XCTAssertFalse(cached.matches(session: session, screenID: "phone", screenObject: replacement))
++        XCTAssertFalse(cached.matches(session: session, screenID: "phone", screenObject: nil))
++        XCTAssertFalse(cached.matches(session: session, screenID: nil, screenObject: nil))
++    }
++
++    func testLiveCaptureStillRequiresExactObjectDeviceIDSessionAndActiveInput() throws {
++        let session = UUID()
++        let capture = NSObject()
++        let currentInput = input(session: session)
++        let cached = DeviceRegistry.CachedInput(
++            input: currentInput, screenID: "phone", screenObject: capture)
++        XCTAssertTrue(cached.matches(session: session, screenID: "phone", screenObject: capture))
++        XCTAssertFalse(cached.matches(session: session, screenID: "phone", screenObject: NSObject()))
++        XCTAssertFalse(cached.matches(session: session, screenID: "another", screenObject: capture))
++        XCTAssertFalse(cached.matches(session: UUID(), screenID: "phone", screenObject: capture))
++        try currentInput.retireForCalibrationReload()
++        XCTAssertFalse(cached.matches(session: session, screenID: "phone", screenObject: capture))
++    }
++
++    func testIntentionallyUnboundProbeOnlyMatchesAnotherUnboundRequest() {
++        let session = UUID()
++        let cached = DeviceRegistry.CachedInput(input: input(session: session), screenID: nil, screenObject: nil)
++        XCTAssertTrue(cached.matches(session: session, screenID: nil, screenObject: nil))
++        XCTAssertFalse(cached.matches(session: session, screenID: "phone", screenObject: NSObject()))
++        XCTAssertFalse(cached.matches(session: UUID(), screenID: nil, screenObject: nil))
++    }
++}

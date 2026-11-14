@@ -1,0 +1,222 @@
+diff --git a/Sources/iPhoneUse/Input/DeviceInput.swift b/Sources/iPhoneUse/Input/DeviceInput.swift
+index d0f6652..c7e95fe 100644
+--- a/Sources/iPhoneUse/Input/DeviceInput.swift
++++ b/Sources/iPhoneUse/Input/DeviceInput.swift
+@@ -48,6 +48,7 @@ final class DeviceInput {
+     private var buttons: UInt8 = 0
+     private let reportSender: (ReportID, [UInt8]) -> Void
+     private let sleep: (TimeInterval) -> Void
++    private let monotonicNow: () -> TimeInterval
+     private var windowDragging = false
+     let calibration: RelativePointerCalibration?
+     /// Raw HID coordinates, including when the visible display is rotated.
+@@ -182,6 +183,7 @@ final class DeviceInput {
+         displayMappingProvider: (() throws -> DeviceDisplayMapping)? = nil,
+         inputIsAllowed: @escaping () -> Bool = { true },
+         sleep: @escaping (TimeInterval) -> Void = Thread.sleep(forTimeInterval:),
++        monotonicNow: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+         reportSender: ((ReportID, [UInt8]) -> Void)? = nil,
+         reportReadiness: ((ReportID, UUID, UUID?) -> Bool)? = nil
+     ) {
+@@ -196,6 +198,7 @@ final class DeviceInput {
+         self.displayMappingProvider = displayMappingProvider
+         self.inputIsAllowed = inputIsAllowed
+         self.sleep = sleep
++        self.monotonicNow = monotonicNow
+         self.reportReadiness =
+             reportReadiness ?? {
+                 HIDPeripheral.shared.isReady(report: $0, host: $1, session: $2)
+@@ -227,10 +230,11 @@ extension DeviceInput {
+         }
+     }
+ 
+-    /// Follow a polyline with one press and release. `duration` is the total
+-    /// movement wait; estimated report pacing counts toward it. Positioning,
+-    /// button pacing and calibrated HID reports
+-    /// retain their own intervals. Segment waits follow physical screen distance.
++    /// Follow a polyline with one press and release. `duration` apportions timing
++    /// targets among movement steps; estimated/measured movement work counts
++    /// toward each interval. Positioning, button pacing and legacy calibrated
++    /// reports retain their own waits, so total wall time may exceed `duration`.
++    /// Segment timing follows physical screen distance.
+     func swipe(points: [(Double, Double)], duration: TimeInterval) throws {
+         try performCoordinateGesture {
+             let table = StringsAPI.current
+@@ -279,9 +283,15 @@ extension DeviceInput {
+                         try dragMove(x, y, sequence: nil)
+                         pause(interval)
+                     } else {
++                        let started = monotonicNow()
+                         let movementWait = try moveEstimatedDragPointer(
+                             x, y, sequence: nil, finishing: i == steps)
+-                        if interval > movementWait { pause(interval - movementWait) }
++                        // Include real send/check/sleep time before topping up.
++                        // Retain the requested-wait floor for injected sleepers
++                        // that return immediately; never shorten report pacing.
++                        let elapsed = max(0, monotonicNow() - started)
++                        let consumed = max(movementWait, elapsed)
++                        if interval > consumed { pause(interval - consumed) }
+                     }
+                 }
+             }
+diff --git a/Tests/iPhoneUseTests/Input/DeviceInputPointerTests.swift b/Tests/iPhoneUseTests/Input/DeviceInputPointerTests.swift
+index 225a78e..06caa89 100644
+--- a/Tests/iPhoneUseTests/Input/DeviceInputPointerTests.swift
++++ b/Tests/iPhoneUseTests/Input/DeviceInputPointerTests.swift
+@@ -283,7 +283,7 @@ final class DeviceInputPointerTests: XCTestCase {
+         var pauses: [TimeInterval] = []
+         let input = DeviceInput(
+             host: UUID(), session: UUID(), screenSize: { CGSize(width: 750, height: 1334) },
+-            sleep: { pauses.append($0) }, reportSender: { reports.append(($0, $1)) })
++            sleep: { pauses.append($0) }, monotonicNow: { 0 }, reportSender: { reports.append(($0, $1)) })
+         input.step = 0.125
+ 
+         try input.swipe(points: [(0, 0), (1, 1)], duration: 0.5)
+@@ -322,7 +322,7 @@ final class DeviceInputPointerTests: XCTestCase {
+         var movementCount = 0
+         let input = DeviceInput(
+             host: UUID(), session: UUID(), screenSize: { CGSize(width: 750, height: 1334) },
+-            sleep: { pauses.append($0) },
++            sleep: { pauses.append($0) }, monotonicNow: { 0 },
+             reportSender: { id, bytes in
+                 if id == .relativeMouse, bytes[1] != 0 || bytes[2] != 0 { movementCount += 1 }
+             })
+@@ -453,7 +453,7 @@ final class DeviceInputPointerTests: XCTestCase {
+         var pauses: [TimeInterval] = []
+         let input = DeviceInput(
+             host: UUID(), session: UUID(), screenSize: { CGSize(width: 750, height: 1500) },
+-            sleep: { pauses.append($0) }, reportSender: { reports.append(($0, $1)) })
++            sleep: { pauses.append($0) }, monotonicNow: { 0 }, reportSender: { reports.append(($0, $1)) })
+         input.step = 0.125
+ 
+         try input.swipe(points: [(0, 0), (1, 0), (1, 1)], duration: 0.75)
+@@ -498,7 +498,7 @@ final class DeviceInputPointerTests: XCTestCase {
+             var reports: [(ReportID, [UInt8])] = []
+             var pauses: [TimeInterval] = []
+             let input = DeviceInput(
+-                host: UUID(), session: UUID(), sleep: { pauses.append($0) },
++                host: UUID(), session: UUID(), sleep: { pauses.append($0) }, monotonicNow: { 0 },
+                 reportSender: { reports.append(($0, $1)) })
+             input.step = 0.125
+ 
+diff --git a/Tests/iPhoneUseTests/Input/HeldDragProfileTests.swift b/Tests/iPhoneUseTests/Input/HeldDragProfileTests.swift
+index 338ff79..4acb58e 100644
+--- a/Tests/iPhoneUseTests/Input/HeldDragProfileTests.swift
++++ b/Tests/iPhoneUseTests/Input/HeldDragProfileTests.swift
+@@ -21,11 +21,15 @@ private final class HeldDragRecorder {
+                 .map { .init(count: $0.0, distance: $0.1) })
+     }
+ 
+-    func input(selection: HeldDragProfile.Selection? = nil, screenID: String? = nil) -> DeviceInput {
++    func input(
++        selection: HeldDragProfile.Selection? = nil, screenID: String? = nil,
++        sleep: @escaping (TimeInterval) -> Void = { _ in },
++        monotonicNow: @escaping () -> TimeInterval = { 0 }
++    ) -> DeviceInput {
+         DeviceInput(
+             host: host, session: UUID(), screenID: screenID ?? self.screenID,
+             screenSize: { self.size }, heldDragProfile: selection ?? .loaded(profile),
+-            sleep: { _ in }, reportSender: receive)
++            sleep: sleep, monotonicNow: monotonicNow, reportSender: receive)
+     }
+ 
+     func receive(_ id: ReportID, _ bytes: [UInt8]) {
+@@ -136,6 +140,98 @@ final class HeldDragProfileTests: XCTestCase {
+         }
+     }
+ 
++    func testMeasuredSwipeFastTopUpsPreserveReportsAndTheInjectedSleepFloor() throws {
++        var reference: [[UInt8]]?
++        for advancesClock in [false, true] {
++            for duration in [0.48, 0.5] {
++                let recorder = HeldDragRecorder()
++                var now: TimeInterval = 0
++                var pauses: [TimeInterval] = []
++                let input = recorder.input(
++                    sleep: { seconds in
++                        pauses.append(seconds)
++                        if advancesClock { now += seconds }
++                    }, monotonicNow: { now })
++                try input.swipe(points: [(0.3, 0.2), (0.3, 0.33)], duration: duration)
++
++                let topUps = pauses.filter { $0 > 0 && $0 < 0.03 - 1e-12 }
++                XCTAssertEqual(topUps.count, duration == 0.48 ? 0 : 15)
++                for wait in topUps { XCTAssertEqual(wait, 0.00125, accuracy: 1e-12) }
++                if let reference { XCTAssertEqual(recorder.reports.map(\.1), reference) }
++                else { reference = recorder.reports.map(\.1) }
++                XCTAssertEqual(recorder.presses.count, 1)
++                XCTAssertEqual(recorder.buttons, 0)
++                XCTAssertEqual(recorder.reports.last?.1, [0, 0, 0, 0])
++                XCTAssertEqual(recorder.position.y, 0.33 * 2556, accuracy: 0.36)
++            }
++        }
++    }
++
++    func testMeasuredSwipeDoesNotTopUpAfterSlowInnerSleepOrSend() throws {
++        let reference = HeldDragRecorder()
++        try reference.input().swipe(points: [(0.3, 0.2), (0.3, 0.33)], duration: 0.48)
++        for slowSleep in [true, false] {
++            for duration in [0.48, 0.5] {
++                let recorder = HeldDragRecorder()
++                var now: TimeInterval = 0
++                var pauses: [TimeInterval] = []
++                if !slowSleep {
++                    recorder.onReport = {
++                        if let (id, bytes) = recorder.reports.last,
++                            id == .relativeMouse, bytes[1] != 0 || bytes[2] != 0
++                        { now += 0.005 }
++                    }
++                }
++                let input = recorder.input(
++                    sleep: { seconds in
++                        pauses.append(seconds)
++                        now += seconds
++                        if slowSleep, seconds == 0.03 { now += 0.005 }
++                    }, monotonicNow: { now })
++                try input.swipe(points: [(0.3, 0.2), (0.3, 0.33)], duration: duration)
++
++                XCTAssertTrue(pauses.allSatisfy { $0 >= 0.03 }, "elapsed movement already exceeds either interval")
++                XCTAssertEqual(recorder.reports.map(\.0), reference.reports.map(\.0))
++                XCTAssertEqual(recorder.reports.map(\.1), reference.reports.map(\.1))
++                XCTAssertEqual(pauses.filter { $0 == 0.03 }.count, recorder.movement.count + 3,
++                    "retain each report interval plus initial priming, press and release pacing")
++                XCTAssertEqual(recorder.presses.count, 1)
++                XCTAssertEqual(recorder.buttons, 0)
++                XCTAssertEqual(recorder.reports.last?.1, [0, 0, 0, 0])
++            }
++        }
++    }
++
++    func testStationaryMeasuredSwipeKeepsHoldAndDoesNotCatchUpAfterSlowTopUps() throws {
++        for oversleep in [TimeInterval(0), 0.02] {
++            let recorder = HeldDragRecorder()
++            var now: TimeInterval = 0
++            var pauses: [TimeInterval] = []
++            var pressedAt: TimeInterval?
++            var releasedAt: TimeInterval?
++            recorder.onReport = {
++                guard let (id, bytes) = recorder.reports.last, id == .relativeMouse else { return }
++                if bytes == [1, 0, 0, 0] { pressedAt = now }
++                if bytes == [0, 0, 0, 0], pressedAt != nil { releasedAt = now }
++            }
++            let input = recorder.input(
++                sleep: { seconds in
++                    pauses.append(seconds)
++                    now += seconds
++                    if abs(seconds - 0.03125) < 1e-12 { now += oversleep }
++                }, monotonicNow: { now })
++            try input.swipe(points: [(0.3, 0.2), (0.3, 0.2)], duration: 0.5)
++
++            XCTAssertTrue(recorder.movement.isEmpty)
++            XCTAssertEqual(pauses.filter { abs($0 - 0.03125) < 1e-12 }.count, 16)
++            let held = try XCTUnwrap(releasedAt) - XCTUnwrap(pressedAt)
++            XCTAssertEqual(held, 0.03 + 0.5 + 16 * oversleep, accuracy: 1e-12)
++            XCTAssertEqual(recorder.presses.count, 1)
++            XCTAssertEqual(recorder.buttons, 0)
++            XCTAssertEqual(recorder.reports.last?.1, [0, 0, 0, 0])
++        }
++    }
++
+     func testMeasuredPolylineReachesCornerBeforeTurningAndWindowReleaseFinishes() throws {
+         let recorder = HeldDragRecorder()
+         let input = recorder.input()

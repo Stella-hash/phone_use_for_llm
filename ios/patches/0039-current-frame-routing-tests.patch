@@ -1,0 +1,126 @@
+diff --git a/Tests/iPhoneUseTests/API/HTTPAPITests.swift b/Tests/iPhoneUseTests/API/HTTPAPITests.swift
+index 6e2de5f..86c46b0 100644
+--- a/Tests/iPhoneUseTests/API/HTTPAPITests.swift
++++ b/Tests/iPhoneUseTests/API/HTTPAPITests.swift
+@@ -255,22 +255,54 @@ final class SwipeRequestTests: XCTestCase {
+         super.tearDown()
+     }
+ 
+-    func testMCPPathSurvivesHTTPEncodingAndEmitsOneContinuousDrag() throws {
++    func testFrameBoundMCPPathSurvivesHTTPEncodingAndEndsAllUp() throws {
++        let frame = "00000000-0000-4000-8000-000000000001"
++        let points = [["x": 0, "y": 800], ["x": 400, "y": 500], ["x": 0, "y": 0]]
+         let action = try XCTUnwrap(
+             MCPToolRequest.action(
+-                named: "swipe",
++                named: "act",
+                 arguments: [
+-                    "points": [["x": 0, "y": 800], ["x": 400, "y": 500], ["x": 0, "y": 0]],
+-                    "duration": 0.12, "device": "phone",
++                    "steps": [["type": "swipe", "frame_id": frame, "points": points, "duration": 0.12]],
++                    "device": "phone",
+                 ], longEdge: MCPServer.longEdge))
+         let json = try JSONSerialization.data(withJSONObject: action.body)
+-        let header = Data("POST \(action.path) HTTP/1.1\r\nContent-Length: \(json.count)\r\n\r\n".utf8)
++        let header = Data("POST \(action.path) HTTP/1.1\r\nHost: 127.0.0.1:7390\r\nContent-Type: application/json\r\nContent-Length: \(json.count)\r\n\r\n".utf8)
+         let request = try XCTUnwrap(HTTPRequest.parse(header + json))
+-        XCTAssertEqual(request.path, "/swipe")
++        XCTAssertEqual(request.path, "/act")
++        XCTAssertNil(request.rejection(listeningPort: 7390))
+         XCTAssertEqual(request.body["device"] as? String, "phone")
++        let batch = try ActRequest(request.body, requireFrameTouch: true)
++        XCTAssertEqual(batch.steps.count, 1)
++        let step = try XCTUnwrap(batch.steps.first)
++        XCTAssertEqual(step["frame_id"] as? String, frame)
++        XCTAssertEqual(step["points"] as? [[String: Int]], points)
++        XCTAssertNil(step["fraction"])
++        XCTAssertNil(step["normalized"])
++        let program = try TouchSequenceRequest.gesture(path: "/swipe", body: step)
++        _ = try TouchSequenceRequest(["samples": program.samples], image: (500, 1000))
++        let first = try XCTUnwrap((program.samples.first?["contacts"] as? [[String: Any]])?.first)
++        let lastContact = try XCTUnwrap((program.samples.dropLast().last?["contacts"] as? [[String: Any]])?.first)
++        XCTAssertEqual(first["x"] as? Double, 0)
++        XCTAssertEqual(first["y"] as? Double, 800)
++        XCTAssertEqual(lastContact["x"] as? Double, 0)
++        XCTAssertEqual(lastContact["y"] as? Double, 0)
++        for sample in program.samples.dropLast() {
++            let contacts = try XCTUnwrap(sample["contacts"] as? [[String: Any]])
++            XCTAssertEqual(contacts.count, 1)
++            XCTAssertEqual(contacts.first?["id"] as? Int, 0)
++        }
++        XCTAssertEqual(program.samples.last?["at_ms"] as? Double, 121)
++        XCTAssertTrue(try XCTUnwrap(program.samples.last?["contacts"] as? [[String: Any]]).isEmpty)
++    }
+ 
++    func testLegacyPointerDriverStillEmitsOneContinuousDrag() throws {
++        // Retain driver-level coverage without presenting its relative reports
++        // as the managed USB MCP transport.
+         let size = CGSize(width: 750, height: 1500)
+-        let swipe = try SwipeRequest(request.body, screenSize: size, screenName: "phone")
++        let swipe = try SwipeRequest([
++            "points": [["x": 0, "y": 800], ["x": 400, "y": 500], ["x": 0, "y": 0]],
++            "duration": 0.12, "maxEdge": 1000,
++        ], screenSize: size, screenName: "phone")
+         var reports: [(ReportID, [UInt8])] = []
+         let input = DeviceInput(
+             host: UUID(), session: UUID(), screenSize: { size }, sleep: { _ in },
+@@ -341,27 +373,26 @@ final class SwipeRequestTests: XCTestCase {
+         XCTAssertEqual(swipe.duration, 0.3)
+     }
+ 
+-    func testNormalizedMCPToolsSurviveJSONAndUseScreenFractionsWithoutAFrame() throws {
++    func testMCPRejectsNormalizedAndUnboundCoordinatesBeforeHTTPEncoding() {
+         for name in ["tap", "long_press", "swipe"] {
+-            let action = try XCTUnwrap(
+-                MCPToolRequest.action(
+-                    named: name,
+-                    arguments: [
+-                        "normalized": true, "x": 500, "y": 1000,
+-                        "points": [["x": 0, "y": 1000], ["x": 500, "y": 0]],
+-                    ],
+-                    longEdge: MCPServer.longEdge))
+-            let json = try JSONSerialization.data(withJSONObject: action.body)
+-            let header = Data("POST \(action.path) HTTP/1.1\r\nContent-Length: \(json.count)\r\n\r\n".utf8)
+-            let request = try XCTUnwrap(HTTPRequest.parse(header + json))
+-            if name == "swipe" {
+-                let swipe = try SwipeRequest(request.body, screenSize: nil, screenName: "phone")
+-                XCTAssertEqual(swipe.points.map { $0.0 }, [0, 0.5])
+-                XCTAssertEqual(swipe.points.map { $0.1 }, [1, 0])
+-            } else {
+-                let point = try RequestCoordinates.point(request.body, "x", "y", screenSize: nil, screenName: "phone")
+-                XCTAssertEqual(point.0, 0.5)
+-                XCTAssertEqual(point.1, 1)
++            var arguments: [String: Any] = name == "swipe"
++                ? ["points": [["x": 0, "y": 800], ["x": 400, "y": 0]]]
++                : ["x": 400, "y": 800]
++            arguments["normalized"] = true
++            arguments["frame_id"] = "00000000-0000-4000-8000-000000000001"
++            XCTAssertThrowsError(
++                try MCPToolRequest.action(named: name, arguments: arguments, longEdge: MCPServer.longEdge)
++            ) { error in
++                XCTAssertTrue(error is InputRequestError)
++                XCTAssertEqual(String(describing: error),
++                    "MCP touch requires frame_id and screenshot pixels; normalized coordinates are unsupported")
++            }
++            arguments.removeValue(forKey: "normalized")
++            arguments.removeValue(forKey: "frame_id")
++            XCTAssertThrowsError(
++                try MCPToolRequest.action(named: name, arguments: arguments, longEdge: MCPServer.longEdge)
++            ) { error in
++                XCTAssertEqual(String(describing: error), "Invalid act parameters; touch requires frame_id and screenshot pixels")
+             }
+         }
+     }
+diff --git a/Tests/iPhoneUseTests/MCP/MCPProtocolTests.swift b/Tests/iPhoneUseTests/MCP/MCPProtocolTests.swift
+index 5469947..3a921b1 100644
+--- a/Tests/iPhoneUseTests/MCP/MCPProtocolTests.swift
++++ b/Tests/iPhoneUseTests/MCP/MCPProtocolTests.swift
+@@ -195,7 +195,7 @@ final class MCPProtocolTests: XCTestCase {
+ 
+     func testMissingCoordinatesReportTheFirstMissingKeyAndPresentNullIsRejected() {
+         XCTAssertThrowsError(try MCPToolRequest.action(named: "tap", arguments: ["frame_id": fixtureFrameID, "x": 1], longEdge: 1000)) { error in
+-            XCTAssertEqual(String(describing: error), "y is required")
++            XCTAssertEqual(String(describing: error), "y must be a finite number")
+         }
+         XCTAssertThrowsError(try MCPToolRequest.action(
+             named: "tap", arguments: ["frame_id": fixtureFrameID, "x": NSNull(), "y": "unchecked"], longEdge: 1000))

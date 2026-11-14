@@ -1,0 +1,4 @@
+# Direct dependency input for the CPython 3.12/macOS architecture hash locks.
+# setup-usb syncs requirements-usb-macos-*.lock; it never resolves this file.
+# CoreDevice clipboard capability is detected at use time, not gated by iOS version.
+pymobiledevice3==11.50.0

@@ -1,0 +1,946 @@
+diff --git a/Sources/iPhoneUse/Devices/DeviceRegistry.swift b/Sources/iPhoneUse/Devices/DeviceRegistry.swift
+index 238dbd9..817e88d 100644
+--- a/Sources/iPhoneUse/Devices/DeviceRegistry.swift
++++ b/Sources/iPhoneUse/Devices/DeviceRegistry.swift
+@@ -339,6 +339,7 @@ final class DeviceRegistry {
+                 host: host, screenID: screenID),
+             calibrationFilePresent: FileManager.default.fileExists(
+                 atPath: RelativePointerCalibration.fileURL(host: host).path),
++            screenID: screenID,
+             screenSize: screenID.map { id in
+                 // USB reconnect creates a new ScreenCaptureSession while the
+                 // Bluetooth session may remain unchanged.
+diff --git a/Sources/iPhoneUse/Input/DeviceInput.swift b/Sources/iPhoneUse/Input/DeviceInput.swift
+index ee172d2..8c34487 100644
+--- a/Sources/iPhoneUse/Input/DeviceInput.swift
++++ b/Sources/iPhoneUse/Input/DeviceInput.swift
+@@ -72,7 +72,9 @@ final class DeviceInput {
+     var inputActivitySequence: UInt64 { backgroundSequence.current }
+     private let calibrationRequired: Bool
+     private let calibrationFilePresent: Bool
++    private let screenID: String?
+     private let screenSize: (() -> CGSize?)?
++    private let heldDragProfile: HeldDragProfile.Selection
+ 
+     /// A read-only snapshot for `/status`, including the curve actually loaded
+     /// in memory so diagnostics do not infer it from potentially stale files.
+@@ -113,9 +115,39 @@ final class DeviceInput {
+             "sessionCurrent": isCurrentSession,
+             "coordinateMappingAvailable": coordinateMappingAvailable,
+             "calibration": calibrationInfo,
++            "heldDrag": heldDragStatus,
+         ]
+     }
+ 
++    private var heldDragStatus: [String: Any] {
++        let state: String
++        let reason: String?
++        var result: [String: Any] = [:]
++        switch heldDragProfile {
++        case .notConfigured:
++            state = "not-configured"
++            reason = nil
++        case .invalid(let issue):
++            state = "invalid"
++            reason = issue
++        case .loaded(let profile):
++            reason = profile.bindingIssue(host: host, screenID: screenID, size: screenSize?(), interval: step)
++            state = reason == nil ? "loaded" : "mismatch"
++            result["host"] = profile.host.uuidString
++            result["screenID"] = profile.screenID
++            result["screenWidth"] = profile.screenWidth
++            result["screenHeight"] = profile.screenHeight
++            result["reportInterval"] = profile.reportInterval
++            result["samples"] = profile.samples.map { ["count": $0.count, "distance": $0.distance] as [String: Any] }
++        }
++        result["profileState"] = state
++        result["mode"] = calibration != nil ? "legacy-relative"
++            : state == "loaded" ? "measured" : state == "not-configured" ? "estimated" : "unavailable"
++        result["available"] = calibration != nil || reason == nil
++        if let reason { result["reason"] = reason }
++        return result
++    }
++
+     private var coordinateMappingAvailable: Bool {
+         if isRetired || !inputIsAllowed() { return false }
+         if calibrationRequired && calibration == nil { return false }
+@@ -131,7 +163,9 @@ final class DeviceInput {
+         calibration: RelativePointerCalibration? = nil,
+         calibrationRequired: Bool = false,
+         calibrationFilePresent: Bool? = nil,
++        screenID: String? = nil,
+         screenSize: (() -> CGSize?)? = nil,
++        heldDragProfile: HeldDragProfile.Selection = .load(),
+         inputIsAllowed: @escaping () -> Bool = { true },
+         sleep: @escaping (TimeInterval) -> Void = Thread.sleep(forTimeInterval:),
+         reportSender: ((ReportID, [UInt8]) -> Void)? = nil,
+@@ -142,7 +176,9 @@ final class DeviceInput {
+         self.calibration = calibration
+         self.calibrationRequired = calibrationRequired
+         self.calibrationFilePresent = calibrationFilePresent ?? calibrationRequired
++        self.screenID = screenID
+         self.screenSize = screenSize
++        self.heldDragProfile = heldDragProfile
+         self.inputIsAllowed = inputIsAllowed
+         self.sleep = sleep
+         self.reportReadiness =
+@@ -197,6 +233,7 @@ extension DeviceInput {
+             guard step.isFinite, step > 0, (step * 2).isFinite,
+                 reportCount.isFinite, reportCount < Double(Int.max)
+             else { throw InputError.invalidSwipe(table.swipeReasonReportCount) }
++            _ = try activeHeldDragProfile()
+ 
+             let durations = swipeSegmentDurations(points: points, duration: duration)
+             // iOS synthesizes the touch on the relative collection only, and
+@@ -207,6 +244,11 @@ extension DeviceInput {
+             pause(step * 2)
+             beginEstimatedDrag(x: points[0].0, y: points[0].1)
+             button(down: true)
++            defer {
++                button(down: false)
++                pause(step)
++                endEstimatedDrag()
++            }
+             pause(step)
+             for (index, segmentDuration) in durations.enumerated() {
+                 let from = points[index]
+@@ -219,17 +261,15 @@ extension DeviceInput {
+                     let y = from.1 + (to.1 - from.1) * t
+                     let interval = segmentDuration / Double(steps)
+                     if calibration != nil {
+-                        dragMove(x, y, sequence: nil)
++                        try dragMove(x, y, sequence: nil)
+                         pause(interval)
+                     } else {
+-                        let movementWait = moveEstimatedDragPointer(x, y, sequence: nil)
++                        let movementWait = try moveEstimatedDragPointer(
++                            x, y, sequence: nil, finishing: i == steps)
+                         if interval > movementWait { pause(interval - movementWait) }
+                     }
+                 }
+             }
+-            button(down: false)
+-            pause(step)
+-            endEstimatedDrag()
+         }
+     }
+ 
+@@ -476,7 +516,7 @@ extension DeviceInput {
+         if let calibration {
+             moveCalibratedPointer(point.x, point.y, calibration: calibration, sequence: sequence, isReady: isReady)
+         } else if isReady() {
+-            moveAbsolutePointer(point.x, point.y, sequence: sequence)
++            moveAbsolutePointer(point.x, point.y, sequence: sequence, isReady: isReady)
+         }
+     }
+ 
+@@ -498,6 +538,8 @@ extension DeviceInput {
+         discardPendingMotion()
+         queue.async {
+             guard !self.windowDragging, self.coordinateMappingAvailable else { return }
++            do { _ = try self.activeHeldDragProfile() }
++            catch { log("held drag rejected: \(error)"); return }
+             self.windowDragging = true
+             // Position through the absolute collection, then press on the
+             // relative collection: iOS synthesizes the touch there.
+@@ -515,7 +557,8 @@ extension DeviceInput {
+             guard self.windowDragging,
+                 self.motionSequence.isCurrent(sequence)
+             else { return }
+-            self.dragMove(x, y, sequence: sequence)
++            do { try self.dragMove(x, y, sequence: sequence) }
++            catch { self.rejectWindowDrag(error) }
+         }
+     }
+ 
+@@ -523,13 +566,21 @@ extension DeviceInput {
+         discardPendingMotion()
+         queue.async {
+             guard self.windowDragging else { return }
+-            self.dragMove(x, y, sequence: nil)
++            do { try self.dragMove(x, y, sequence: nil, finishing: true) }
++            catch { self.rejectWindowDrag(error); return }
+             self.button(down: false)
+             self.windowDragging = false
+             self.endEstimatedDrag()
+         }
+     }
+ 
++    private func rejectWindowDrag(_ error: Error) {
++        log("held drag stopped: \(error)")
++        button(down: false)
++        windowDragging = false
++        endEstimatedDrag()
++    }
++
+     /// Always clear the phone-side button state when the window loses focus or
+     /// the mouse interaction is cancelled outside the view.
+     func cancelPointer() {
+@@ -728,28 +779,33 @@ extension DeviceInput {
+         }
+     }
+ 
+-    fileprivate func moveAbsolutePointer(_ x: Double, _ y: Double, sequence: UInt64?) {
+-        guard shouldContinueMotion(sequence) else { return }
++    fileprivate func moveAbsolutePointer(
++        _ x: Double, _ y: Double, sequence: UInt64?, isReady: () -> Bool = { true }
++    ) {
++        guard shouldContinueMotion(sequence), isReady() else { return }
+         let max = Double(HIDReportMap.absoluteMax)
+         let px = UInt16(Swift.max(0, Swift.min(max, (x * max).rounded())))
+         let py = UInt16(Swift.max(0, Swift.min(max, (y * max).rounded())))
+-        if buttons == 0, relativeMotionSinceAbsoluteReport,
+-            let previous = lastAbsoluteReportPosition, previous.x == px, previous.y == py
+-        {
++        let repeatsAfterRelativeMotion = relativeMotionSinceAbsoluteReport
++            && lastAbsoluteReportPosition.map { $0.x == px && $0.y == py } == true
++        if buttons == 0, lastAbsoluteReportPosition == nil || repeatsAfterRelativeMotion {
+             // iOS can ignore an unchanged absolute report even after relative
+-            // reports moved its pointer. Reassert both axes through a nearby,
++            // reports moved its pointer. A recreated input also has no knowledge
++            // of the phone's last report (for example after quiet capture restarts).
++            // Reassert both axes through a nearby,
+             // button-up coordinate before returning to the exact requested one.
+             let size = screenSize?()
+             let nx = Self.absoluteResetNeighbor(px, screenDimension: size.map { Double($0.width) })
+             let ny = Self.absoluteResetNeighbor(py, screenDimension: size.map { Double($0.height) })
+             absolutePointerPosition = (nx, ny)
+             send(.absolutePointer, HIDReportPayload.absolutePointer(buttons: 0, x: nx, y: ny))
++            guard shouldContinueMotion(sequence), isReady() else { return }
+             // A neutral relative report is also an ordering barrier: the HID
+             // pending queue coalesces consecutive absolute hovers under pressure.
+             // No press is held here, so this neither clicks nor releases a drag.
+             send(.relativeMouse, HIDReportPayload.relativeMouse(buttons: 0))
+             pause(step)
+-            guard shouldContinueMotion(sequence), buttons == 0 else { return }
++            guard shouldContinueMotion(sequence), isReady(), buttons == 0 else { return }
+         }
+         absolutePointerPosition = (px, py)
+         send(.absolutePointer, HIDReportPayload.absolutePointer(buttons: buttons, x: px, y: py))
+@@ -775,11 +831,11 @@ extension DeviceInput {
+     /// Absolute reports can never carry this movement: iOS pins the touch to
+     /// the relative collection, and absolute pointer moves — with or without
+     /// button bits — do not move it (verified on iOS 26).
+-    fileprivate func dragMove(_ x: Double, _ y: Double, sequence: UInt64?) {
++    fileprivate func dragMove(_ x: Double, _ y: Double, sequence: UInt64?, finishing: Bool = false) throws {
+         if let calibration {
+             moveCalibratedPointer(x, y, calibration: calibration, sequence: sequence)
+         } else {
+-            moveEstimatedDragPointer(x, y, sequence: sequence)
++            try moveEstimatedDragPointer(x, y, sequence: sequence, finishing: finishing)
+         }
+     }
+ 
+@@ -814,12 +870,15 @@ extension DeviceInput {
+     /// value in the built-in curve.
+     static let estimatedDragMaxCount = 32
+ 
+-    /// Follows the drag target with combined relative X/Y reports. Each axis picks the count whose
+-    /// curve-predicted distance best covers the remaining error, so slow and
+-    /// fast drags track the mouse at the same fidelity; each new target
+-    /// corrects whatever the real curve did differently.
++    /// Without a held-only profile, preserve the upstream estimated curve.
++    /// Its position is predicted from reports, not corrected by observation.
+     @discardableResult
+-    fileprivate func moveEstimatedDragPointer(_ x: Double, _ y: Double, sequence: UInt64?) -> TimeInterval {
++    fileprivate func moveEstimatedDragPointer(
++        _ x: Double, _ y: Double, sequence: UInt64?, finishing: Bool = false
++    ) throws -> TimeInterval {
++        if let profile = try activeHeldDragProfile() {
++            return try moveMeasuredDragPointer(x, y, profile: profile, sequence: sequence, finishing: finishing)
++        }
+         guard shouldContinueMotion(sequence),
+             let size = screenSize?(),
+             var position = dragPosition
+@@ -870,6 +929,49 @@ extension DeviceInput {
+         return movementWait
+     }
+ 
++    /// A configured bad or stale profile blocks only held movement. Native
++    /// absolute move/tap and keyboard input remain available for recovery.
++    private func activeHeldDragProfile() throws -> HeldDragProfile? {
++        guard calibration == nil else { return nil }
++        switch heldDragProfile {
++        case .notConfigured: return nil
++        case .invalid(let issue): throw InputError.heldDragProfileUnavailable(issue)
++        case .loaded(let profile):
++            if let issue = profile.bindingIssue(host: host, screenID: screenID, size: screenSize?(), interval: step) {
++                throw InputError.heldDragProfileUnavailable(issue)
++            }
++            return profile
++        }
++    }
++
++    private func moveMeasuredDragPointer(
++        _ x: Double, _ y: Double, profile: HeldDragProfile, sequence: UInt64?, finishing: Bool
++    ) throws -> TimeInterval {
++        guard shouldContinueMotion(sequence), var position = dragPosition else { return 0 }
++        let size = CGSize(width: profile.screenWidth, height: profile.screenHeight)
++        let target = CGPoint(
++            x: max(0, min(size.width - 1, x * size.width)),
++            y: max(0, min(size.height - 1, y * size.height)))
++        var movementWait: TimeInterval = 0
++        while shouldContinueMotion(sequence) {
++            _ = try activeHeldDragProfile()
++            guard let movement = profile.movement(from: position, to: target, finishing: finishing) else { break }
++            relative(movement.dx, movement.dy)
++            position = CGPoint(
++                x: max(0, min(size.width - 1, movement.position.x)),
++                y: max(0, min(size.height - 1, movement.position.y)))
++            dragPosition = position
++            let unit = Double(HIDReportMap.absoluteMax)
++            absolutePointerPosition = (
++                UInt16((position.x / size.width * unit).rounded()),
++                UInt16((position.y / size.height * unit).rounded()))
++            pause(profile.reportInterval)
++            movementWait += profile.reportInterval
++            if !finishing { break }
++        }
++        return movementWait
++    }
++
+     fileprivate func shouldContinueMotion(_ sequence: UInt64?) -> Bool {
+         guard !isRetired, inputIsAllowed() else {
+             clearPointerEstimate()
+@@ -977,6 +1079,7 @@ extension DeviceInput {
+         case unknownKey(String)
+         case pointerBusy
+         case calibrationMismatch
++        case heldDragProfileUnavailable(String)
+         case invalidSwipe(String)
+         case pairingProbeUnavailable
+ 
+@@ -987,6 +1090,7 @@ extension DeviceInput {
+             case .unknownKey(let k): table.unknownKey(k)
+             case .pointerBusy: table.pointerBusy
+             case .calibrationMismatch: table.calibrationMismatch
++            case .heldDragProfileUnavailable(let reason): "Held-drag profile unavailable: \(reason)"
+             case .invalidSwipe(let reason): table.invalidSwipePrefix(reason)
+             case .pairingProbeUnavailable: table.pairingProbeUnavailable
+             }
+diff --git a/Sources/iPhoneUse/Input/HeldDragProfile.swift b/Sources/iPhoneUse/Input/HeldDragProfile.swift
+new file mode 100644
+index 0000000..5ac861a
+--- /dev/null
++++ b/Sources/iPhoneUse/Input/HeldDragProfile.swift
+@@ -0,0 +1,102 @@
++import Foundation
++
++/// Optional, local measurements of button-held relative reports. This is not
++/// a pointer calibration: button-up positioning remains native absolute, and
++/// these samples must never be reused as a hover curve or scaled to a screen.
++struct HeldDragProfile: Codable {
++    struct Sample: Codable, Equatable {
++        let count: Int
++        let distance: Double
++    }
++
++    let schemaVersion: Int
++    let host: UUID
++    let screenID: String
++    let screenWidth: Int
++    let screenHeight: Int
++    /// Requested driver pacing used while measuring, not phone event latency.
++    let reportInterval: TimeInterval
++    let samples: [Sample]
++
++    enum Selection {
++        case notConfigured
++        case invalid(String)
++        case loaded(HeldDragProfile)
++
++        static func load(environment: [String: String] = ProcessInfo.processInfo.environment) -> Selection {
++            guard let path = environment["IPHONE_USE_HELD_DRAG_PROFILE"] else { return .notConfigured }
++            guard !path.isEmpty else { return .invalid("profile path is empty") }
++            do {
++                let profile = try JSONDecoder().decode(
++                    HeldDragProfile.self, from: Data(contentsOf: URL(fileURLWithPath: path)))
++                if let issue = profile.validationIssue { return .invalid(issue) }
++                return .loaded(profile)
++            } catch {
++                return .invalid("cannot read held-drag profile: \(error)")
++            }
++        }
++    }
++
++    var validationIssue: String? {
++        guard schemaVersion == 1 else { return "unsupported schemaVersion" }
++        guard !screenID.isEmpty, screenWidth > 0, screenHeight > 0 else {
++            return "screen identity and dimensions are required"
++        }
++        guard reportInterval.isFinite, (0.01...0.1).contains(reportInterval) else {
++            return "reportInterval must be between 0.01 and 0.1 seconds"
++        }
++        guard samples.first?.count == 1 else { return "samples must begin with measured count 1" }
++        var previous = Sample(count: 0, distance: 0)
++        for sample in samples {
++            guard (1...127).contains(sample.count), sample.count > previous.count,
++                sample.distance.isFinite, sample.distance > previous.distance
++            else { return "sample counts and positive distances must be strictly increasing" }
++            previous = sample
++        }
++        return nil
++    }
++
++    func bindingIssue(host: UUID, screenID: String?, size: CGSize?, interval: TimeInterval) -> String? {
++        if let issue = validationIssue { return issue }
++        guard self.host == host else { return "Bluetooth host does not match profile" }
++        guard self.screenID == screenID else { return "capture screen ID does not match profile" }
++        guard let size, size.width == Double(screenWidth), size.height == Double(screenHeight) else {
++            return "live capture dimensions do not match profile"
++        }
++        guard interval.isFinite, abs(reportInterval - interval) < 0.000_001 else {
++            return "driver report interval does not match profile"
++        }
++        return nil
++    }
++
++    struct Movement {
++        let dx: Int
++        let dy: Int
++        let position: CGPoint
++    }
++
++    /// Send only measured counts and one axis at a time. Intermediate targets
++    /// carry their residual to the next frame rather than emitting a chain of
++    /// tiny correction reports. Segment endpoints finish within half count 1;
++    /// no large overshoot is allowed at a corner or release point.
++    func movement(from position: CGPoint, to target: CGPoint, finishing: Bool) -> Movement? {
++        let tolerance = samples[0].distance / 2
++        let errors = [target.x - position.x, target.y - position.y]
++        let axis = abs(errors[0]) >= abs(errors[1]) ? 0 : 1
++        let error = errors[axis]
++        guard abs(error) > tolerance else { return nil }
++        let candidates = samples.filter {
++            abs(abs(error) - $0.distance) < abs(error)
++                && (!finishing || $0.distance <= abs(error) + tolerance)
++        }
++        guard let sample = candidates.min(by: {
++            abs(abs(error) - $0.distance) < abs(abs(error) - $1.distance)
++        }) else { return nil }
++        let sign = error < 0 ? -1 : 1
++        let delta = Double(sign) * sample.distance
++        let count = sign * sample.count
++        var next = position
++        if axis == 0 { next.x += delta } else { next.y += delta }
++        return Movement(dx: axis == 0 ? count : 0, dy: axis == 1 ? count : 0, position: next)
++    }
++}
+diff --git a/Tests/iPhoneUseTests/Input/DeviceInputAbsoluteResetTests.swift b/Tests/iPhoneUseTests/Input/DeviceInputAbsoluteResetTests.swift
+index d5fe5be..d7c01f9 100644
+--- a/Tests/iPhoneUseTests/Input/DeviceInputAbsoluteResetTests.swift
++++ b/Tests/iPhoneUseTests/Input/DeviceInputAbsoluteResetTests.swift
+@@ -108,7 +108,7 @@ final class DeviceInputAbsoluteResetTests: XCTestCase {
+         XCTAssertEqual(phone.point, target)
+         XCTAssertEqual(phone.presses, [target])
+         let absolute = phone.delivered.filter { $0.0 == .absolutePointer }
+-        XCTAssertEqual(absolute.count, 3, "the reset neighbor must survive the production queue's coalescing")
++        XCTAssertEqual(absolute.count, 4, "initial priming and reset neighbors must survive queue coalescing")
+         XCTAssertTrue(absolute.allSatisfy { $0.1[0] == 0 })
+     }
+ 
+@@ -124,6 +124,31 @@ final class DeviceInputAbsoluteResetTests: XCTestCase {
+         XCTAssertEqual(phone.presses, [origin, origin])
+     }
+ 
++    func testKeyboardBetweenDragsPreservesAbsoluteResetState() throws {
++        let phone = AbsoluteResetHost()
++        let input = phone.input()
++        let origin = AbsoluteResetHost.target(0.3, 0.3)
++        try input.swipe(points: [(0.3, 0.3), (0.7, 0.6)], duration: 0.06)
++        try input.key("r", modifiers: ["cmd"])
++        try input.swipe(points: [(0.3, 0.3), (0.7, 0.6)], duration: 0.06)
++        XCTAssertEqual(phone.presses, [origin, origin])
++    }
++
++    func testRecreatedInputReanchorsSameOriginRetainedByPhone() throws {
++        let phone = AbsoluteResetHost()
++        let origin = AbsoluteResetHost.target(0.3, 0.3)
++        try phone.input().swipe(points: [(0.3, 0.3), (0.7, 0.6)], duration: 0.06)
++        XCTAssertNotEqual(phone.point, origin)
++        phone.congested = true
++
++        // The phone retains its prior absolute report and relative displacement,
++        // but a capture/session replacement starts with fresh local bookkeeping.
++        try phone.input().swipe(points: [(0.3, 0.3), (0.7, 0.6)], duration: 0.06)
++        phone.drain()
++
++        XCTAssertEqual(phone.presses, [origin, origin])
++    }
++
+     func testWindowDragThenTapOriginalPositionUsesLastAbsoluteReportNotDragEstimate() throws {
+         let phone = AbsoluteResetHost()
+         let input = phone.input()
+@@ -148,9 +173,9 @@ final class DeviceInputAbsoluteResetTests: XCTestCase {
+             try input.move(x: x, y: y)
+ 
+             let absolute = phone.delivered.filter { $0.0 == .absolutePointer }
+-            XCTAssertEqual(absolute.count, 3)
+-            guard absolute.count == 3 else { continue }
+-            let neighbor = AbsoluteResetHost.decode(absolute[1].1)
++            XCTAssertEqual(absolute.count, 4)
++            guard absolute.count == 4 else { continue }
++            let neighbor = AbsoluteResetHost.decode(absolute[2].1)
+             XCTAssertNotEqual(neighbor.x, target.x)
+             XCTAssertNotEqual(neighbor.y, target.y)
+             XCTAssertTrue((0...32767).contains(neighbor.x) && (0...32767).contains(neighbor.y))
+@@ -171,7 +196,7 @@ final class DeviceInputAbsoluteResetTests: XCTestCase {
+         try input.nudge(dx: 0, dy: 16, click: false)
+         try input.move(x: 0.6, y: 0.7)
+ 
+-        XCTAssertEqual(phone.delivered.filter { $0.0 == .absolutePointer }.count, 3)
++        XCTAssertEqual(phone.delivered.filter { $0.0 == .absolutePointer }.count, 4)
+         XCTAssertEqual(phone.point, AbsoluteResetHost.target(0.6, 0.7))
+     }
+ 
+@@ -180,7 +205,7 @@ final class DeviceInputAbsoluteResetTests: XCTestCase {
+         var invalidateOnReset = false
+         let input = phone.input { _ in
+             if invalidateOnReset,
+-                phone.offered.filter({ $0.0 == .absolutePointer }).count == 2
++                phone.offered.filter({ $0.0 == .absolutePointer }).count == 3
+             {
+                 phone.allowed = false
+             }
+@@ -191,7 +216,7 @@ final class DeviceInputAbsoluteResetTests: XCTestCase {
+ 
+         try input.tap(x: 0.4, y: 0.3)
+ 
+-        XCTAssertEqual(phone.offered.filter { $0.0 == .absolutePointer }.count, 2)
++        XCTAssertEqual(phone.offered.filter { $0.0 == .absolutePointer }.count, 3)
+         XCTAssertTrue(phone.presses.isEmpty)
+         XCTAssertTrue(phone.offered.suffix(2).allSatisfy { $0.0 == .relativeMouse && $0.1 == [0, 0, 0, 0] })
+         invalidateOnReset = false
+@@ -206,7 +231,7 @@ final class DeviceInputAbsoluteResetTests: XCTestCase {
+         var input: DeviceInput!
+         input = phone.input { _ in
+             if cancelOnReset,
+-                phone.offered.filter({ $0.0 == .absolutePointer }).count == 2
++                phone.offered.filter({ $0.0 == .absolutePointer }).count == 3
+             {
+                 cancelOnReset = false
+                 input.cancelPointer()
+@@ -222,7 +247,7 @@ final class DeviceInputAbsoluteResetTests: XCTestCase {
+         try input.type("")
+         try input.type("")
+ 
+-        XCTAssertEqual(phone.offered.filter { $0.0 == .absolutePointer }.count, 2)
++        XCTAssertEqual(phone.offered.filter { $0.0 == .absolutePointer }.count, 3)
+         XCTAssertNotEqual(phone.point, AbsoluteResetHost.target(0.4, 0.3))
+         XCTAssertTrue(phone.presses.isEmpty)
+         try input.move(x: 0.6, y: 0.7)
+diff --git a/Tests/iPhoneUseTests/Input/DeviceInputPointerTests.swift b/Tests/iPhoneUseTests/Input/DeviceInputPointerTests.swift
+index d98196c..3b00a8c 100644
+--- a/Tests/iPhoneUseTests/Input/DeviceInputPointerTests.swift
++++ b/Tests/iPhoneUseTests/Input/DeviceInputPointerTests.swift
+@@ -8,6 +8,22 @@ private func curveStep(_ byte: UInt8) -> Double {
+     return Double(count.signum()) * DeviceInput.estimatedDragCurve[abs(count)]
+ }
+ 
++// Fresh input has unknown phone-side absolute state. Verify its two-report
++// priming prefix separately, then keep the existing gesture assertions focused
++// on the requested target, held movement, and release.
++private func removeInitialAbsolutePrime(_ reports: inout [(ReportID, [UInt8])]) {
++    XCTAssertGreaterThanOrEqual(reports.count, 3)
++    guard reports.count >= 3 else { return }
++    XCTAssertEqual(reports[0].0, .absolutePointer)
++    XCTAssertEqual(reports[0].1[0], 0)
++    XCTAssertEqual(reports[1].0, .relativeMouse)
++    XCTAssertEqual(reports[1].1, [0, 0, 0, 0])
++    XCTAssertEqual(reports[2].0, .absolutePointer)
++    XCTAssertNotEqual(Array(reports[0].1[1...2]), Array(reports[2].1[1...2]))
++    XCTAssertNotEqual(Array(reports[0].1[3...4]), Array(reports[2].1[3...4]))
++    reports.removeFirst(2)
++}
++
+ final class DeviceInputPointerTests: XCTestCase {
+     func testCaptureRecheckRetainsBluetoothReadinessButBlocksInputUntilConfirmed() throws {
+         var allowed = true
+@@ -25,7 +41,7 @@ final class DeviceInputPointerTests: XCTestCase {
+         allowed = true
+         try input.move(x: 0.5, y: 0.5)
+         XCTAssertTrue(input.isPointerReady)
+-        XCTAssertEqual(reports.filter { $0.0 == .absolutePointer }.count, 1)
++        XCTAssertEqual(reports.filter { $0.0 == .absolutePointer }.count, 2)
+     }
+ 
+     func testUnverifiedCaptureRejectsCoordinatesAndRawMovement() throws {
+@@ -58,6 +74,7 @@ final class DeviceInputPointerTests: XCTestCase {
+         input.cancelPointer()
+         try input.nudge(dx: 0, dy: 0, click: false)
+ 
++        removeInitialAbsolutePrime(&reports)
+         XCTAssertEqual(reports.map { $0.0 }, [.absolutePointer, .relativeMouse, .relativeMouse])
+         XCTAssertEqual(reports[1].1, [1, 0, 0, 0])
+         XCTAssertEqual(reports[2].1, [0, 0, 0, 0])
+@@ -158,10 +175,11 @@ final class DeviceInputPointerTests: XCTestCase {
+             calibration: nil, firstPoint: CGPoint(x: 0.3, y: 0.35), secondPoint: CGPoint(x: 0.7, y: 0.65),
+             returnToStart: true, thirdPoint: CGPoint(x: 0.5, y: 0.5), wait: 0, isReady: { true },
+             capture: { [UInt8(reports.count)] })
+-        XCTAssertEqual(frames.before, [2])
+-        XCTAssertEqual(frames.after, [3])
+-        XCTAssertEqual(frames.intermediate, [4])
+-        XCTAssertEqual(frames.returned, [5])
++        removeInitialAbsolutePrime(&reports)
++        XCTAssertEqual(frames.before, [4])
++        XCTAssertEqual(frames.after, [5])
++        XCTAssertEqual(frames.intermediate, [6])
++        XCTAssertEqual(frames.returned, [7])
+         XCTAssertEqual(reports.count, 5)
+         XCTAssertTrue(reports.allSatisfy { $0.0 == .absolutePointer && $0.1[0] == 0 })
+         XCTAssertEqual(reports[0].1, reports[3].1, "wake-up visits a different coordinate before the first capture")
+@@ -264,6 +282,8 @@ final class DeviceInputPointerTests: XCTestCase {
+ 
+         try input.swipe(points: [(0, 0), (1, 1)], duration: 0.5)
+ 
++        removeInitialAbsolutePrime(&reports)
++        XCTAssertEqual(pauses.removeFirst(), input.step)
+         // One absolute hover positions the pointer; the press, movement and
+         // release all carry the touch on the relative collection.
+         XCTAssertEqual(reports.filter { $0.0 == .absolutePointer }.map { $0.1 }, [[0, 0, 0, 0, 0]])
+@@ -302,6 +322,7 @@ final class DeviceInputPointerTests: XCTestCase {
+             })
+         input.step = 0.125
+         try input.swipe(points: [(0.5, 0.5), (0.501, 0.501)], duration: 0.6)
++        XCTAssertEqual(pauses.removeFirst(), input.step)
+         XCTAssertGreaterThan(movementCount, 0)
+         XCTAssertTrue(pauses.dropFirst(2).dropLast().contains { $0 > 0 && $0 < input.step })
+         XCTAssertEqual(pauses.dropFirst(2).dropLast().reduce(0, +), 0.6, accuracy: 1e-12)
+@@ -322,6 +343,7 @@ final class DeviceInputPointerTests: XCTestCase {
+                 return [UInt8(captureCount)]
+             })
+ 
++        removeInitialAbsolutePrime(&reports)
+         XCTAssertEqual(captures.before, [1])
+         XCTAssertEqual(captures.after, [2])
+         XCTAssertEqual(captureCount, 2)
+@@ -348,7 +370,7 @@ final class DeviceInputPointerTests: XCTestCase {
+         XCTAssertEqual(captureCount, 0)
+     }
+ 
+-    func testAbsoluteCapabilityProbeReturnsWithExactlyThreeReportsAndCaptures() throws {
++    func testAbsoluteCapabilityProbeReturnsWithThreeReportsAndCapturesAfterInitialPrime() throws {
+         var reports: [(ReportID, [UInt8])] = []
+         var captureCount = 0
+         let input = DeviceInput(
+@@ -361,6 +383,7 @@ final class DeviceInputPointerTests: XCTestCase {
+                 captureCount += 1
+                 return [UInt8(captureCount)]
+             })
++        removeInitialAbsolutePrime(&reports)
+         XCTAssertEqual(captures.returned, [3])
+         XCTAssertEqual(captureCount, 3)
+         XCTAssertEqual(reports.map(\.0), [.absolutePointer, .absolutePointer, .absolutePointer])
+@@ -382,7 +405,7 @@ final class DeviceInputPointerTests: XCTestCase {
+                     if captureCount == 2 { input.cancelBackgroundMotion() }
+                     return [UInt8(captureCount)]
+                 }))
+-        XCTAssertEqual(reportCount, 2)
++        XCTAssertEqual(reportCount, 4)
+         XCTAssertEqual(captureCount, 2)
+     }
+ 
+@@ -429,6 +452,8 @@ final class DeviceInputPointerTests: XCTestCase {
+ 
+         try input.swipe(points: [(0, 0), (1, 0), (1, 1)], duration: 0.75)
+ 
++        removeInitialAbsolutePrime(&reports)
++        XCTAssertEqual(pauses.removeFirst(), input.step)
+         // One absolute hover; the whole drag runs on the relative collection.
+         XCTAssertEqual(reports.filter { $0.0 == .absolutePointer }.map { $0.1 }, [[0, 0, 0, 0, 0]])
+         XCTAssertEqual(reports.first { $0.0 == .relativeMouse }?.1, [1, 0, 0, 0])
+@@ -473,6 +498,8 @@ final class DeviceInputPointerTests: XCTestCase {
+ 
+             try input.swipe(points: points, duration: 0.5)
+ 
++            removeInitialAbsolutePrime(&reports)
++            XCTAssertEqual(pauses.removeFirst(), input.step)
+             // One absolute hover, one press, one release — repeated or
+             // stationary points never add a second button transition.
+             XCTAssertEqual(reports.filter { $0.0 == .absolutePointer }.count, 1)
+@@ -529,6 +556,7 @@ final class DeviceInputPointerTests: XCTestCase {
+ 
+         try input.swipe(points: [(0, 0), (1, 0), (1, 1)], duration: .leastNonzeroMagnitude)
+ 
++        removeInitialAbsolutePrime(&reports)
+         // The estimated drag converges on every interpolated target, so even
+         // a near-zero duration still reaches both corners before releasing.
+         let movement = reports.filter { $0.0 == .relativeMouse }.dropFirst().dropLast()
+@@ -601,6 +629,7 @@ final class DeviceInputPointerTests: XCTestCase {
+         try input.nudge(dx: 0, dy: 0, click: false)
+         try input.tap(x: 0.5, y: 0.5)
+ 
++        removeInitialAbsolutePrime(&reports)
+         XCTAssertEqual(
+             reports.map { $0.0 },
+             [
+@@ -625,6 +654,7 @@ final class DeviceInputPointerTests: XCTestCase {
+         // Wait for all asynchronous window reports without adding a movement.
+         try input.nudge(dx: 0, dy: 0, click: false)
+ 
++        removeInitialAbsolutePrime(&reports)
+         XCTAssertEqual(
+             reports.dropFirst(3).map { $0.0 },
+             [
+@@ -649,6 +679,7 @@ final class DeviceInputPointerTests: XCTestCase {
+         input.release(x: 1, y: 1)
+         try input.nudge(dx: 0, dy: 0, click: false)
+ 
++        removeInitialAbsolutePrime(&reports)
+         // The queued drags are superseded; the release positions the pointer.
+         // One absolute hover, then a wholly relative drag to the release point.
+         XCTAssertEqual(reports.first?.1, [0, 0, 0, 0, 0])
+@@ -711,6 +742,7 @@ final class DeviceInputPointerTests: XCTestCase {
+                 }
+             }
+         }
++        removeInitialAbsolutePrime(&reports)
+         XCTAssertEqual(reports.count, 2)
+         input.release(x: 0.5, y: 0.5)
+         try input.tap(x: 1, y: 1)
+@@ -730,6 +762,7 @@ final class DeviceInputPointerTests: XCTestCase {
+         input.release(x: 1, y: 1)
+         try input.tap(x: 0.5, y: 0.5)
+ 
++        removeInitialAbsolutePrime(&reports)
+         XCTAssertEqual(
+             reports.map { $0.0 },
+             [
+@@ -749,8 +782,12 @@ final class DeviceInputPointerTests: XCTestCase {
+         let input = DeviceInput(
+             host: UUID(), session: UUID(),
+             reportSender: { id, bytes in
+-                XCTAssertEqual(id, .absolutePointer)
+-                positions.append(bytes)
++                if id == .absolutePointer {
++                    positions.append(bytes)
++                } else {
++                    XCTAssertEqual(id, .relativeMouse)
++                    XCTAssertEqual(bytes, [0, 0, 0, 0])
++                }
+             })
+         input.positionPointer(x: 0, y: 0)
+         input.positionPointer(x: 0.5, y: 0.5)
+@@ -758,7 +795,7 @@ final class DeviceInputPointerTests: XCTestCase {
+         try input.nudge(dx: 0, dy: 0, click: false)
+ 
+         XCTAssertEqual(positions.last, [0, 255, 127, 255, 127])
+-        XCTAssertLessThanOrEqual(positions.count, 3)
++        XCTAssertLessThanOrEqual(positions.count, 4)
+     }
+ 
+     func testInvalidatedCalibratedEstimateHomesBeforeNextWindowMove() throws {
+diff --git a/Tests/iPhoneUseTests/Input/HeldDragProfileTests.swift b/Tests/iPhoneUseTests/Input/HeldDragProfileTests.swift
+new file mode 100644
+index 0000000..338ff79
+--- /dev/null
++++ b/Tests/iPhoneUseTests/Input/HeldDragProfileTests.swift
+@@ -0,0 +1,208 @@
++import XCTest
++
++@testable import iPhoneUse
++
++private final class HeldDragRecorder {
++    let host = UUID()
++    let screenID = "held-drag-test-phone"
++    var size = CGSize(width: 1180, height: 2556)
++    var reports: [(ReportID, [UInt8])] = []
++    var position = CGPoint.zero
++    var presses: [CGPoint] = []
++    var heldPositions: [CGPoint] = []
++    var buttons: UInt8 = 0
++    var onReport: (() -> Void)?
++
++    var profile: HeldDragProfile {
++        HeldDragProfile(
++            schemaVersion: 1, host: host, screenID: screenID, screenWidth: 1180, screenHeight: 2556,
++            reportInterval: 0.03,
++            samples: zip([1, 2, 4, 8, 16, 32], [0.625, 1.21875, 5.71875, 17.75, 41.75, 117.25])
++                .map { .init(count: $0.0, distance: $0.1) })
++    }
++
++    func input(selection: HeldDragProfile.Selection? = nil, screenID: String? = nil) -> DeviceInput {
++        DeviceInput(
++            host: host, session: UUID(), screenID: screenID ?? self.screenID,
++            screenSize: { self.size }, heldDragProfile: selection ?? .loaded(profile),
++            sleep: { _ in }, reportSender: receive)
++    }
++
++    func receive(_ id: ReportID, _ bytes: [UInt8]) {
++        reports.append((id, bytes))
++        if id == .absolutePointer {
++            position = CGPoint(
++                x: Double(Int(bytes[1]) | Int(bytes[2]) << 8) / 32767 * 1180,
++                y: Double(Int(bytes[3]) | Int(bytes[4]) << 8) / 32767 * 2556)
++        } else if id == .relativeMouse {
++            if bytes[0] != 0, buttons == 0 { presses.append(position) }
++            buttons = bytes[0]
++            let dx = Int(Int8(bitPattern: bytes[1]))
++            let dy = Int(Int8(bitPattern: bytes[2]))
++            for (axis, count) in [(0, dx), (1, dy)] where count != 0 {
++                guard let sample = profile.samples.first(where: { $0.count == abs(count) }) else {
++                    XCTFail("driver emitted an unmeasured count \(count)")
++                    continue
++                }
++                let distance = Double(count.signum()) * sample.distance
++                if axis == 0 { position.x += distance } else { position.y += distance }
++            }
++            if buttons != 0 { heldPositions.append(position) }
++        }
++        onReport?()
++    }
++
++    var movement: [[UInt8]] {
++        reports.compactMap { id, bytes in
++            id == .relativeMouse && (bytes[1] != 0 || bytes[2] != 0) ? bytes : nil
++        }
++    }
++}
++
++final class HeldDragProfileTests: XCTestCase {
++    func testLoaderDistinguishesAbsentInvalidAndLoadedFiles() throws {
++        guard case .notConfigured = HeldDragProfile.Selection.load(environment: [:]) else {
++            return XCTFail("absent environment must preserve estimated drag")
++        }
++        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
++        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
++        defer { try? FileManager.default.removeItem(at: directory) }
++        let url = directory.appendingPathComponent("held.json")
++        let env = ["IPHONE_USE_HELD_DRAG_PROFILE": url.path]
++        guard case .invalid = HeldDragProfile.Selection.load(environment: env) else {
++            return XCTFail("missing configured file must be explicit")
++        }
++        let profile = HeldDragRecorder().profile
++        try JSONEncoder().encode(profile).write(to: url)
++        guard case .loaded(let loaded) = HeldDragProfile.Selection.load(environment: env) else {
++            return XCTFail("valid profile was not loaded")
++        }
++        XCTAssertEqual(loaded.samples, profile.samples)
++        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
++        for invalidSamples in [
++            [], [["count": 2, "distance": 1.2]],
++            [["count": 1, "distance": 0]],
++            [["count": 1, "distance": 1], ["count": 1, "distance": 2]],
++            [["count": 1, "distance": 1], ["count": 2, "distance": 0.5]],
++            [["count": 1, "distance": 1], ["count": 128, "distance": 2]],
++        ] as [[[String: Any]]] {
++            json["samples"] = invalidSamples
++            try JSONSerialization.data(withJSONObject: json).write(to: url)
++            guard case .invalid = HeldDragProfile.Selection.load(environment: env) else {
++                XCTFail("invalid sample table was accepted: \(invalidSamples)")
++                continue
++            }
++        }
++    }
++
++    func testProfileBindingRequiresExactHostScreenDimensionsAndPacing() {
++        let recorder = HeldDragRecorder()
++        let profile = recorder.profile
++        XCTAssertNil(profile.bindingIssue(host: recorder.host, screenID: recorder.screenID, size: recorder.size, interval: 0.03))
++        for (host, screen, size, interval) in [
++            (UUID(), recorder.screenID, recorder.size, 0.03),
++            (recorder.host, "different", recorder.size, 0.03),
++            (recorder.host, recorder.screenID, CGSize(width: 2556, height: 1180), 0.03),
++            (recorder.host, recorder.screenID, recorder.size, 0.075),
++        ] {
++            XCTAssertNotNil(profile.bindingIssue(host: host, screenID: screen, size: size, interval: interval))
++        }
++        XCTAssertNotNil(profile.bindingIssue(host: recorder.host, screenID: nil, size: recorder.size, interval: 0.03))
++        XCTAssertNotNil(profile.bindingIssue(host: recorder.host, screenID: recorder.screenID, size: nil, interval: 0.03))
++    }
++
++    func testMeasuredHeldReportsReachEndpointsAtDifferentSpeedsAndDirections() throws {
++        for (dx, dy, duration) in [
++            (0.0, 93.56, 0.48), (0, 151.49, 0.24), (0, 269.85, 0.12),
++            (0, -269.85, 0.12), (160, 0, 0.24), (-160, 0, 0.24),
++            (130, 180, 0.24),
++        ] {
++            let recorder = HeldDragRecorder()
++            let input = recorder.input()
++            let start = (231.0 / 462, 420.0 / 1000)
++            let end = ((231 + dx) / 462, (420 + dy) / 1000)
++            try input.swipe(points: [start, end], duration: duration)
++
++            XCTAssertEqual(recorder.position.x, end.0 * 1180, accuracy: 0.36)
++            XCTAssertEqual(recorder.position.y, end.1 * 2556, accuracy: 0.36)
++            XCTAssertEqual(recorder.buttons, 0)
++            XCTAssertEqual(recorder.presses.count, 1)
++            XCTAssertTrue(recorder.movement.allSatisfy { $0[0] == 1 && ($0[1] == 0 || $0[2] == 0) })
++            XCTAssertLessThanOrEqual(recorder.movement.count, Int(duration / 0.03) + 16,
++                "intermediate targets must not each trigger count-1 correction chains")
++            let status = try XCTUnwrap(input.pointerStatus["heldDrag"] as? [String: Any])
++            XCTAssertEqual(status["profileState"] as? String, "loaded")
++            XCTAssertEqual(status["mode"] as? String, "measured")
++        }
++    }
++
++    func testMeasuredPolylineReachesCornerBeforeTurningAndWindowReleaseFinishes() throws {
++        let recorder = HeldDragRecorder()
++        let input = recorder.input()
++        try input.swipe(points: [(0.3, 0.3), (0.6, 0.3), (0.6, 0.6)], duration: 0.12)
++        let turn = try XCTUnwrap(recorder.heldPositions.first { abs($0.y - 0.3 * 2556) > 0.1 })
++        XCTAssertEqual(turn.x, 0.6 * 1180, accuracy: 0.36)
++        XCTAssertEqual(recorder.position.y, 0.6 * 2556, accuracy: 0.36)
++        input.press(x: 0.2, y: 0.2)
++        input.drag(x: 0.5, y: 0.4)
++        input.release(x: 0.7, y: 0.6)
++        try input.type("")
++        XCTAssertEqual(recorder.position.x, 0.7 * 1180, accuracy: 0.36)
++        XCTAssertEqual(recorder.position.y, 0.6 * 2556, accuracy: 0.36)
++        XCTAssertEqual(recorder.buttons, 0)
++    }
++
++    func testInvalidOrMismatchedHeldProfileRejectsOnlyHeldGesturesBeforeReports() throws {
++        for selection in [HeldDragProfile.Selection.invalid("broken file"), .loaded(HeldDragRecorder().profile)] {
++            let recorder = HeldDragRecorder()
++            let input = recorder.input(selection: selection)
++            XCTAssertThrowsError(try input.swipe(points: [(0.3, 0.3), (0.6, 0.6)], duration: 0.12))
++            input.press(x: 0.3, y: 0.3)
++            try input.type("")
++            XCTAssertTrue(recorder.reports.isEmpty)
++            try input.tap(x: 0.3, y: 0.3, hold: 0)
++            try input.move(x: 0.6, y: 0.6)
++            XCTAssertEqual(recorder.presses.count, 1)
++            XCTAssertTrue(recorder.movement.isEmpty)
++            let status = try XCTUnwrap(input.pointerStatus["heldDrag"] as? [String: Any])
++            XCTAssertEqual(status["mode"] as? String, "unavailable")
++        }
++    }
++
++    func testDimensionChangeWhileHeldReleasesAndReportsMismatch() throws {
++        let recorder = HeldDragRecorder()
++        let input = recorder.input()
++        recorder.onReport = {
++            if !recorder.movement.isEmpty { recorder.size = CGSize(width: 2556, height: 1180) }
++        }
++        XCTAssertThrowsError(try input.swipe(points: [(0.3, 0.3), (0.6, 0.6)], duration: 0.12))
++        XCTAssertEqual(recorder.movement.count, 1)
++        XCTAssertEqual(recorder.buttons, 0)
++        XCTAssertEqual(recorder.reports.last?.1, [0, 0, 0, 0])
++        let status = try XCTUnwrap(input.pointerStatus["heldDrag"] as? [String: Any])
++        XCTAssertEqual(status["profileState"] as? String, "mismatch")
++    }
++
++    func testMeasuredProfileLeavesAbsolutePositioningAndLegacyCalibrationSeparate() throws {
++        let recorder = HeldDragRecorder()
++        let input = recorder.input()
++        try input.move(x: 0.3, y: 0.3)
++        recorder.reports = []
++        try input.tap(x: 0.6, y: 0.6, hold: 0)
++        XCTAssertEqual(recorder.reports.map(\.0), [.absolutePointer, .relativeMouse, .relativeMouse])
++        XCTAssertTrue(recorder.movement.isEmpty)
++
++        let calibration = RelativePointerCalibration(
++            host: UUID(), screenWidth: 100, screenHeight: 200, reportInterval: 0.01,
++            distances: [0, 1, 3, 8, 20])
++        var reports: [ReportID] = []
++        let legacy = DeviceInput(
++            host: calibration.host, session: UUID(), calibration: calibration,
++            heldDragProfile: .invalid("does not belong to legacy relative mode"),
++            sleep: { _ in }, reportSender: { id, _ in reports.append(id) })
++        try legacy.swipe(points: [(0.2, 0.2), (0.4, 0.4)], duration: 0.06)
++        XCTAssertTrue(reports.allSatisfy { $0 == .relativeMouse })
++        let status = try XCTUnwrap(legacy.pointerStatus["heldDrag"] as? [String: Any])
++        XCTAssertEqual(status["mode"] as? String, "legacy-relative")
++    }
++}

@@ -1,0 +1,190 @@
+diff --git a/Sources/iPhoneUse/MCP/MCPServer.swift b/Sources/iPhoneUse/MCP/MCPServer.swift
+index ad341fc..4da946e 100644
+--- a/Sources/iPhoneUse/MCP/MCPServer.swift
++++ b/Sources/iPhoneUse/MCP/MCPServer.swift
+@@ -643,17 +643,9 @@ enum MCPServer {
+         if let reference = observation.frame?.referenceJSON { metadata["frame"] = reference }
+         var result =
+             observation.frame.map { screenshotContent($0, includeImage: includeImage, diff: diff) }
+-            ?? ["content": [["type": "text", "text": "Action acknowledged; no screen observation."]]]
+-        var content = result["content"] as? [[String: Any]] ?? []
+-        let encoded = try? JSONSerialization.data(withJSONObject: metadata, options: [.sortedKeys])
+-        let summary = encoded.map { String(decoding: $0, as: UTF8.self) } ?? "Observation metadata unavailable"
+-        if let index = content.lastIndex(where: { $0["type"] as? String == "text" }) {
+-            let prefix = content[index]["text"] as? String ?? ""
+-            content[index]["text"] = observation.reason == "disabled" ? summary : prefix + "\n" + summary
+-        } else {
+-            content.append(["type": "text", "text": summary])
+-        }
+-        result["content"] = content
++            ?? ["content": []]
++        // attach() adds the input/observation/app-result summary after it has
++        // assembled the final input receipt. Do not duplicate this metadata.
+         result["structuredContent"] = metadata
+         return result
+     }
+@@ -680,9 +672,13 @@ enum MCPServer {
+     private static func failure(_ message: String, inputNotSent: Bool = false) -> [String: Any] {
+         var result: [String: Any] = ["content": [["type": "text", "text": message]], "isError": true]
+         if inputNotSent {
+-            result["structuredContent"] = ["input_receipt": [
++            let metadata: [String: Any] = ["input_receipt": [
+                 "status": "not_sent", "requests_started": 0, "requests_acknowledged": 0,
+             ]]
++            result["structuredContent"] = metadata
++            if let summary = MCPResultSummary.text(metadata) {
++                result["content"] = [["type": "text", "text": message], ["type": "text", "text": summary]]
++            }
+         }
+         return result
+     }
+diff --git a/Sources/iPhoneUse/MCP/MCPContextStore.swift b/Sources/iPhoneUse/MCP/MCPContextStore.swift
+index e07a1e9..f21a579 100644
+--- a/Sources/iPhoneUse/MCP/MCPContextStore.swift
++++ b/Sources/iPhoneUse/MCP/MCPContextStore.swift
+@@ -379,12 +379,11 @@ final class MCPContextRecording {
+             metadata["input_receipt"] = receipt
+         }
+         result["structuredContent"] = metadata
+-        // Preserve existing OCR/action text exactly; context is a distinct data block.
++        // Format once from the final receipt, after partial/error aggregation.
++        // OCR, frames, original error/progress text and context stay distinct.
+         var content = result["content"] as? [[String: Any]] ?? []
+-        if inputFrameID != nil, let receipt = metadata["input_receipt"],
+-            let data = try? JSONSerialization.data(withJSONObject: ["input_receipt": receipt], options: [.sortedKeys])
+-        {
+-            content.append(["type": "text", "text": String(decoding: data, as: UTF8.self)])
++        if let summary = MCPResultSummary.text(metadata) {
++            content.append(["type": "text", "text": summary])
+         }
+         if includeCheckpoint || diagnostic != nil {
+             var extra: [String: Any] = ["session_activity": activity]
+diff --git a/Sources/iPhoneUse/MCP/MCPResultSummary.swift b/Sources/iPhoneUse/MCP/MCPResultSummary.swift
+new file mode 100644
+index 0000000..b6542c3
+--- /dev/null
++++ b/Sources/iPhoneUse/MCP/MCPResultSummary.swift
+@@ -0,0 +1,82 @@
++import Foundation
++
++/// Human-readable projection of the final receipt, never a new success verdict.
++/// Complete transport, observation, frame and error data remain structured.
++enum MCPResultSummary {
++    static func text(_ metadata: [String: Any]) -> String? {
++        guard let receipt = metadata["input_receipt"] as? [String: Any] else { return nil }
++        let transport = receipt["transport"] as? [String: Any] ?? [:]
++        let backend = transport["backend"] as? String
++        let route = backend.map { " (\($0))" } ?? ""
++        let input: String
++        switch receipt["status"] as? String {
++        case "sent_unverified":
++            input = "locally sent\(route); device delivery unverified"
++        case "acknowledged":
++            input = "request acknowledged; device delivery unverified"
++        case "not_sent":
++            input = transport["no_op"] as? Bool == true ? "no-op; nothing sent" : "not sent"
++        case "unconfirmed":
++            input = "unconfirmed\(route); may have executed"
++        default:
++            input = "status unknown; execution not established"
++        }
++        var lines = ["Input: \(input)."]
++        if let observation = metadata["observation"] as? [String: Any] {
++            if observation["status"] as? String == "unobserved",
++                observation["reason"] as? String == "disabled"
++            {
++                lines.append("Observation: not requested.")
++            } else {
++                let status: String
++                switch observation["status"] as? String {
++                case "changed": status = "change detected"
++                case "stable": status = "stable"
++                case "timeout": status = "wait timed out"
++                case "unobserved": status = "unobserved"
++                default: status = "status unknown"
++                }
++                let reason = (observation["reason"] as? String).map { " (\($0))" } ?? ""
++                lines.append(
++                    "Observation: \(status)\(reason); fresh=\(flag(observation["fresh"])), "
++                    + "changed=\(flag(observation["changed_from_baseline"])), "
++                    + "stable=\(flag(observation["visually_stable"])).")
++                if let detail = observation["detail"] as? String, !detail.isEmpty {
++                    lines.append("Observation detail: \(detail)")
++                }
++            }
++        } else {
++            lines.append("Observation: not recorded.")
++        }
++        // These routes do not evaluate an application-specific success condition.
++        lines.append("App result: unverified.")
++        if hasCleanupWarning(transport) {
++            lines.append("Cleanup: warning; details retained in input_receipt.transport.")
++        }
++        // Preserve transport-only failure descriptions without repeating the
++        // entire transport payload on every successful frame-bound action.
++        for key in ["reason", "error_type"] {
++            if let detail = transport[key] as? String, !detail.isEmpty {
++                lines.append("Input \(key): \(detail)")
++            }
++        }
++        return lines.joined(separator: "\n")
++    }
++
++    private static func flag(_ value: Any?) -> String {
++        guard let value = value as? Bool else { return "unknown" }
++        return value ? "yes" : "no"
++    }
++
++    private static func hasCleanupWarning(_ transport: [String: Any]) -> Bool {
++        let cleanup = transport["cleanup"] as? [String: Any] ?? [:]
++        if let errors = cleanup["errors"] as? [Any], !errors.isEmpty { return true }
++        if ["warning", "failed", "error"].contains(cleanup["status"] as? String ?? "") { return true }
++        if cleanup["subscription_stop"] as? String == "not-acknowledged" { return true }
++        if ["pairing_scratch_removed", "connection_closed", "tunnel_closed"].contains(where: {
++            cleanup[$0] as? Bool == false
++        }) { return true }
++        let release = transport["cleanup_release"] as? [String: Any]
++        return release?["status"] as? String == "unconfirmed"
++    }
++}
+diff --git a/Tests/iPhoneUseTests/MCP/MCPObservationTests.swift b/Tests/iPhoneUseTests/MCP/MCPObservationTests.swift
+index fe267c0..191ce8d 100644
+--- a/Tests/iPhoneUseTests/MCP/MCPObservationTests.swift
++++ b/Tests/iPhoneUseTests/MCP/MCPObservationTests.swift
+@@ -74,7 +74,9 @@ final class MCPObservationTests: XCTestCase {
+         XCTAssertEqual(metadata["app_completion"] as? String, "unverified")
+         let blocks = try XCTUnwrap(content["content"] as? [[String: Any]])
+         XCTAssertEqual(blocks.first?["data"] as? String, result.frame?.image.base64EncodedString())
+-        XCTAssertTrue(try XCTUnwrap(blocks.last?["text"] as? String).contains("\"status\":\"stable\""))
++        // The final input summary is rendered by MCPContextRecording.attach;
++        // this observation layer retains structured metadata without duplicating it.
++        XCTAssertFalse(blocks.compactMap { $0["text"] as? String }.joined().contains("\"observation\":"))
+     }
+ 
+     func testRepeatedSingleFreshFrameCannotEstablishStability() {
+diff --git a/Tests/PythonTests/test_mcp_stdio.py b/Tests/PythonTests/test_mcp_stdio.py
+index 91e8511..7ef11e4 100644
+--- a/Tests/PythonTests/test_mcp_stdio.py
++++ b/Tests/PythonTests/test_mcp_stdio.py
+@@ -543,7 +543,10 @@ class MCPStdioTests(unittest.TestCase):
+                  {"type": "key", "key": "enter"}]
+         result = self.exchange([("act", {"steps": steps, "device": "First", "observe": "none"})])[0]
+         self.assertNotIn("isError", result)
+-        metadata = json.loads(result["content"][0]["text"])
++        metadata = result["structuredContent"]
++        self.assertIn("Input: request acknowledged", result["content"][0]["text"])
++        self.assertIn("Observation: not requested.", result["content"][0]["text"])
++        self.assertIn("App result: unverified.", result["content"][0]["text"])
+         self.assertTrue(metadata["ok"])
+         self.assertTrue(metadata["action_acknowledged"])
+         self.assertEqual(metadata["observation"]["status"], "unobserved")
+@@ -600,7 +603,8 @@ class MCPStdioTests(unittest.TestCase):
+         self.assertNotIn("isError", full)
+         self.assertIn('"old" (20,30)', full["content"][1]["text"])
+         for result in (changed, unchanged):
+-            self.assertEqual([block["type"] for block in result["content"]], ["text"])
++            self.assertEqual([block["type"] for block in result["content"]], ["text", "text"])
++            self.assertTrue(result["content"][-1]["text"].startswith("Input:"))
+         self.assertIn("+new", changed["content"][0]["text"])
+         self.assertIn("-old", changed["content"][0]["text"])
+         self.assertIn("screenHash: b", changed["content"][0]["text"])

@@ -1,0 +1,466 @@
+diff --git a/Sources/iPhoneUse/Input/DeviceDisplayMapping.swift b/Sources/iPhoneUse/Input/DeviceDisplayMapping.swift
+index 29be4d0..2c01df2 100644
+--- a/Sources/iPhoneUse/Input/DeviceDisplayMapping.swift
++++ b/Sources/iPhoneUse/Input/DeviceDisplayMapping.swift
+@@ -82,6 +82,27 @@ struct DeviceDisplayMapping: Equatable {
+         else { throw DeviceError("Native display orientation does not match the current capture dimensions") }
+     }
+ 
++    /// Preserve the actual capture raster for exact measured-profile binding.
++    /// The observed quarter-turn chooses the axes; no aspect inference, scaling
++    /// or replacement of 1180 capture pixels with 1179 native pixels occurs.
++    func nativeCaptureSize(captureSize: CGSize?) throws -> CGSize {
++        try validate(captureSize: captureSize)
++        guard let captureSize else { throw DeviceError("Current capture dimensions are unavailable") }
++        return rotationDegrees == 90 || rotationDegrees == 270
++            ? CGSize(width: captureSize.height, height: captureSize.width) : captureSize
++    }
++
++    /// Inverse rotation for a relative vector. Unlike hidPoint, a displacement
++    /// has no origin translation. Counts keep their measured magnitudes.
++    func hidVector(dx: Int, dy: Int) -> (dx: Int, dy: Int) {
++        switch rotationDegrees {
++        case 90: (dy, -dx)
++        case 180: (-dx, -dy)
++        case 270: (-dy, dx)
++        default: (dx, dy)
++        }
++    }
++
+     /// Inverse of the phone's HID-to-display map. Coordinates remain normalized
+     /// to the visible capture everywhere above this absolute-report boundary.
+     func hidPoint(x: Double, y: Double) -> (x: Double, y: Double) {
+diff --git a/Sources/iPhoneUse/Input/DeviceInput.swift b/Sources/iPhoneUse/Input/DeviceInput.swift
+index 5aab2fb..6e97836 100644
+--- a/Sources/iPhoneUse/Input/DeviceInput.swift
++++ b/Sources/iPhoneUse/Input/DeviceInput.swift
+@@ -61,8 +61,8 @@ final class DeviceInput {
+     /// Cancelling the interaction or invalidating its mapping starts a new path.
+     private var relativeHomingReportIndex = 0
+     private var lastTrackingMovement: RelativePointerCalibration.Movement?
+-    /// Predicted pointer position in physical pixels while an uncalibrated
+-    /// drag runs on the relative collection. Nil outside a drag.
++    /// Predicted pointer position in visible-display physical pixels while an
++    /// uncalibrated drag runs on the relative collection. Nil outside a drag.
+     private var dragPosition: CGPoint?
+     private let motionSequence = PointerMotionSequence()
+     /// Cancellation may arrive while a window press is reading USB orientation.
+@@ -80,9 +80,13 @@ final class DeviceInput {
+     private let screenSize: (() -> CGSize?)?
+     private let heldDragProfile: HeldDragProfile.Selection
+     private let displayMappingProvider: (() throws -> DeviceDisplayMapping)?
+-    /// Queue-confined. Refresh at a gesture boundary; never change coordinate
+-    /// systems in the middle of a held touch.
+-    private var displayMapping: DeviceDisplayMapping?
++    /// Mutated only on the input queue, at a gesture boundary. The existing
++    /// lifecycle lock also permits a passive status snapshot without a USB read.
++    private var observedDisplayMapping: DeviceDisplayMapping?
++    private var displayMapping: DeviceDisplayMapping? {
++        get { lifecycleLock.withLock { observedDisplayMapping } }
++        set { lifecycleLock.withLock { observedDisplayMapping = newValue } }
++    }
+ 
+     /// A read-only snapshot for `/status`, including the curve actually loaded
+     /// in memory so diagnostics do not infer it from potentially stale files.
+@@ -131,15 +135,16 @@ final class DeviceInput {
+         let state: String
+         let reason: String?
+         var result: [String: Any] = [:]
++        // Use the same already-observed mapping and binding as preflight. This
++        // never queries USB; an unobserved or stale mapping is not held-ready.
++        do { _ = try activeHeldDragProfile(); reason = nil }
++        catch { reason = String(describing: error) }
+         switch heldDragProfile {
+         case .notConfigured:
+             state = "not-configured"
+-            reason = nil
+-        case .invalid(let issue):
++        case .invalid:
+             state = "invalid"
+-            reason = issue
+         case .loaded(let profile):
+-            reason = profile.bindingIssue(host: host, screenID: screenID, size: screenSize?(), interval: step)
+             state = reason == nil ? "loaded" : "mismatch"
+             result["host"] = profile.host.uuidString
+             result["screenID"] = profile.screenID
+@@ -149,9 +154,9 @@ final class DeviceInput {
+             result["samples"] = profile.samples.map { ["count": $0.count, "distance": $0.distance] as [String: Any] }
+         }
+         result["profileState"] = state
+-        result["mode"] = calibration != nil ? "legacy-relative"
++        result["mode"] = reason != nil ? "unavailable" : calibration != nil ? "legacy-relative"
+             : state == "loaded" ? "measured" : state == "not-configured" ? "estimated" : "unavailable"
+-        result["available"] = calibration != nil || reason == nil
++        result["available"] = coordinateMappingAvailable && reason == nil
+         if let reason { result["reason"] = reason }
+         return result
+     }
+@@ -977,28 +982,44 @@ extension DeviceInput {
+     /// A configured bad or stale profile blocks only held movement. Native
+     /// absolute move/tap and keyboard input remain available for recovery.
+     private func activeHeldDragProfile() throws -> HeldDragProfile? {
+-        guard calibration == nil else { return nil }
+-        let profile: HeldDragProfile?
++        let mapping = displayMapping
++        var bindingSize = screenSize?()
++        if displayMappingProvider != nil {
++            guard let mapping else {
++                throw InputError.heldDragProfileUnavailable("Native display mapping has not been observed for this gesture")
++            }
++            // Validate the frozen display geometry before transposing to native
++            // axes. Otherwise a mid-hold aspect change could appear to match the
++            // portrait profile while the old display mapping is still in use.
++            bindingSize = try mapping.nativeCaptureSize(captureSize: bindingSize)
++        }
++        if calibration != nil {
++            if let mapping, mapping.rotationDegrees != 0 {
++                throw InputError.heldDragProfileUnavailable("Legacy relative calibration does not support this display rotation")
++            }
++            return nil
++        }
+         switch heldDragProfile {
+-        case .notConfigured: profile = nil
++        case .notConfigured:
++            if let mapping, mapping.rotationDegrees != 0 {
++                throw InputError.heldDragProfileUnavailable("Rotated held motion requires an exactly bound measured profile")
++            }
++            return nil
+         case .invalid(let issue): throw InputError.heldDragProfileUnavailable(issue)
+         case .loaded(let loaded):
+-            if let issue = loaded.bindingIssue(host: host, screenID: screenID, size: screenSize?(), interval: step) {
++            if let issue = loaded.bindingIssue(host: host, screenID: screenID, size: bindingSize, interval: step) {
+                 throw InputError.heldDragProfileUnavailable(issue)
+             }
+-            profile = loaded
++            return loaded
+         }
+-        if let displayMapping, displayMapping.rotationDegrees != 0 {
+-            throw InputError.heldDragProfileUnavailable("Held motion has not been validated for this display rotation")
+-        }
+-        return profile
+     }
+ 
+     private func moveMeasuredDragPointer(
+         _ x: Double, _ y: Double, profile: HeldDragProfile, sequence: UInt64?, finishing: Bool
+     ) throws -> TimeInterval {
+-        guard shouldContinueMotion(sequence), var position = dragPosition else { return 0 }
+-        let size = CGSize(width: profile.screenWidth, height: profile.screenHeight)
++        guard shouldContinueMotion(sequence), var position = dragPosition, let size = screenSize?() else { return 0 }
++        // Keep the measured-distance planner in visible-display physical pixels.
++        // Only the report vector crosses to native HID axes; the curve is never scaled.
+         let target = CGPoint(
+             x: max(0, min(size.width - 1, x * size.width)),
+             y: max(0, min(size.height - 1, y * size.height)))
+@@ -1006,7 +1027,9 @@ extension DeviceInput {
+         while shouldContinueMotion(sequence) {
+             _ = try activeHeldDragProfile()
+             guard let movement = profile.movement(from: position, to: target, finishing: finishing) else { break }
+-            relative(movement.dx, movement.dy)
++            let report = displayMapping?.hidVector(dx: movement.dx, dy: movement.dy)
++                ?? (dx: movement.dx, dy: movement.dy)
++            relative(report.dx, report.dy)
+             position = CGPoint(
+                 x: max(0, min(size.width - 1, movement.position.x)),
+                 y: max(0, min(size.height - 1, movement.position.y)))
+diff --git a/Tests/iPhoneUseTests/Input/DeviceDisplayMappingTests.swift b/Tests/iPhoneUseTests/Input/DeviceDisplayMappingTests.swift
+index 1a4f40a..882a1a5 100644
+--- a/Tests/iPhoneUseTests/Input/DeviceDisplayMappingTests.swift
++++ b/Tests/iPhoneUseTests/Input/DeviceDisplayMappingTests.swift
+@@ -21,6 +21,28 @@ final class DeviceDisplayMappingTests: XCTestCase {
+         XCTAssertThrowsError(try mapping.validate(captureSize: nil))
+     }
+ 
++    func testRelativeVectorsRotateWithoutTranslationOrChangingCounts() throws {
++        for (rotation, expectedX, expectedY) in [(0, 7, -3), (90, -3, -7), (180, -7, 3), (270, 3, 7)] {
++            let mapping = try DeviceDisplayMapping(rotationDegrees: rotation, nativeWidth: 1179, nativeHeight: 2556)
++            let vector = mapping.hidVector(dx: 7, dy: -3)
++            XCTAssertEqual(vector.dx, expectedX)
++            XCTAssertEqual(vector.dy, expectedY)
++            XCTAssertEqual(mapping.hidVector(dx: 0, dy: 0).dx, 0)
++            XCTAssertEqual(mapping.hidVector(dx: 0, dy: 0).dy, 0)
++        }
++    }
++
++    func testProfileBindingUsesExplicitRotationAndPreservesTheCaptureRaster() throws {
++        for rotation in [0, 90, 180, 270] {
++            let mapping = try DeviceDisplayMapping(rotationDegrees: rotation, nativeWidth: 1179, nativeHeight: 2556)
++            let capture = rotation == 90 || rotation == 270
++                ? CGSize(width: 2556, height: 1180) : CGSize(width: 1180, height: 2556)
++            XCTAssertEqual(try mapping.nativeCaptureSize(captureSize: capture), CGSize(width: 1180, height: 2556))
++            XCTAssertThrowsError(try mapping.nativeCaptureSize(captureSize: CGSize(width: 1000, height: 462)))
++            XCTAssertThrowsError(try mapping.nativeCaptureSize(captureSize: nil))
++        }
++    }
++
+     func testMalformedUnavailableAndForeignDisplayEvidenceIsRejected() {
+         for invalid in [
+             envelope().merging(["device_id": "another-phone"]) { _, new in new },
+diff --git a/Tests/iPhoneUseTests/Input/DeviceInputRotatedHeldDragTests.swift b/Tests/iPhoneUseTests/Input/DeviceInputRotatedHeldDragTests.swift
+new file mode 100644
+index 0000000..77982b9
+--- /dev/null
++++ b/Tests/iPhoneUseTests/Input/DeviceInputRotatedHeldDragTests.swift
+@@ -0,0 +1,263 @@
++import Foundation
++import XCTest
++
++@testable import iPhoneUse
++
++/// An independent host-side forward map. It consumes native HID reports and
++/// measures their displayed positions; it does not call hidPoint/hidVector.
++/// Equal measured gains on native axes are a fixture assumption, not evidence
++/// that the real phone preserves its held acceleration in every orientation.
++private final class RotatingHeldHost {
++    let host = UUID()
++    let screenID = "rotating-held-test-phone"
++    var rotation = 0
++    var captureOverride: CGSize?
++    var allowed = true
++    var queries = 0
++    var reports: [(ReportID, [UInt8])] = []
++    var position = CGPoint.zero
++    var presses: [CGPoint] = []
++    var heldPositions: [CGPoint] = []
++    var releases = 0
++    var buttons: UInt8 = 0
++    var onReport: (() -> Void)?
++
++    var captureSize: CGSize {
++        captureOverride ?? (rotation == 90 || rotation == 270
++            ? CGSize(width: 2556, height: 1180) : CGSize(width: 1180, height: 2556))
++    }
++
++    func profile(width: Int = 1180) -> HeldDragProfile {
++        HeldDragProfile(
++            schemaVersion: 1, host: host, screenID: screenID, screenWidth: width, screenHeight: 2556,
++            reportInterval: 0.03,
++            samples: zip([1, 2, 4, 8, 16, 32], [0.625, 1.21875, 5.71875, 17.75, 41.75, 117.25])
++                .map { .init(count: $0.0, distance: $0.1) })
++    }
++
++    func input(
++        selection: HeldDragProfile.Selection? = nil, captureID: String? = nil,
++        nativeMapping: Bool = true, calibration: RelativePointerCalibration? = nil
++    ) -> DeviceInput {
++        let provider: (() throws -> DeviceDisplayMapping)? = nativeMapping ? {
++            self.queries += 1
++            return try DeviceDisplayMapping(rotationDegrees: self.rotation, nativeWidth: 1179, nativeHeight: 2556)
++        } : nil
++        return DeviceInput(
++            host: host, session: UUID(), calibration: calibration, screenID: captureID ?? screenID,
++            screenSize: { self.captureSize }, heldDragProfile: selection ?? .loaded(profile()),
++            displayMappingProvider: provider, inputIsAllowed: { self.allowed },
++            sleep: { _ in }, reportSender: receive)
++    }
++
++    func receive(_ id: ReportID, _ bytes: [UInt8]) {
++        reports.append((id, bytes))
++        let size = captureSize
++        if id == .absolutePointer {
++            let nx = Double(Int(bytes[1]) | Int(bytes[2]) << 8) / 32767
++            let ny = Double(Int(bytes[3]) | Int(bytes[4]) << 8) / 32767
++            let displayed: CGPoint
++            switch rotation {
++            case 90: displayed = CGPoint(x: 1 - ny, y: nx)
++            case 180: displayed = CGPoint(x: 1 - nx, y: 1 - ny)
++            case 270: displayed = CGPoint(x: ny, y: 1 - nx)
++            default: displayed = CGPoint(x: nx, y: ny)
++            }
++            position = CGPoint(x: displayed.x * size.width, y: displayed.y * size.height)
++        } else if id == .relativeMouse {
++            if buttons == 0, bytes[0] != 0 { presses.append(position) }
++            if buttons != 0, bytes[0] == 0 { releases += 1 }
++            buttons = bytes[0]
++            func distance(_ count: Int) -> Double {
++                guard count != 0 else { return 0 }
++                guard let sample = profile().samples.first(where: { $0.count == abs(count) }) else {
++                    XCTFail("unmeasured native report count \(count)")
++                    return 0
++                }
++                return Double(count.signum()) * sample.distance
++            }
++            let nx = distance(Int(Int8(bitPattern: bytes[1])))
++            let ny = distance(Int(Int8(bitPattern: bytes[2])))
++            let displayed: CGPoint
++            switch rotation {
++            case 90: displayed = CGPoint(x: -ny, y: nx)
++            case 180: displayed = CGPoint(x: -nx, y: -ny)
++            case 270: displayed = CGPoint(x: ny, y: -nx)
++            default: displayed = CGPoint(x: nx, y: ny)
++            }
++            if nx != 0 || ny != 0 {
++                position = CGPoint(
++                    x: min(size.width - 1, max(0, position.x + displayed.x)),
++                    y: min(size.height - 1, max(0, position.y + displayed.y)))
++            }
++            if buttons != 0 { heldPositions.append(position) }
++        }
++        onReport?()
++    }
++
++    var movement: [[UInt8]] {
++        reports.compactMap { id, bytes in
++            id == .relativeMouse && (bytes[1] != 0 || bytes[2] != 0) ? bytes : nil
++        }
++    }
++}
++
++final class DeviceInputRotatedHeldDragTests: XCTestCase {
++    func testMeasuredQuarterTurnsReachAsymmetricEndpointsWithOnePressAndRelease() throws {
++        for rotation in [0, 90, 180, 270] {
++            for (dx, dy) in [(0.13, 0.21), (-0.17, 0.12), (0.12, -0.17)] {
++                let phone = RotatingHeldHost()
++                phone.rotation = rotation
++                let input = phone.input()
++                let end = (0.41 + dx, 0.43 + dy)
++                try input.swipe(points: [(0.41, 0.43), end], duration: 0.12)
++                XCTAssertEqual(phone.position.x, end.0 * phone.captureSize.width, accuracy: 0.36)
++                XCTAssertEqual(phone.position.y, end.1 * phone.captureSize.height, accuracy: 0.36)
++                XCTAssertEqual(phone.presses.count, 1)
++                XCTAssertEqual(phone.releases, 1)
++                XCTAssertEqual(phone.buttons, 0)
++                XCTAssertEqual(phone.queries, 1)
++                XCTAssertEqual(phone.reports.last?.1, [0, 0, 0, 0])
++                XCTAssertTrue(phone.movement.allSatisfy { $0[0] == 1 && ($0[1] == 0 || $0[2] == 0) })
++                let firstPress = try XCTUnwrap(phone.reports.firstIndex { $0.0 == .relativeMouse && $0.1[0] == 1 })
++                XCTAssertFalse(phone.reports.dropFirst(firstPress).contains { $0.0 == .absolutePointer })
++            }
++        }
++    }
++
++    func testPortraitMeasuredReportsStayIdenticalWithAndWithoutNativeMapping() throws {
++        let plain = RotatingHeldHost()
++        let mapped = RotatingHeldHost()
++        try plain.input(nativeMapping: false).swipe(points: [(0.3, 0.4), (0.6, 0.7)], duration: 0.12)
++        try mapped.input().swipe(points: [(0.3, 0.4), (0.6, 0.7)], duration: 0.12)
++        XCTAssertEqual(plain.reports.map(\.0), mapped.reports.map(\.0))
++        XCTAssertEqual(plain.reports.map(\.1), mapped.reports.map(\.1))
++        XCTAssertEqual(plain.queries, 0)
++        XCTAssertEqual(mapped.queries, 1)
++    }
++
++    func testRotatedPolylineFinishesCornersBeforeTurningAndClampsScreenEdges() throws {
++        for rotation in [90, 270] {
++            let phone = RotatingHeldHost()
++            phone.rotation = rotation
++            let input = phone.input()
++            let size = phone.captureSize
++            try input.swipe(points: [(0.2, 0.3), (0.7, 0.3), (0.7, 0.8), (0.1, 0.8)], duration: 0.18)
++            let firstTurn = try XCTUnwrap(phone.heldPositions.first { abs($0.y - 0.3 * size.height) > 0.1 })
++            XCTAssertEqual(firstTurn.x, 0.7 * size.width, accuracy: 0.36)
++            let secondTurn = try XCTUnwrap(phone.heldPositions.first { $0.y > 0.7 * size.height && $0.x < 0.7 * size.width - 0.5 })
++            XCTAssertEqual(secondTurn.y, 0.8 * size.height, accuracy: 0.36)
++            XCTAssertEqual(phone.position.x, 0.1 * size.width, accuracy: 0.36)
++            XCTAssertEqual(phone.position.y, 0.8 * size.height, accuracy: 0.36)
++            try input.swipe(points: [(0.2, 0.3), (1, 0)], duration: 0.12)
++            XCTAssertEqual(phone.position.x, size.width - 1, accuracy: 0.36)
++            XCTAssertEqual(phone.position.y, 0, accuracy: 0.36)
++            XCTAssertEqual(phone.presses.count, 2)
++            XCTAssertEqual(phone.releases, 2)
++        }
++    }
++
++    func testRotatedWindowDragReversesAndReleasesWithoutAnotherUSBRead() throws {
++        for rotation in [90, 180, 270] {
++            let phone = RotatingHeldHost()
++            phone.rotation = rotation
++            let input = phone.input()
++            let size = phone.captureSize
++            input.press(x: 0.4, y: 0.3)
++            try input.type("")
++            input.drag(x: 0.8, y: 0.3)
++            try input.type("")
++            XCTAssertGreaterThan(phone.position.x, 0.4 * size.width)
++            input.release(x: 0.2, y: 0.6)
++            try input.type("")
++            XCTAssertEqual(phone.position.x, 0.2 * size.width, accuracy: 0.36)
++            XCTAssertEqual(phone.position.y, 0.6 * size.height, accuracy: 0.36)
++            XCTAssertEqual(phone.presses.count, 1)
++            XCTAssertEqual(phone.releases, 1)
++            XCTAssertEqual(phone.queries, 1)
++            XCTAssertEqual(phone.buttons, 0)
++        }
++    }
++
++    func testRotatedBindingsAndUnmeasuredRoutesRejectBeforeAnyInput() throws {
++        for scenario in ["host", "screen", "profile-raster", "pacing", "no-native-map", "estimated", "legacy"] {
++            let phone = RotatingHeldHost()
++            phone.rotation = 270
++            let profile: HeldDragProfile.Selection = scenario == "host" ? .loaded(RotatingHeldHost().profile())
++                : scenario == "profile-raster" ? .loaded(phone.profile(width: 1179))
++                : scenario == "estimated" ? .notConfigured : .loaded(phone.profile())
++            let calibration = scenario == "legacy" ? RelativePointerCalibration(
++                host: phone.host, screenWidth: 2556, screenHeight: 1180, reportInterval: 0.03, distances: [0, 1, 3]) : nil
++            let input = phone.input(
++                selection: profile, captureID: scenario == "screen" ? "wrong" : nil,
++                nativeMapping: scenario != "no-native-map", calibration: calibration)
++            if scenario == "pacing" { input.step = 0.075 }
++            XCTAssertThrowsError(try input.swipe(points: [(0.2, 0.3), (0.6, 0.7)], duration: 0.12), scenario)
++            input.press(x: 0.2, y: 0.3)
++            try input.type("")
++            XCTAssertTrue(phone.reports.isEmpty, scenario)
++            let status = try XCTUnwrap(input.pointerStatus["heldDrag"] as? [String: Any])
++            XCTAssertEqual(status["available"] as? Bool, false, scenario)
++        }
++    }
++
++    func testPassiveHeldStatusUsesOnlyAnObservedMatchingGeometry() throws {
++        let phone = RotatingHeldHost()
++        phone.rotation = 270
++        let input = phone.input()
++        let unknown = try XCTUnwrap(input.pointerStatus["heldDrag"] as? [String: Any])
++        XCTAssertEqual(unknown["available"] as? Bool, false)
++        XCTAssertEqual(phone.queries, 0)
++        try input.move(x: 0.2, y: 0.3)
++        let ready = try XCTUnwrap(input.pointerStatus["heldDrag"] as? [String: Any])
++        XCTAssertEqual(ready["profileState"] as? String, "loaded")
++        XCTAssertEqual(ready["mode"] as? String, "measured")
++        XCTAssertEqual(ready["available"] as? Bool, true)
++        XCTAssertEqual(phone.queries, 1)
++        phone.captureOverride = CGSize(width: 1180, height: 2556)
++        let stale = try XCTUnwrap(input.pointerStatus["heldDrag"] as? [String: Any])
++        XCTAssertEqual(stale["available"] as? Bool, false)
++        XCTAssertEqual(phone.queries, 1, "status must never launch the USB helper")
++    }
++
++    func testCaptureGeometryChangeDuringSwipeReleasesAfterFirstMovement() throws {
++        for rotation in [90, 270] {
++            let phone = RotatingHeldHost()
++            phone.rotation = rotation
++            let input = phone.input()
++            phone.onReport = {
++                if phone.movement.count == 1 { phone.captureOverride = CGSize(width: 1180, height: 2556) }
++            }
++            XCTAssertThrowsError(try input.swipe(points: [(0.2, 0.3), (0.6, 0.7)], duration: 0.12))
++            XCTAssertEqual(phone.movement.count, 1)
++            XCTAssertEqual(phone.presses.count, 1)
++            XCTAssertEqual(phone.releases, 1)
++            XCTAssertEqual(phone.buttons, 0)
++            XCTAssertEqual(phone.queries, 1)
++            XCTAssertEqual(phone.reports.last?.1, [0, 0, 0, 0])
++        }
++    }
++
++    func testRotatedSplitGeometryLossAssociationLossAndCancellationOnlyRelease() throws {
++        for interruption in ["geometry", "association", "cancel"] {
++            let phone = RotatingHeldHost()
++            phone.rotation = 270
++            let input = phone.input()
++            input.press(x: 0.2, y: 0.3)
++            try input.type("")
++            XCTAssertEqual(phone.presses.count, 1)
++            let before = phone.reports.count
++            if interruption == "association" { phone.allowed = false }
++            else { phone.captureOverride = CGSize(width: 1180, height: 2556) }
++            if interruption == "cancel" { input.cancelPointer() }
++            else { input.release(x: 0.8, y: 0.7) }
++            try input.type("")
++            let released = Array(phone.reports.dropFirst(before))
++            XCTAssertEqual(released.map(\.0), [.relativeMouse])
++            XCTAssertEqual(released.map(\.1), [[0, 0, 0, 0]])
++            XCTAssertEqual(phone.queries, 1)
++            XCTAssertEqual(phone.releases, 1)
++            XCTAssertEqual(phone.buttons, 0)
++        }
++    }
++}

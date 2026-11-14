@@ -1,0 +1,1354 @@
+{
+  "fixture_kind": "synthetic",
+  "cases": {
+    "form": {
+      "source": "ios-native-ax",
+      "schema_version": 1,
+      "status": "ok",
+      "scope": "point",
+      "nodes": [
+        {
+          "id": "n0",
+          "parent_id": null,
+          "native_type": "UIApplication",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Example form"
+        },
+        {
+          "id": "n1",
+          "parent_id": "n0",
+          "native_type": "UITextField",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Name",
+          "value": "Example"
+        },
+        {
+          "id": "n2",
+          "parent_id": "n0",
+          "native_type": "UIButton",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Continue"
+        }
+      ],
+      "selection": {
+        "request_process_id": 41
+      },
+      "coverage": {
+        "complete": false,
+        "native_node_count": 6,
+        "hidden_nodes_omitted": 3,
+        "text_truncated_field_count": 0
+      }
+    },
+    "keyboard": {
+      "source": "ios-native-ax",
+      "schema_version": 1,
+      "status": "ok",
+      "scope": "point",
+      "nodes": [
+        {
+          "id": "n0",
+          "parent_id": null,
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "n1",
+          "parent_id": "n0",
+          "native_type": "UISearchTextField",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Search",
+          "value": "示例"
+        },
+        {
+          "id": "n2",
+          "parent_id": "n0",
+          "native_type": "UIKeyboardWindow",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "n3",
+          "parent_id": "n2",
+          "native_type": "UIAccessibilityElementKBKey",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "a"
+        }
+      ],
+      "selection": {
+        "request_process_id": 41
+      },
+      "coverage": {
+        "complete": false,
+        "native_node_count": 7,
+        "hidden_nodes_omitted": 3,
+        "text_truncated_field_count": 0
+      }
+    },
+    "webkit": {
+      "source": "ios-native-ax",
+      "schema_version": 1,
+      "status": "ok",
+      "scope": "point",
+      "nodes": [
+        {
+          "id": "n0",
+          "parent_id": null,
+          "native_type": "WKWebView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "n1",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Example page"
+        },
+        {
+          "id": "n2",
+          "parent_id": "n0",
+          "native_type": "UIButton",
+          "process_id": 42,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": true,
+          "label": "Continue"
+        }
+      ],
+      "selection": {
+        "request_process_id": 41
+      },
+      "coverage": {
+        "complete": false,
+        "native_node_count": 6,
+        "hidden_nodes_omitted": 3,
+        "text_truncated_field_count": 0
+      }
+    },
+    "dense_rows": {
+      "source": "ios-native-ax",
+      "schema_version": 1,
+      "status": "ok",
+      "scope": "point",
+      "nodes": [
+        {
+          "id": "n0",
+          "parent_id": null,
+          "native_type": "CustomContainer",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "r0",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "l0",
+          "parent_id": "r0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Item 0"
+        },
+        {
+          "id": "v0",
+          "parent_id": "r0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "value": "value-0"
+        },
+        {
+          "id": "r1",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "l1",
+          "parent_id": "r1",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Item 1"
+        },
+        {
+          "id": "v1",
+          "parent_id": "r1",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "value": "value-1"
+        },
+        {
+          "id": "r2",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "l2",
+          "parent_id": "r2",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Item 2"
+        },
+        {
+          "id": "v2",
+          "parent_id": "r2",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "value": "value-2"
+        },
+        {
+          "id": "r3",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "l3",
+          "parent_id": "r3",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Item 3"
+        },
+        {
+          "id": "v3",
+          "parent_id": "r3",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "value": "value-3"
+        },
+        {
+          "id": "r4",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "l4",
+          "parent_id": "r4",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Item 4"
+        },
+        {
+          "id": "v4",
+          "parent_id": "r4",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "value": "value-4"
+        },
+        {
+          "id": "r5",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "l5",
+          "parent_id": "r5",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Item 5"
+        },
+        {
+          "id": "v5",
+          "parent_id": "r5",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "value": "value-5"
+        },
+        {
+          "id": "r6",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "l6",
+          "parent_id": "r6",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Item 6"
+        },
+        {
+          "id": "v6",
+          "parent_id": "r6",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "value": "value-6"
+        },
+        {
+          "id": "r7",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "l7",
+          "parent_id": "r7",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Item 7"
+        },
+        {
+          "id": "v7",
+          "parent_id": "r7",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "value": "value-7"
+        },
+        {
+          "id": "r8",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "l8",
+          "parent_id": "r8",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Item 8"
+        },
+        {
+          "id": "v8",
+          "parent_id": "r8",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "value": "value-8"
+        },
+        {
+          "id": "r9",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "l9",
+          "parent_id": "r9",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Item 9"
+        },
+        {
+          "id": "v9",
+          "parent_id": "r9",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "value": "value-9"
+        },
+        {
+          "id": "r10",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "l10",
+          "parent_id": "r10",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Item 10"
+        },
+        {
+          "id": "v10",
+          "parent_id": "r10",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "value": "value-10"
+        },
+        {
+          "id": "r11",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "l11",
+          "parent_id": "r11",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Item 11"
+        },
+        {
+          "id": "v11",
+          "parent_id": "r11",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "value": "value-11"
+        },
+        {
+          "id": "r12",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "l12",
+          "parent_id": "r12",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Item 12"
+        },
+        {
+          "id": "v12",
+          "parent_id": "r12",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "value": "value-12"
+        },
+        {
+          "id": "r13",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "l13",
+          "parent_id": "r13",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Item 13"
+        },
+        {
+          "id": "v13",
+          "parent_id": "r13",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "value": "value-13"
+        },
+        {
+          "id": "r14",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "l14",
+          "parent_id": "r14",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Item 14"
+        },
+        {
+          "id": "v14",
+          "parent_id": "r14",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "value": "value-14"
+        },
+        {
+          "id": "r15",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "l15",
+          "parent_id": "r15",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Item 15"
+        },
+        {
+          "id": "v15",
+          "parent_id": "r15",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "value": "value-15"
+        },
+        {
+          "id": "r16",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "l16",
+          "parent_id": "r16",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Item 16"
+        },
+        {
+          "id": "v16",
+          "parent_id": "r16",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "value": "value-16"
+        },
+        {
+          "id": "r17",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "l17",
+          "parent_id": "r17",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Item 17"
+        },
+        {
+          "id": "v17",
+          "parent_id": "r17",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "value": "value-17"
+        },
+        {
+          "id": "r18",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "l18",
+          "parent_id": "r18",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Item 18"
+        },
+        {
+          "id": "v18",
+          "parent_id": "r18",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "value": "value-18"
+        },
+        {
+          "id": "r19",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "l19",
+          "parent_id": "r19",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Item 19"
+        },
+        {
+          "id": "v19",
+          "parent_id": "r19",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "value": "value-19"
+        },
+        {
+          "id": "r20",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "l20",
+          "parent_id": "r20",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Item 20"
+        },
+        {
+          "id": "v20",
+          "parent_id": "r20",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "value": "value-20"
+        },
+        {
+          "id": "r21",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "l21",
+          "parent_id": "r21",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Item 21"
+        },
+        {
+          "id": "v21",
+          "parent_id": "r21",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "value": "value-21"
+        },
+        {
+          "id": "r22",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "l22",
+          "parent_id": "r22",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Item 22"
+        },
+        {
+          "id": "v22",
+          "parent_id": "r22",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "value": "value-22"
+        },
+        {
+          "id": "r23",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "l23",
+          "parent_id": "r23",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Item 23"
+        },
+        {
+          "id": "v23",
+          "parent_id": "r23",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "value": "value-23"
+        },
+        {
+          "id": "r24",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "l24",
+          "parent_id": "r24",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Item 24"
+        },
+        {
+          "id": "v24",
+          "parent_id": "r24",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "value": "value-24"
+        },
+        {
+          "id": "r25",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "l25",
+          "parent_id": "r25",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Item 25"
+        },
+        {
+          "id": "v25",
+          "parent_id": "r25",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "value": "value-25"
+        },
+        {
+          "id": "r26",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "l26",
+          "parent_id": "r26",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Item 26"
+        },
+        {
+          "id": "v26",
+          "parent_id": "r26",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "value": "value-26"
+        },
+        {
+          "id": "r27",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "l27",
+          "parent_id": "r27",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Item 27"
+        },
+        {
+          "id": "v27",
+          "parent_id": "r27",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "value": "value-27"
+        },
+        {
+          "id": "r28",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "l28",
+          "parent_id": "r28",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Item 28"
+        },
+        {
+          "id": "v28",
+          "parent_id": "r28",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "value": "value-28"
+        },
+        {
+          "id": "r29",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "l29",
+          "parent_id": "r29",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Item 29"
+        },
+        {
+          "id": "v29",
+          "parent_id": "r29",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "value": "value-29"
+        },
+        {
+          "id": "r30",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "l30",
+          "parent_id": "r30",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Item 30"
+        },
+        {
+          "id": "v30",
+          "parent_id": "r30",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "value": "value-30"
+        },
+        {
+          "id": "r31",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "l31",
+          "parent_id": "r31",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Item 31"
+        },
+        {
+          "id": "v31",
+          "parent_id": "r31",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "value": "value-31"
+        },
+        {
+          "id": "r32",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "l32",
+          "parent_id": "r32",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Item 32"
+        },
+        {
+          "id": "v32",
+          "parent_id": "r32",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "value": "value-32"
+        },
+        {
+          "id": "r33",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "l33",
+          "parent_id": "r33",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Item 33"
+        },
+        {
+          "id": "v33",
+          "parent_id": "r33",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "value": "value-33"
+        },
+        {
+          "id": "r34",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "l34",
+          "parent_id": "r34",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Item 34"
+        },
+        {
+          "id": "v34",
+          "parent_id": "r34",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "value": "value-34"
+        },
+        {
+          "id": "r35",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "l35",
+          "parent_id": "r35",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Item 35"
+        },
+        {
+          "id": "v35",
+          "parent_id": "r35",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "value": "value-35"
+        },
+        {
+          "id": "r36",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "l36",
+          "parent_id": "r36",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Item 36"
+        },
+        {
+          "id": "v36",
+          "parent_id": "r36",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "value": "value-36"
+        },
+        {
+          "id": "r37",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "l37",
+          "parent_id": "r37",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Item 37"
+        },
+        {
+          "id": "v37",
+          "parent_id": "r37",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "value": "value-37"
+        },
+        {
+          "id": "r38",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "l38",
+          "parent_id": "r38",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Item 38"
+        },
+        {
+          "id": "v38",
+          "parent_id": "r38",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "value": "value-38"
+        },
+        {
+          "id": "r39",
+          "parent_id": "n0",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false
+        },
+        {
+          "id": "l39",
+          "parent_id": "r39",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "label": "Item 39"
+        },
+        {
+          "id": "v39",
+          "parent_id": "r39",
+          "native_type": "UIView",
+          "process_id": 41,
+          "native_visible": true,
+          "ancestor_native_hidden": false,
+          "foreign_process": false,
+          "value": "value-39"
+        }
+      ],
+      "selection": {
+        "request_process_id": 41
+      },
+      "coverage": {
+        "complete": false,
+        "native_node_count": 124,
+        "hidden_nodes_omitted": 3,
+        "text_truncated_field_count": 0
+      }
+    },
+    "unavailable": {
+      "source": "ios-native-ax",
+      "schema_version": 1,
+      "status": "unavailable",
+      "scope": "app",
+      "reason": {
+        "code": "service_unavailable",
+        "message": "Synthetic unavailable service"
+      },
+      "cleanup": {
+        "status": "ok"
+      }
+    }
+  }
+}
