@@ -63,15 +63,14 @@ import Testing
         #expect(policy.shouldRunCoreBluetooth)
     }
 
-    @Test func usbHomeUsesTheCommandHProgramAndCountsAgainstBatchBudget() throws {
+    @Test func usbHomeUsesTheNativeButtonAndCountsAgainstBatchBudget() throws {
         let home = try CoreDeviceKeyboardProgram.home()
-        let chord = try CoreDeviceKeyboardProgram.key(KeyRequest(["key": "h", "modifiers": ["command"]]))
-        #expect(home.samples.map { $0["usages"] as! [Int] } == chord.samples.map { $0["usages"] as! [Int] })
-        #expect(home.samples.last?["usages"] as? [Int] == [])
-        #expect(home.samples.last?["at_ms"] as? Int == 320)
+        #expect(home.payload as? [String: String] == ["button": "home"])
+        #expect(home.samples.isEmpty && home.reportCount == 2)
+        #expect(home.programmedSeconds == 0.05)
 
         let waits: [[String: Any]] = Array(repeating: ["type": "delay", "seconds": 6], count: 4)
-        let overBudget = waits + [["type": "delay", "seconds": 5.8], ["type": "home"]]
+        let overBudget = waits + [["type": "delay", "seconds": 6], ["type": "home"]]
         #expect(throws: (any Error).self) {
             try ActRequest(["steps": overBudget], directKeyboardConfigured: true)
         }

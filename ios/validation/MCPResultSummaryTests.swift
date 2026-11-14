@@ -59,7 +59,11 @@ struct MCPResultSummaryTests {
         #expect(text(result).contains("Input: locally sent (coredevice); device delivery unverified."))
         #expect(text(result).contains("Observation: wait timed out; fresh=yes, changed=yes, stable=no."))
         #expect(text(result).contains("App result: unverified."))
-        #expect(text(result).contains("existing OCR") && text(result).contains("returned-frame"))
+        #expect(text(result).contains("existing OCR") && !text(result).contains("returned-frame"))
+        #expect(metadata["frame"] == nil)
+        #expect(metadata["touch_reference"] as? [String: String] ==
+            ["status": "not_issued", "reason": "action_observation_only", "next_tool": "screenshot"])
+        #expect(text(result).contains("call screenshot for a fresh frame.id"))
         #expect(!text(result).contains("transport-detail-") && !text(result).contains("\"input_receipt\":"))
         #expect(result["isError"] == nil)
     }
@@ -196,5 +200,7 @@ struct MCPResultSummaryTests {
         let result = recording.attach(to: original)
         #expect(try sameJSON(blocks(result), blocks(original)))
         #expect(!text(result).contains("Input:") && !text(result).contains("App result:"))
+        let metadata = try #require(result["structuredContent"] as? [String: Any])
+        #expect((metadata["frame"] as? [String: Any])?["id"] as? String == "returned-frame")
     }
 }

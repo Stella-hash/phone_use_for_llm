@@ -47,7 +47,7 @@ import Testing
         var environment: [String: String] {
             var env = ProcessInfo.processInfo.environment
             env[CoreDeviceKeyboard.helperKey] = helper.path
-            env["IPHONE_USE_DEVICE_ID"] = "synthetic-capture"
+            env["IPHONE_USE_DEVICE_ID"] = "11111111-1111111111111111"
             env["IPHONE_USE_USB_DEVICE_ID"] = "11111111-1111111111111111"
             env["IPHONE_USE_USB_CLIPBOARD_PYTHON"] = ProcessInfo.processInfo.environment["PHONE_USE_TEST_PYTHON"] ?? "/usr/bin/python3"
             env["PYMOBILEDEVICE3_UDID"] = "must-not-be-inherited"
@@ -57,7 +57,7 @@ import Testing
         }
         func result(beforeCommit: () throws -> Void = {}, clipboard: (() throws -> Void)? = nil) throws -> [String: Any] {
             try CoreDeviceKeyboard.perform(CoreDeviceKeyboardProgram.key(KeyRequest(["key": "a", "modifiers": ["command"]])),
-                device: "synthetic-capture", environment: environment, beforeCommit: beforeCommit, clipboard: clipboard)
+                device: "11111111-1111111111111111", environment: environment, beforeCommit: beforeCommit, clipboard: clipboard)
         }
         func stages() throws -> [String] {
             (try JSONSerialization.jsonObject(with: Data(contentsOf: marker)) as! [String: Any])["stages"] as! [String]
@@ -143,7 +143,8 @@ if mode == 'nonzero_success': raise SystemExit(1)
     @Test func clipboardFailureKeepsKeysUncommittedAndHidesChildDetail() throws {
         let harness = try Harness("normal")
         let result = try harness.result(clipboard: { throw DeviceError("PRIVATE_INPUT_SENTINEL") })
-        #expect(result["input_status"] as? String == "not_sent")
+        #expect(result["input_status"] as? String == "unconfirmed")
+        #expect(result["hid_input_status"] as? String == "not_sent")
         #expect(result["clipboard_status"] as? String == "unconfirmed")
         let stages = try harness.stages()
         #expect(!stages.contains("committed"))
@@ -156,7 +157,7 @@ if mode == 'nonzero_success': raise SystemExit(1)
         let result = try harness.result(clipboard: { clipboard = true })
         #expect(!clipboard)
         #expect(result["input_status"] as? String == "not_sent")
-        #expect(CoreDeviceKeyboard.response(result, device: "synthetic-capture").status == 409)
+        #expect(CoreDeviceKeyboard.response(result, device: "11111111-1111111111111111").status == 409)
     }
 
     @Test(arguments: ["uncommitted_success", "invalid_json", "contradictory_not_sent", "numeric_count", "wrong_count", "error_success", "cleanup_failure", "cleanup_false", "nonzero_success"])
@@ -164,7 +165,7 @@ if mode == 'nonzero_success': raise SystemExit(1)
         let harness = try Harness(mode)
         let result = try harness.result()
         #expect(result["input_status"] as? String == "unconfirmed")
-        let response = CoreDeviceKeyboard.response(result, device: "synthetic-capture")
+        let response = CoreDeviceKeyboard.response(result, device: "11111111-1111111111111111")
         #expect(response.status == 409)
         let body = try JSONSerialization.jsonObject(with: response.body) as! [String: Any]
         #expect(body["input_sent"] == nil)
@@ -175,18 +176,18 @@ if mode == 'nonzero_success': raise SystemExit(1)
         let harness = try Harness("normal")
         let request = try TypeTextRequest(["text": "", "use_clipboard": false], directKeyboardConfigured: true)
         let result = try CoreDeviceKeyboard.perform(CoreDeviceKeyboardProgram.text(request, switchIME: false),
-            device: "synthetic-capture", environment: harness.environment)
+            device: "11111111-1111111111111111", environment: harness.environment)
         #expect(result["no_op"] as? Bool == true)
-        #expect(CoreDeviceKeyboard.response(result, device: "synthetic-capture").status == 200)
+        #expect(CoreDeviceKeyboard.response(result, device: "11111111-1111111111111111").status == 200)
         #expect(!FileManager.default.fileExists(atPath: harness.marker.path))
     }
 
     @Test func actStopsAtKeyboardFailureAndPreservesLeafReceipt() throws {
         let act = try ActRequest(["steps": [["type": "key", "key": "a"], ["type": "key", "key": "b"]]])
         var calls = 0
-        let response = try act.perform(device: "synthetic-capture", capture: { _, _ in throw Stop.beforeInput }, execute: { _, _, _ in
+        let response = try act.perform(device: "11111111-1111111111111111", capture: { _, _ in throw Stop.beforeInput }, execute: { _, _, _ in
             calls += 1
-            return CoreDeviceKeyboard.response(["input_status": "unconfirmed"], device: "synthetic-capture")
+            return CoreDeviceKeyboard.response(["input_status": "unconfirmed"], device: "11111111-1111111111111111")
         })
         #expect(calls == 1 && response.status == 409)
         let error = MCPHTTPClient.check(response.body, status: response.status, language: .en)

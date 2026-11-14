@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded CoreDevice direct touch; optional host preflight/commit protocol.
+"""Bounded CoreDevice direct touch with mandatory host preflight/commit.
 
 Reads a complete JSON contact timeline from stdin before opening the exact USB
 target. No media stream, pairing, mounting, retries, keyboard, or BLE input.
@@ -13,11 +13,12 @@ import logging
 import math
 import os
 from pathlib import Path
+import re
 import signal
 import sys
 import time
 
-ROOT = Path(__file__).resolve().parents[2]
+ACCESSIBILITY_DIRECTORY = (Path(__file__).resolve().parent.parent / "accessibility").resolve()
 MAX_INPUT = 64 * 1024
 MAX_SAMPLES = 256
 MAX_DURATION_MS = 6000
@@ -197,14 +198,16 @@ async def run(value, gate=None):
     try:
         # Validate the whole program before any connection or input side effect.
         image, samples = parse_plan(value)
-        sys.path.insert(0, str(ROOT / "ios/accessibility"))
+        if gate is None:
+            raise ValueError("Hosted touch requires a host commit")
+        device_id = os.environ.get("IPHONE_USE_USB_DEVICE_ID", "")
+        if not re.fullmatch(r"(?:[0-9A-Fa-f]{8}-[0-9A-Fa-f]{16}|[0-9A-Fa-f]{40})", device_id):
+            raise ValueError("Hosted touch requires an exact USB device")
+        # Isolated Python omits the script directory. Add only this resolved
+        # source sibling, never a directory supplied by cwd or PYTHONPATH.
+        sys.path.insert(0, str(ACCESSIBILITY_DIRECTORY))
         from tree import Runtime
         from pymobiledevice3.remote.core_device.hid_service import UniversalHIDServiceService, TouchscreenContact
-        device_id = os.environ.get("IPHONE_USE_USB_DEVICE_ID") if gate else None
-        if gate and not device_id:
-            raise ValueError("Hosted touch requires an explicit USB device")
-        if not device_id:
-            device_id = json.loads((ROOT / ".local/iphone-use.json").read_text())["usbDeviceId"]
         rt = Runtime(device_id)
         async with asyncio.timeout(6):
             rsd = await rt.open(require_ax=False)
@@ -220,9 +223,8 @@ async def run(value, gate=None):
             receipt["ios_version"] = rsd.peer_info.get("Properties", {}).get("OSVersion")
             receipt["display"] = display.json()
 
-        if gate is not None:
-            await gate(receipt["display"])
-            receipt["host_commit_received"] = True
+        await gate(receipt["display"])
+        receipt["host_commit_received"] = True
 
         async def send(frame):
             await hid.send_multitouch([TouchscreenContact(i, x, y, touching) for i, x, y, touching in frame])
@@ -260,20 +262,19 @@ async def main():
     for sig in (signal.SIGINT, signal.SIGTERM):
         asyncio.get_running_loop().add_signal_handler(sig, task.cancel)
     try:
-        hosted = len(sys.argv) == 3 and sys.argv[1] == "--commit-file"
-        if sys.argv[1:] and not hosted:
-            raise ValueError("Unknown arguments")
-        commit_file = Path(sys.argv[2]) if hosted else None
-        if commit_file and (not commit_file.is_absolute() or commit_file.exists()):
+        if len(sys.argv) != 3 or sys.argv[1] != "--commit-file":
+            raise ValueError("Expected host commit path")
+        commit_file = Path(sys.argv[2])
+        if not commit_file.is_absolute() or commit_file.exists():
             raise ValueError("Host commit must be a new absolute path")
         raw = sys.stdin.buffer.read(MAX_INPUT + 1)
         if len(raw) > MAX_INPUT:
             raise ValueError("Input exceeds 64 KiB")
         value = json.loads(raw)
     except (ValueError, UnicodeError) as exc:
-        result = {"input_status": "not_sent", "error_type": type(exc).__name__, "reason": "Invalid or oversized JSON"}
+        result = {"input_status": "not_sent", "error_type": type(exc).__name__, "reason": "Invalid host arguments or JSON"}
     else:
-        result = await run(value, (lambda display: host_gate(display, commit_file)) if hosted else None)
+        result = await run(value, lambda display: host_gate(display, commit_file))
     print(json.dumps(result, ensure_ascii=False, allow_nan=False), flush=True)
     if result.get("error_type") or result.get("cleanup", {}).get("errors") or result.get("cleanup_release", {}).get("status") == "unconfirmed":
         raise SystemExit(1)

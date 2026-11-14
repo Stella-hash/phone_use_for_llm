@@ -81,6 +81,7 @@ import Testing
         #expect(preview["X-Frame-ID"] == nil)
         #expect(preview == ordinary)
         #expect(preview == [
+            "Cache-Control": "no-store",
             "X-Device": "phone-a", "X-Frame-Source": "capture-a", "X-Frame-Sequence": "42",
             "X-Frame-Received-At": "123.5", "X-Screen-Width": "2556", "X-Screen-Height": "1180",
             "X-Image-Width": "1200", "X-Image-Height": "554",
@@ -112,5 +113,21 @@ import Testing
         }
         #expect(throws: ScreenshotReferences.Rejected.self) { try consume(store, first) }
         #expect(try consume(store, latest).id == latest)
+    }
+
+    @Test func internalBaselineBurstAndPollsPreserveEveryTokenInAFullCache() throws {
+        let store = ScreenshotReferences(capacity: 128)
+        let ids = try (0..<128).map { _ in try #require(headers(store)["X-Frame-ID"]) }
+        // The first token is already the next eviction candidate before the
+        // action's private baseline read. Internal observations must issue none.
+        for query in [
+            ["format": "png", "stability": "1", "observationOnly": "1"],
+            ["ocr": "1", "observationOnly": "1"],
+        ] {
+            for sequence in 0..<256 {
+                #expect(try headers(store, query: query, sequence: UInt64(sequence))["X-Frame-ID"] == nil)
+            }
+        }
+        for id in ids { #expect(try consume(store, id).id == id) }
     }
 }

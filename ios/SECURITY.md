@@ -5,11 +5,11 @@ Mac and trusted local MCP client. It is a separate implementation from the
 Android service. Android bearer tokens, app/domain scopes, owner signing keys
 and per-input approvals are not implemented by the native iOS host.
 
-The managed launcher binds input to explicit capture and physical USB identifiers,
-enables both USB input routes, and disables Bluetooth lifecycle. It exposes seven
-MCP tools; removed legacy input names are rejected before device access in all
-native modes. It does
-not pair a new device, choose another phone on failure, silently fall back to
+The managed launcher binds screenshots, AX and input to one exact physical USB
+UDID, enables USB touch and keyboard, and disables Bluetooth lifecycle. There is
+no independent AV capture selector or inferred capture-to-input mapping. It exposes
+seven MCP tools; removed legacy input names are rejected before device access in
+all native modes. It does not pair a new device, choose another phone on failure, silently fall back to
 another input transport, or replay uncertain input.
 
 The native HTTP listener is an internal loopback service on 127.0.0.1:7390 for
@@ -20,10 +20,12 @@ against another process or user on the Mac. Do not proxy, tunnel or expose the
 listener to other machines. A process with access to the local host/client can
 exercise the configured phone authority.
 
-One-use screenshot references bind a coordinate input attempt to capture identity
-and dimensions. They do not lock UI content, certify hittability or survive a
-capture restart. Application completion and phone-side delivery remain separate
-from host send receipts. There is no app allowlist, task ownership lease or
+One-use screenshot references bind a coordinate input attempt to the physical
+USB attachment and screenshot dimensions, which the host rechecks before input.
+They do not lock UI content, certify hittability or authorize a new USB attachment.
+Action observations do not issue another touch token; take a new ordinary
+screenshot before another coordinate decision. Application completion and
+phone-side delivery remain separate from host send receipts. There is no app allowlist, task ownership lease or
 background multi-client handoff; keep one operator in control and observe after
 any uncertain input.
 

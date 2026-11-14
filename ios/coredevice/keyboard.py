@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Owned, bounded CoreDevice keyboard helper for the native /key and /type routes.
+"""Owned, bounded CoreDevice keyboard and native Home button helper.
 
-Validate the full held-usage timeline before opening the exact USB target. After
-registering a session keyboard, wait for the host's one-use commit. No media,
-pairing, mounting, BLE fallback or uncertain-action replay. Receipts contain no
-literal input, usage codes, raw reports or physical device identifiers.
+Validate the complete plan before opening the exact USB target. After opening
+the native Home button service or registering a session keyboard, wait for the
+host's one-use commit. No media, pairing, mounting, BLE fallback or uncertain-
+action replay. Receipts contain no literal input, usage codes, raw reports or
+physical device identifiers.
 """
 import asyncio
 import datetime
@@ -19,17 +20,24 @@ import signal
 import sys
 import time
 
+# -I removes the script directory. Restore only the resolved trusted sibling
+# directory needed by this helper, independently of cwd and PYTHONPATH.
+HELPER_DIRECTORY = Path(__file__).resolve().parent
+sys.path.insert(0, str(HELPER_DIRECTORY))
 from touch import bounded_cleanup, finish_cleanup
 
-ROOT = Path(__file__).resolve().parents[2]
+ACCESSIBILITY_DIRECTORY = (HELPER_DIRECTORY.parent / "accessibility").resolve()
 MAX_INPUT = 16384
 MAX_SAMPLES = 128
 MAX_DURATION_MS = 6000
 
 
 def parse_plan(value):
+    if (type(value) is dict and set(value) == {"button"}
+            and type(value["button"]) is str and value["button"] == "home"):
+        return "home"
     if type(value) is not dict or set(value) != {"samples"}:
-        raise ValueError("Expected samples only")
+        raise ValueError("Expected samples or the native Home button only")
     rows = value["samples"]
     if type(rows) is not list or not 2 <= len(rows) <= MAX_SAMPLES:
         raise ValueError("Expected 2..128 samples")
@@ -84,6 +92,41 @@ async def send_plan(send, samples, receipt):
                     raise
 
 
+async def send_home_button(send, receipt):
+    """The pinned Indigo Home usage has down/up states; never retry a press."""
+    receipt.update(reports_attempted=0, reports_locally_sent=0,
+                   cleanup_release={"status": "not_needed"})
+    try:
+        receipt["reports_attempted"] += 1
+        await send(1)  # HID_BUTTON_STATE_DOWN
+        receipt["reports_locally_sent"] += 1
+        await asyncio.sleep(.05)
+        receipt["reports_attempted"] += 1
+        await send(2)  # HID_BUTTON_STATE_UP
+        receipt["reports_locally_sent"] += 1
+        # The pinned service dispatches asynchronously; allow UP to dispatch
+        # before closing XPC. This is a grace period, not an application ACK.
+        await asyncio.sleep(.1)
+        receipt["cleanup_release"] = {"status": "sent_unverified"}
+    except (Exception, asyncio.CancelledError):
+        # An interrupted send may already have reached the phone. Cancel the
+        # same button on this same session once, without replaying DOWN or UP.
+        try:
+            async def cancel_and_allow_dispatch():
+                await send(3)  # HID_BUTTON_STATE_CANCELED
+                await asyncio.sleep(.1)
+            interrupted = await bounded_cleanup(cancel_and_allow_dispatch(), 1)
+            receipt["cleanup_release"] = {"status": "sent_unverified"}
+            if interrupted:
+                raise asyncio.CancelledError()
+        except (Exception, asyncio.CancelledError) as exc:
+            if receipt["cleanup_release"]["status"] != "sent_unverified":
+                receipt["cleanup_release"] = {"status": "unconfirmed", "error_type": type(exc).__name__}
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+        raise
+
+
 async def run(value, gate):
     began = time.monotonic()
     receipt = {
@@ -98,36 +141,51 @@ async def run(value, gate):
     rt = hid = None
     try:
         samples = parse_plan(value)
+        button = samples == "home"
+        if button:
+            receipt.update(backend="coredevice-button", button="home", button_service_ready=False,
+                           surface_deregistration="not_applicable")
         device_id = os.environ.get("IPHONE_USE_USB_DEVICE_ID", "")
         if not re.fullmatch(r"(?:[0-9A-Fa-f]{8}-[0-9A-Fa-f]{16}|[0-9A-Fa-f]{40})", device_id):
             raise ValueError("Hosted keyboard requires an exact USB device")
         if gate is None:
             raise ValueError("Hosted keyboard requires a host commit")
-        sys.path.insert(0, str(ROOT / "ios/accessibility"))
+        sys.path.insert(0, str(ACCESSIBILITY_DIRECTORY))
         from tree import Runtime
-        from pymobiledevice3.remote.core_device.hid_service import UniversalHIDServiceService
         rt = Runtime(device_id)
         async with asyncio.timeout(6):
             rsd = await rt.open(require_ax=False)
-            hid = UniversalHIDServiceService(rsd)
-            await hid.__aenter__()
-            requested = (1 << 32) | secrets.randbits(32)
-            service_id = await hid.create_keyboard_service(service_id=requested,
-                product="Phone-use USB keyboard", manufacturer="Phone-use")
-            if type(service_id) is not int or service_id != requested:
-                raise ValueError("Unexpected keyboard service identity")
-            surfaces = (await hid.list_connected_services()).get("connectedServices", [])
-            if not any(s.get("_ServiceID") == service_id and s.get("PrimaryUsagePage") == 1
-                       and s.get("PrimaryUsage") == 6 for s in surfaces):
-                raise ValueError("Registered keyboard surface was not advertised")
-            receipt["virtual_service_registered"] = True
+            if button:
+                from pymobiledevice3.remote.core_device.hid_service import IndigoHIDService
+                hid = IndigoHIDService(rsd)
+                await hid.__aenter__()
+                receipt["button_service_ready"] = True
+            else:
+                from pymobiledevice3.remote.core_device.hid_service import UniversalHIDServiceService
+                hid = UniversalHIDServiceService(rsd)
+                await hid.__aenter__()
+                requested = (1 << 32) | secrets.randbits(32)
+                service_id = await hid.create_keyboard_service(service_id=requested,
+                    product="Phone-use USB keyboard", manufacturer="Phone-use")
+                if type(service_id) is not int or service_id != requested:
+                    raise ValueError("Unexpected keyboard service identity")
+                surfaces = (await hid.list_connected_services()).get("connectedServices", [])
+                if not any(s.get("_ServiceID") == service_id and s.get("PrimaryUsagePage") == 1
+                           and s.get("PrimaryUsage") == 6 for s in surfaces):
+                    raise ValueError("Registered keyboard surface was not advertised")
+                receipt["virtual_service_registered"] = True
             receipt["preflight_ms"] = round((time.monotonic() - began) * 1000, 3)
         await gate()
         receipt["host_commit_received"] = True
-        async def send(usages):
-            await hid.send_keyboard(service_id, usages)
         async with asyncio.timeout(MAX_DURATION_MS / 1000 + 2):
-            await send_plan(send, samples, receipt)
+            if button:
+                async def send(state):
+                    await hid.send_button(0x0C, 0x40, state)
+                await send_home_button(send, receipt)
+            else:
+                async def send(usages):
+                    await hid.send_keyboard(service_id, usages)
+                await send_plan(send, samples, receipt)
         receipt["input_status"] = "unconfirmed" if receipt["cleanup_release"]["status"] == "unconfirmed" else "sent_unverified"
     except (Exception, asyncio.CancelledError) as exc:
         receipt["input_status"] = "unconfirmed" if receipt["reports_attempted"] else "not_sent"
@@ -138,8 +196,10 @@ async def run(value, gate):
     return receipt
 
 
-async def host_gate(commit_file):
-    print(json.dumps({"phase": "ready", "keyboard_surface_registered": True}), flush=True)
+async def host_gate(commit_file, *, button=False):
+    ready = {"phase": "ready", "button_service_ready": True, "button": "home"} if button else {
+        "phase": "ready", "keyboard_surface_registered": True}
+    print(json.dumps(ready), flush=True)
     # The host may spend up to ten seconds writing the phone clipboard here.
     async with asyncio.timeout(13):
         while not commit_file.exists():
@@ -169,7 +229,7 @@ async def main():
     except (ValueError, UnicodeError):
         result = {"input_status": "not_sent", "error_type": "ValueError", "reason": "Invalid host arguments or JSON"}
     else:
-        result = await run(value, lambda: host_gate(commit_file))
+        result = await run(value, lambda: host_gate(commit_file, button=value == {"button": "home"}))
     print(json.dumps(result, allow_nan=False), flush=True)
     if result.get("error_type") or result.get("cleanup", {}).get("errors") or result.get("cleanup_release", {}).get("status") == "unconfirmed":
         raise SystemExit(1)

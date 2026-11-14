@@ -1,6 +1,9 @@
 import asyncio
 import copy
+import os
+import types
 import unittest
+from unittest.mock import Mock, patch
 
 from touch import finish_cleanup, mapped_samples, parse_plan, run, send_plan
 
@@ -20,6 +23,19 @@ class Validation(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["input_status"], "not_sent")
         self.assertEqual(result["reports_attempted"], 0)
         self.assertTrue(result["cleanup"]["not_started"])
+
+    async def test_missing_host_gate_or_exact_target_never_opens_runtime(self):
+        forbidden = Mock(side_effect=AssertionError("Runtime must not open"))
+        with patch.dict("sys.modules", {"tree": types.SimpleNamespace(Runtime=forbidden)}):
+            for target, gate in [("11111111-1111111111111111", None),
+                                 ("", forbidden), ("capture-alias", forbidden)]:
+                with self.subTest(target=target), patch.dict(os.environ, {"IPHONE_USE_USB_DEVICE_ID": target}):
+                    result = await run(plan(), gate)
+                    self.assertEqual(result["error_type"], "ValueError")
+                    self.assertEqual(result["input_status"], "not_sent")
+                    self.assertEqual(result["reports_attempted"], 0)
+                    self.assertTrue(result["cleanup"]["not_started"])
+        forbidden.assert_not_called()
 
     async def test_rejects_wraparound_nonfinite_boolean_duplicates_and_unreleased_plan(self):
         cases = []

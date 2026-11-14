@@ -28,7 +28,7 @@ import Testing
             helper = directory.appendingPathComponent("fake-helper.py")
             marker = directory.appendingPathComponent("marker.json")
             try Self.script.write(to: helper, atomically: true, encoding: .utf8)
-            reference = ScreenshotReferences(capacity: 1).issue(device: "synthetic-capture", source: "synthetic-source",
+            reference = ScreenshotReferences(capacity: 1).issue(device: "11111111-1111111111111111", source: "synthetic-source",
                 screenSize: CGSize(width: 1180, height: 2556), imageSize: (462, 1000))
         }
 

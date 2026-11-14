@@ -1,13 +1,57 @@
 # iOS USB source preview validation
 
 Codex-E · `Stella-hash/phone_use_for_llm` · 2026-11-14.
-Status: source preview prepared for independent review; no binary/package release.
+Status: HOLD / draft after review of `7aff1e1`; repairs await independent review of the new PR head. No binary/package release.
 Initial review base: `41651b77369033958d551a73d43f571fcd92cfb8`; updated by a
 normal merge from `main@169cbb79ee4fdef54852c766f9179f4927b9e53c` after Android
 PR #13 landed. The iOS source recipe is unchanged by that merge.
 Native input: `YueChen-C/iPhone-use@577d5f2d0ec5831ed6e3e5d9c3ae482ee1dc4f5c`
-plus ordered patches 0001–0042. The PR head identifies the integration revision.
+plus ordered patches 0001–0043. The PR head identifies the integration revision.
 This page adds iOS evidence; it does not supersede the Android validation records.
+
+## Remediation after the 7aff1e1 review
+
+Patch 0043 replaces the managed AV capture selector with a physical USB screenshot
+read from the same exact UDID as input. It verifies the sole USB attachment before
+and after screenshots and immediately before input commit. Managed startup and
+shutdown do not enter the old AV/Valeria/Bluetooth lifecycle. Mismatched legacy
+capture/USB configuration is rejected before a helper or clipboard operation.
+The native tree is `fbbf99283c329740dea740fda893b2dcdf8ef4e1`.
+
+The same patch separates HID and clipboard effects, compares OCR against retained
+pre-input pixels from the current call, and marks every internal screenshot as
+observation-only. Only standalone screenshots mint touch references. The private
+assistant caller was migrated to explicitly fetch one before its next input.
+The direct ungated touch helper path is removed. Python runs isolated with the
+complete hash locks; launcher/native UDID formats agree. Dynamic HTTP responses
+carry `Cache-Control: no-store`.
+
+Local acceptance: 23 launcher tests, 64 offline AX tests, 44 USB helper tests,
+and 142 isolated Swift tests in 18 suites passed. All seven physical-target tests
+passed, including capture A / USB B, wrong device, legacy AV token, changed USB
+attachment during capture/preflight, and a full 128-reference cache. Swift tests
+also cover clipboard uncertainty, same-call OCR and native Home commit/receipts.
+The final guide/skill edits do not change those tested production files.
+
+A dedicated USB iPhone on iOS 26.5 supplied real screenshots from the physical
+service (observed standalone calls approximately 0.75–1.47 seconds). A frame-bound
+tap navigated Settings. Clipboard text was visible in the search field after the
+system paste confirmation; HID and clipboard statuses remained separate. The
+previous Command-H Home shortcut and a system-edge swipe did not leave that field.
+Home now uses the existing native USB button through the same target/commit guard,
+and was observed to return to the Home screen. No raw device evidence or identifiers
+are exported. No native AX tree was fetched during this remediation.
+
+Some 3-second post-input observations timed out while returning a useful current
+image; that does not mean input failed or that the app completed. Action images
+contained no touch token. System paste permission remains an OS interaction and
+is not bypassed. Multi-iPhone operation, other iOS/device combinations and universal
+system-gesture behavior are not established by these observations.
+
+Hosted CI now also invokes the complete isolated Swift overlay, runs only PR
+checks for task branches, and cancels obsolete runs. Full XCTest and release
+protocol results must be checked on the exact new PR head; earlier green results
+below are retained as historical evidence, not acceptance of these repairs.
 
 ## What is included
 
@@ -31,7 +75,26 @@ no native executable, Python environment or combined runtime. See the separate
 [iOS trust boundary](../ios/SECURITY.md) and [dependency notices](../ios/THIRD_PARTY_NOTICES.md).
 Android authorization and owner-signing claims do not cover this host.
 
-## Local verification
+The current managed configuration has one identity, `usbDeviceId`: a physical
+USB UDID shared by screenshots, AX and input. An old `captureId` is accepted only
+when it exactly equals that UDID; a different AV capture ID is rejected with
+migration instructions. Setup discovery enumerates physical USB devices and
+rechecks the sole matching IOKit pin. It does not discover AV capture IDs, infer
+an AV-to-USB mapping, enable CoreMediaIO exposure or activate a new USB
+configuration. Multiple, absent, unavailable or changing devices do not produce
+a candidate. Previous versions' pending restoration records still receive bounded
+reconciliation; `settled` includes restored, detached and superseded outcomes.
+The earlier live discovery/capture observations below belong to their stated
+recipe versions; they do not validate this replacement path.
+
+USB Python dependencies are installed into the ignored private CPython 3.12
+venv from complete macOS 14+ arm64/x86_64 locks, with exact transitive pins,
+SHA-256 checks and source builds disabled. The profile is selected from the
+actual interpreter architecture. Hashes constrain downloaded artifacts; they are
+not a security or license assessment of their contents. See the
+[dependency profile and regeneration rules](../ios/USB-DEPENDENCIES.md).
+
+## Earlier local verification (recipe through 0042)
 
 The source recipe was assembled independently in the public checkout and built
 successfully on the development Mac. Its native Git tree was
@@ -61,7 +124,13 @@ Its pass proves neither full-suite compilation nor full-suite success. Historica
 patches and tests can describe retired APIs; do not restore an unused runtime
 interface to make them pass. Preserve meaningful validation and failure tests on
 the current contract. Journal decoding is separate from executable-tool support. The [iOS workflow](../.github/workflows/ios.yml)
-runs full `swift test` as well as release protocol checks on a hosted Mac.
+runs full `swift test`, every suite in `ios/validation/` through
+`check-native-input.mjs`, and release protocol checks on a hosted Mac. The Swift
+Testing macro plugin is resolved from the selected Swift toolchain, supporting
+both Command Line Tools and full Xcode layouts. CI pushes are limited to `main`;
+pull requests retain coverage, and each workflow/ref cancels superseded runs.
+CodeQL analyzes JavaScript/TypeScript and Python only; it does not analyze Swift.
+Swift coverage here comes from the native test workflows, not CodeQL.
 Read hosted results at the exact PR head; local success is not a hosted pass.
 The first hosted full-suite compilation exposed stale localization tests that
 referenced retired normalized-coordinate strings and the old tool catalog.

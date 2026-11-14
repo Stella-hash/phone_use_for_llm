@@ -1,21 +1,21 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { childEnvironment, discover, discoveryEnvironment, runDiscoveryWorker, isOwnedProcess, locations, main, processIdentity, requireBuild, validateConfig, verifyHostSelection } from './phone.mjs';
+import { childEnvironment, discover, discoveryEnvironment, runDiscoveryWorker, isOwnedProcess, locations, main, processIdentity, requireBuild, setupUSB, usbLockForProfile, validateConfig, verifyHostSelection } from './phone.mjs';
 
 const configured = {
-  captureId: '00000000-TEST-SPARE',
   port: 7390,
   usbDeviceId: '00000000-1111111111111111',
 };
 const normalized = { ...configured, directTouch: true, directKeyboard: true };
 
-test('requires both exact device identities and the fixed local port', () => {
+test('requires one exact physical device identity and defaults to the fixed local port', () => {
   assert.deepEqual(validateConfig(configured), normalized);
+  assert.deepEqual(validateConfig({ usbDeviceId: configured.usbDeviceId }), normalized);
   for (const invalid of [
     {}, null, [],
     { ...configured, captureId: '' },
@@ -24,11 +24,36 @@ test('requires both exact device identities and the fixed local port', () => {
     { ...configured, captureId: 'device\nother' },
     { ...configured, port: '7390' },
     { ...configured, port: 0 },
+    { ...configured, port: undefined },
+    { ...configured, port: null },
     { ...configured, host: '0.0.0.0' },
     { ...configured, usbDeviceId: undefined },
     { ...configured, usbDeviceId: 'auto' },
     { ...configured, usbDeviceId: '00000000-1111111111111111\n' },
   ]) assert.throws(() => validateConfig(invalid));
+});
+
+test('legacy captureId is accepted only as the identical physical UDID, then removed', () => {
+  assert.deepEqual(validateConfig({ ...configured, captureId: configured.usbDeviceId }), normalized);
+  for (const captureId of [undefined, null, '', '00000000-TEST-SPARE',
+    '00000000-2222222222222222', '00000000-0000-4000-8000-000000000001']) {
+    assert.throws(() => validateConfig({ ...configured, captureId }), /AV capture ID.*remove captureId/);
+  }
+  const usbDeviceId = '0123abcd-ABCDEF0123456789';
+  assert.throws(() => validateConfig({ usbDeviceId, captureId: usbDeviceId.toLowerCase() }), /differs/);
+});
+
+test('physical USB identity accepts exactly the Swift and Python UDID formats', () => {
+  for (const usbDeviceId of ['0123abcd-ABCDEF0123456789', 'AbCdEf0123'.repeat(4)]) {
+    assert.equal(validateConfig({ ...configured, usbDeviceId }).usbDeviceId, usbDeviceId);
+  }
+  for (const usbDeviceId of ['-'.repeat(25), 'a'.repeat(25), 'a'.repeat(20), 'a'.repeat(39), 'a'.repeat(41),
+    '01234567-89ab-cdef-0123-456789abcdef', '0123456-0123456789abcdef', '012345678-0123456789abcdef',
+    '01234567-0123456789abcde', '01234567-0123456789abcdef0', '01234567--123456789abcdef',
+    '01234567-0123456789abcdeg', ` ${configured.usbDeviceId}`, `${configured.usbDeviceId}\n`,
+    `${configured.usbDeviceId}\r`, `${configured.usbDeviceId}\u2028`, `${configured.usbDeviceId}\0`]) {
+    assert.throws(() => validateConfig({ ...configured, usbDeviceId }), /physical UDID/);
+  }
 });
 
 test('omitted and existing true direct flags select the same USB-only configuration', () => {
@@ -56,11 +81,10 @@ test('legacy and mixed settings cannot activate an alternative input route', () 
   }
 });
 
-test('example config has one transport after replacing the two device placeholders', async () => {
+test('example config needs only one physical device placeholder', async () => {
   const example = JSON.parse(await readFile(new URL('./config.example.json', import.meta.url), 'utf8'));
-  assert.deepEqual(Object.keys(example).sort(), ['captureId', 'port', 'usbDeviceId']);
-  assert.deepEqual(validateConfig({ ...example, captureId: configured.captureId,
-    usbDeviceId: configured.usbDeviceId }), normalized);
+  assert.deepEqual(Object.keys(example), ['usbDeviceId']);
+  assert.deepEqual(validateConfig({ ...example, usbDeviceId: configured.usbDeviceId }), normalized);
 });
 
 test('shell settings cannot change selectors, input helpers or Bluetooth disablement', () => {
@@ -72,6 +96,9 @@ test('shell settings cannot change selectors, input helpers or Bluetooth disable
     IPHONE_USE_STATE_DIR: '/wrong', IPHONE_USE_USB_DEVICE_ID: 'wrong',
     IPHONE_USE_USB_CLIPBOARD_PYTHON: '/other/python', IPHONE_USE_AX_HELPER: '/other/reader.py',
     IPHONE_USE_TOUCH_HELPER: '/other/touch.py', IPHONE_USE_KEYBOARD_HELPER: '/other/keyboard.py',
+    IPHONE_USE_USB_SCREENSHOT_HELPER: '/other/screenshot.py',
+    PYTHONPATH: '/untrusted/imports', PYTHONHOME: '/untrusted/python', PYTHONUSERBASE: '/untrusted/user-site',
+    PYTHONSTARTUP: '/untrusted/startup.py',
   };
   const original = { ...inherited };
   const env = childEnvironment(configured, paths, inherited);
@@ -79,7 +106,7 @@ test('shell settings cannot change selectors, input helpers or Bluetooth disable
   for (const name of ['IPHONE_USE_BLUETOOTH_HOST', 'IPHONE_USE_HELD_DRAG_PROFILE', 'IPHONE_USE_TRACE_POINTER', 'IPHONE_USE_ALLOW_USB_TETHER_PREEMPTION']) {
     assert.equal(Object.hasOwn(env, name), false);
   }
-  assert.equal(env.IPHONE_USE_DEVICE_ID, configured.captureId);
+  assert.equal(env.IPHONE_USE_DEVICE_ID, configured.usbDeviceId);
   assert.equal(env.IPHONE_USE_USB_DEVICE_ID, configured.usbDeviceId);
   assert.equal(env.IPHONE_USE_PORT, '7390');
   assert.equal(env.IPHONE_USE_STATE_DIR, paths.state);
@@ -87,7 +114,9 @@ test('shell settings cannot change selectors, input helpers or Bluetooth disable
   assert.equal(env.IPHONE_USE_AX_HELPER, paths.accessibilityHelper);
   assert.equal(env.IPHONE_USE_TOUCH_HELPER, paths.touchHelper);
   assert.equal(env.IPHONE_USE_KEYBOARD_HELPER, paths.keyboardHelper);
+  assert.equal(env.IPHONE_USE_USB_SCREENSHOT_HELPER, paths.usbScreenshotHelper);
   assert.equal(env.PATH, inherited.PATH);
+  assert.equal(Object.keys(env).some(key => key.startsWith('PYTHON')), false);
   assert.deepEqual(inherited, original);
   assert.throws(() => childEnvironment({ ...configured, directTouch: false }, paths), /USB-only/);
 });
@@ -132,6 +161,85 @@ async function temporary(t) {
   return locations(repo);
 }
 
+test('USB setup selects only supported CPython 3.12/macOS architecture locks', () => {
+  const paths = locations('/test/repo');
+  const profile = { implementation: 'cpython', version: [3, 12], system: 'Darwin', macos: '14.0', machine: 'arm64' };
+  for (const machine of ['arm64', 'x86_64']) {
+    assert.equal(usbLockForProfile(paths, { ...profile, machine }), paths.usbLocks[machine]);
+  }
+  for (const invalid of [null, {}, { ...profile, version: [3, 11] }, { ...profile, version: [3, 13] },
+    { ...profile, implementation: 'pypy' }, { ...profile, machine: 'i386' }, { ...profile, machine: '__proto__' },
+    { ...profile, system: 'Linux' }, { ...profile, macos: '13.6' }, { ...profile, macos: '' }]) {
+    assert.throws(() => usbLockForProfile(paths, invalid), /CPython 3.12/);
+  }
+});
+
+test('committed USB locks contain exact transitive pins and hashes for the direct dependency', async () => {
+  const source = await readFile(new URL('./requirements-usb.txt', import.meta.url), 'utf8');
+  const direct = source.split('\n').map(line => line.trim()).filter(line => line && !line.startsWith('#'));
+  for (const architecture of ['arm64', 'x86_64']) {
+    const text = await readFile(new URL(`./requirements-usb-macos-${architecture}.lock`, import.meta.url), 'utf8');
+    const entries = text.replace(/\\\r?\n/g, ' ').split('\n').map(line => line.trim())
+      .filter(line => line && !line.startsWith('#'));
+    assert.ok(entries.length > direct.length, 'lock must include transitive dependencies');
+    for (const entry of entries) {
+      assert.match(entry, /^[a-z0-9][a-z0-9._-]*==[^\s;]+(?:\s+--hash=sha256:[a-f0-9]{64})+$/i);
+    }
+    assert.equal(new Set(entries.map(entry => entry.split('==')[0])).size, entries.length);
+    for (const requirement of direct) assert.ok(entries.some(entry => entry.startsWith(`${requirement} `)));
+  }
+});
+
+test('USB setup uses an isolated profile probe and hash-checked wheel-only sync, never ambient installer overrides', async t => {
+  const paths = await temporary(t), calls = [];
+  await mkdir(path.dirname(paths.usbLocks.arm64), { recursive: true });
+  await writeFile(paths.usbLocks.arm64, 'fixture==1.0 --hash=sha256:fixture\n');
+  const inherited = { PATH: '/test/bin', PYTHONPATH: '/untrusted', PYTHONHOME: '/untrusted',
+    UV_NO_VERIFY_HASHES: '1', UV_PYTHON: '/system/python', UV_INDEX: 'https://untrusted.invalid',
+    PIP_INDEX_URL: 'https://untrusted.invalid', VIRTUAL_ENV: '/system/venv', CONDA_PREFIX: '/system/conda',
+    MACOSX_DEPLOYMENT_TARGET: '10.9' };
+  const original = { ...inherited };
+  const runner = async (command, args, options) => {
+    calls.push({ command, args, options });
+    if (args.includes('venv')) {
+      await mkdir(path.dirname(paths.usbPython), { recursive: true });
+      await writeFile(paths.usbPython, 'fixture', { mode: 0o700 });
+    }
+    if (command === paths.usbPython) return JSON.stringify({ implementation: 'cpython', version: [3, 12],
+      system: 'Darwin', macos: '15.0', machine: 'arm64', is_venv: true,
+      prefix: await realpath(path.dirname(path.dirname(paths.usbPython))) });
+    return '';
+  };
+  await setupUSB(paths, { runCommand: runner, hosts: () => [], inherited, platform: 'darwin' });
+  assert.deepEqual(calls[0].args, ['--no-config', 'venv', '--python', '3.12', path.dirname(path.dirname(paths.usbPython))]);
+  assert.equal(calls[1].command, paths.usbPython);
+  assert.deepEqual(calls[1].args.slice(0, 3), ['-I', '-B', '-c']);
+  assert.deepEqual(calls[2].args, ['--no-config', 'pip', 'sync', '--python', paths.usbPython,
+    '--require-hashes', '--no-build', '--strict', '--default-index', 'https://pypi.org/simple', paths.usbLocks.arm64]);
+  for (const call of calls) assert.deepEqual(call.options.env, { PATH: '/test/bin' });
+  assert.deepEqual(inherited, original);
+});
+
+test('USB setup rejects a running host or non-private interpreter before package changes', async t => {
+  const paths = await temporary(t), calls = [];
+  await mkdir(path.dirname(paths.usbPython), { recursive: true });
+  await writeFile(paths.usbPython, 'fixture', { mode: 0o700 });
+  const profile = { implementation: 'cpython', version: [3, 12], system: 'Darwin', macos: '15.0',
+    machine: 'arm64', is_venv: true, prefix: await realpath(path.dirname(path.dirname(paths.usbPython))) };
+  const options = { hosts: () => [], platform: 'darwin', runCommand: (command, args) => {
+    calls.push({ command, args }); return JSON.stringify(profile);
+  } };
+  await assert.rejects(setupUSB(paths, { ...options, hosts: () => [1234] }), /host is running/);
+  assert.equal(calls.length, 0);
+  profile.is_venv = false;
+  await assert.rejects(setupUSB(paths, options), /outside the configured private virtual environment/);
+  profile.is_venv = true; profile.prefix = '/system/venv';
+  await assert.rejects(setupUSB(paths, options), /outside the configured private virtual environment/);
+  profile.prefix = await realpath(path.dirname(path.dirname(paths.usbPython))); profile.version = [3, 11];
+  await assert.rejects(setupUSB(paths, options), /CPython 3.12/);
+  assert.ok(calls.every(call => call.command === paths.usbPython));
+});
+
 test('missing or changed build fails before native MCP launch, without building', async t => {
   const paths = await temporary(t);
   await mkdir(paths.patches, { recursive: true });
@@ -162,7 +270,7 @@ test('setup discovery needs no local config and cannot start a concurrent host',
   const calls = [];
   const result = { schema_version: 1, status: 'configuration_candidate', config_candidate: configured };
   const worker = async (...args) => { calls.push(args); return result; };
-  assert.equal(await discover(paths, { checkBuild: async () => {}, hosts: () => [], worker }), result);
+  assert.deepEqual(await discover(paths, { checkBuild: async () => {}, hosts: () => [], worker }), result);
   assert.equal(calls[0][0], paths.binary);
   assert.deepEqual(calls[0][1], ['--discover-usb-setup']);
   assert.equal(calls[0][2].env.IPHONE_USE_BLUETOOTH_DISABLED, '1');
@@ -179,6 +287,8 @@ test('setup discovery clears inherited selectors and unsafe USB-network override
     PATH: '/test/bin', IPHONE_USE_DEVICE_ID: 'wrong', IPHONE_USE_USB_DEVICE_ID: 'wrong',
     IPHONE_USE_BLUETOOTH_DISABLED: '0', IPHONE_USE_BLUETOOTH_HOST: 'wrong',
     IPHONE_USE_TOUCH_HELPER: '/other/helper', IPHONE_USE_ALLOW_USB_TETHER_PREEMPTION: '1',
+    IPHONE_USE_USB_SCREENSHOT_HELPER: '/other/screenshot.py',
+    PYTHONPATH: '/untrusted', PYTHONHOME: '/untrusted', PYTHONUSERBASE: '/untrusted',
   };
   const original = { ...inherited };
   const env = discoveryEnvironment(paths, inherited);
@@ -189,9 +299,14 @@ test('setup discovery clears inherited selectors and unsafe USB-network override
 test('discovery preserves explicit incomplete inventory and rejects an invalid candidate', async t => {
   const paths = await temporary(t);
   const options = { checkBuild: async () => {}, hosts: () => [] };
-  const incomplete = { schema_version: 1, status: 'capture_unavailable', usb_devices: [{ usbDeviceId: configured.usbDeviceId }] };
+  const incomplete = { schema_version: 1, status: 'usb_topology_unconfirmed', usb_devices: [{ usbDeviceId: configured.usbDeviceId }] };
   assert.equal(await discover(paths, { ...options, worker: async () => incomplete }), incomplete);
-  await assert.rejects(discover(paths, { ...options, worker: async () => ({ status: 'configuration_candidate', config_candidate: {} }) }), /captureId/);
+  await assert.rejects(discover(paths, { ...options, worker: async () => ({ status: 'configuration_candidate', config_candidate: {} }) }), /physical UDID/);
+  await assert.rejects(discover(paths, { ...options, worker: async () => ({ status: 'configuration_candidate',
+    config_candidate: { ...configured, captureId: '00000000-2222222222222222' } }) }), /remove captureId/);
+  const canonical = await discover(paths, { ...options, worker: async () => ({ status: 'configuration_candidate',
+    config_candidate: { ...configured, captureId: configured.usbDeviceId, directTouch: true } }) });
+  assert.deepEqual(canonical.config_candidate, configured);
 });
 
 test('discovery worker preserves success and explicit non-success JSON', async () => {

@@ -1,14 +1,18 @@
-name: CodeQL
+name: CodeQL (JavaScript/TypeScript and Python)
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 permissions:
   contents: read
 jobs:
   analyze:
-    # GitHub Code Security is not enabled for this private candidate.
-    # Public release must run this successfully at the reviewed commit.
+    # This workflow analyzes JavaScript/TypeScript and Python, not Swift.
+    # Native Swift tests and acceptance overlays run in ios.yml.
     if: github.event.repository.private == false
     runs-on: ubuntu-latest
     timeout-minutes: 20

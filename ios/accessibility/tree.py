@@ -22,6 +22,9 @@ import sys
 import tempfile
 import time
 
+# -I omits the script directory. AX codec and presentation imports are limited
+# to this resolved source directory, never cwd or a PYTHONPATH entry.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ax_archive import decode, request
 
 SERVICE = "com.apple.accessibility.axAuditDaemon.remoteAXService"

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Offline production-source acceptance for Macs whose CLT omits XCTest.
 import { execFileSync } from 'node:child_process';
-import { cp, mkdir, mkdtemp, readdir, realpath, rm } from 'node:fs/promises';
+import { access, cp, mkdir, mkdtemp, readdir, realpath, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -27,8 +27,14 @@ try {
   for (const name of await readdir(path.join(repo, 'ios/validation'))) {
     if (name.endsWith('.swift')) await cp(path.join(repo, 'ios/validation', name), path.join(tests, name));
   }
-  const developer = execFileSync('xcode-select', ['-p'], { encoding: 'utf8' }).trim();
-  const plugin = path.join(developer, 'usr/lib/swift/host/plugins/testing/libTestingMacros.dylib');
+  // Full Xcode and Command Line Tools place Swift in different directories.
+  // Ask the same selected driver used below for its actual resource root.
+  const target = JSON.parse(execFileSync('swift', ['-print-target-info'], { encoding: 'utf8' }));
+  if (typeof target.paths?.runtimeResourcePath !== 'string' || !path.isAbsolute(target.paths.runtimeResourcePath)) {
+    throw Error('The selected Swift toolchain did not report an absolute runtime resource path.');
+  }
+  const plugin = path.join(target.paths.runtimeResourcePath, 'host/plugins/testing/libTestingMacros.dylib');
+  await access(plugin).catch(() => { throw Error(`Swift Testing macro plugin is missing from the selected toolchain: ${plugin}`); });
   console.log(`Offline native source tree: ${tree}`);
   execFileSync('swift', ['test', '--disable-sandbox', '--scratch-path', path.join(scratch, '.build'),
     '-Xswiftc', '-load-plugin-library', '-Xswiftc', plugin], {

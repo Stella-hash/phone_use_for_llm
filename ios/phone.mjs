@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { createHash } from 'node:crypto';
 import { execFileSync, spawn } from 'node:child_process';
-import { access, mkdir, mkdtemp, open, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
@@ -19,9 +19,12 @@ export function locations(repo = root) {
     repo, runtime, source, config: path.join(repo, '.local/iphone-use.json'),
     usbPython: path.join(runtime, 'usb-venv/bin/python'),
     usbRequirements: path.join(repo, 'ios/requirements-usb.txt'),
+    usbLocks: Object.fromEntries(['arm64', 'x86_64'].map(architecture =>
+      [architecture, path.join(repo, `ios/requirements-usb-macos-${architecture}.lock`)])),
     accessibilityHelper: path.join(repo, 'ios/accessibility/tree.py'),
     touchHelper: path.join(repo, 'ios/coredevice/touch.py'),
     keyboardHelper: path.join(repo, 'ios/coredevice/keyboard.py'),
+    usbScreenshotHelper: path.join(repo, 'ios/coredevice/screenshot.py'),
     patches: path.join(repo, 'ios/patches'),
     binary: path.join(source, 'build/iPhoneUse.app/Contents/MacOS/iphone-use'),
     build: path.join(runtime, 'build.json'), pid: path.join(runtime, 'host.json'),
@@ -50,31 +53,37 @@ async function atomicJSON(file, value) {
 export function validateConfig(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)
       || Object.keys(value).some(key => !['captureId', 'port', 'usbDeviceId', 'directTouch', 'directKeyboard'].includes(key))) {
-    throw new Error('USB-only config accepts captureId, port, usbDeviceId and optional directTouch:true/directKeyboard:true. Remove legacy Bluetooth and held-drag settings.');
+    throw new Error('USB-only config requires usbDeviceId and accepts optional port:7390/directTouch:true/directKeyboard:true. Remove legacy Bluetooth and held-drag settings.');
   }
-  if (typeof value.captureId !== 'string' || !value.captureId.trim()
-      || value.captureId !== value.captureId.trim() || /[\x00-\x1f\x7f]/.test(value.captureId)
-      || value.captureId.startsWith('REPLACE_')) {
-    throw new Error('captureId must be the exact spare iPhone id returned by /devices.');
-  }
-  if (value.port !== 7390) throw new Error('This local integration uses port 7390 only.');
-  if (typeof value.usbDeviceId !== 'string' || !/^[a-f0-9-]{20,64}$/i.test(value.usbDeviceId)) {
+  if (Object.hasOwn(value, 'port') && value.port !== 7390) throw new Error('This local integration uses port 7390 only.');
+  if (typeof value.usbDeviceId !== 'string'
+      || !/^(?:[0-9A-Fa-f]{8}-[0-9A-Fa-f]{16}|[0-9A-Fa-f]{40})$/.test(value.usbDeviceId)
+      || ![25, 40].includes(value.usbDeviceId.length)) {
     throw new Error('usbDeviceId must be the exact trusted spare iPhone physical UDID; USB input is required.');
+  }
+  if (Object.hasOwn(value, 'captureId') && value.captureId !== value.usbDeviceId) {
+    throw new Error('Legacy captureId differs from usbDeviceId. An AV capture ID does not verify the USB phone identity. Verify the physical USB UDID with discover, then remove captureId; screenshots and input now share usbDeviceId.');
   }
   for (const route of ['directTouch', 'directKeyboard']) {
     if (Object.hasOwn(value, route) && value[route] !== true) {
       throw new Error(`${route} must be true or omitted; this launcher supports USB-only input.`);
     }
   }
-  return { captureId: value.captureId, port: 7390, usbDeviceId: value.usbDeviceId,
+  return { usbDeviceId: value.usbDeviceId, port: 7390,
     directTouch: true, directKeyboard: true };
+}
+
+function pythonEnvironment(inherited) {
+  // Helpers run in Python isolated mode as well. Do not inherit shell import,
+  // startup, user-site or interpreter-home overrides through the native host.
+  return Object.fromEntries(Object.entries(inherited).filter(([key]) => !key.startsWith('PYTHON')));
 }
 
 export function childEnvironment(config, paths, inherited = process.env) {
   config = validateConfig(config);
   const env = {
-    ...inherited,
-    IPHONE_USE_DEVICE_ID: config.captureId,
+    ...pythonEnvironment(inherited),
+    IPHONE_USE_DEVICE_ID: config.usbDeviceId,
     IPHONE_USE_PORT: String(config.port),
     IPHONE_USE_STATE_DIR: paths.state,
   };
@@ -89,14 +98,46 @@ export function childEnvironment(config, paths, inherited = process.env) {
   env.IPHONE_USE_AX_HELPER = paths.accessibilityHelper;
   env.IPHONE_USE_TOUCH_HELPER = paths.touchHelper;
   env.IPHONE_USE_KEYBOARD_HELPER = paths.keyboardHelper;
+  env.IPHONE_USE_USB_SCREENSHOT_HELPER = paths.usbScreenshotHelper;
   return env;
 }
 
-async function setupUSB(paths) {
+export function usbLockForProfile(paths, profile) {
+  const macOSMajor = Number(profile?.macos?.split('.')[0]);
+  if (profile?.implementation !== 'cpython' || profile?.system !== 'Darwin'
+      || !Number.isInteger(macOSMajor) || macOSMajor < 14
+      || !Array.isArray(profile.version) || profile.version[0] !== 3 || profile.version[1] !== 12
+      || !Object.hasOwn(paths.usbLocks, profile.machine)) {
+    throw new Error('USB dependency locks support CPython 3.12 on macOS 14+ arm64 or x86_64 only. Recreate the private USB venv with a supported interpreter.');
+  }
+  return paths.usbLocks[profile.machine];
+}
+
+export async function setupUSB(paths, {
+  runCommand = run, hosts = otherHosts, inherited = process.env, platform = process.platform,
+} = {}) {
+  if (platform !== 'darwin') throw new Error('USB dependency locks support macOS only.');
+  if (hosts().length) throw new Error('An iPhone Use host is running; stop it before changing the USB Python environment.');
+  const environment = Object.fromEntries(Object.entries(pythonEnvironment(inherited)).filter(([key]) =>
+    !key.startsWith('UV_') && !key.startsWith('PIP_')
+      && !['VIRTUAL_ENV', 'CONDA_PREFIX', 'CONDA_DEFAULT_ENV', 'MACOSX_DEPLOYMENT_TARGET'].includes(key)));
+  const options = { env: environment, stdio: 'inherit' };
+  const venv = path.dirname(path.dirname(paths.usbPython));
   try { await access(paths.usbPython, constants.X_OK); }
-  catch { run('uv', ['venv', '--python', '3.12', path.dirname(path.dirname(paths.usbPython))], { stdio: 'inherit' }); }
-  run('uv', ['pip', 'install', '--python', paths.usbPython, '--requirement', paths.usbRequirements], { stdio: 'inherit' });
-  console.log('Installed the pinned USB dependency in the private runtime. No phone input was sent.');
+  catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    await runCommand('uv', ['--no-config', 'venv', '--python', '3.12', venv], options);
+  }
+  const probe = 'import json,os,platform,sys; print(json.dumps({"implementation":sys.implementation.name,"version":list(sys.version_info[:2]),"system":platform.system(),"macos":platform.mac_ver()[0],"machine":platform.machine(),"prefix":os.path.realpath(sys.prefix),"is_venv":sys.prefix!=sys.base_prefix}))';
+  const profile = JSON.parse(await runCommand(paths.usbPython, ['-I', '-B', '-c', probe], { env: environment }));
+  const lock = usbLockForProfile(paths, profile);
+  if (profile.is_venv !== true || profile.prefix !== await realpath(venv)) {
+    throw new Error('Refusing to install USB packages outside the configured private virtual environment.');
+  }
+  await access(lock);
+  await runCommand('uv', ['--no-config', 'pip', 'sync', '--python', paths.usbPython,
+    '--require-hashes', '--no-build', '--strict', '--default-index', 'https://pypi.org/simple', lock], options);
+  console.log(`Synchronized the hash-locked ${profile.machine} USB dependencies in the private runtime. No phone input was sent.`);
 }
 
 async function patchFiles(paths) {
@@ -123,10 +164,11 @@ export async function requireBuild(paths) {
 }
 
 export function discoveryEnvironment(paths, inherited = process.env) {
-  const env = { ...inherited, IPHONE_USE_BLUETOOTH_DISABLED: '1', IPHONE_USE_STATE_DIR: paths.state };
+  const env = { ...pythonEnvironment(inherited), IPHONE_USE_BLUETOOTH_DISABLED: '1', IPHONE_USE_STATE_DIR: paths.state };
   for (const key of ['IPHONE_USE_DEVICE_ID', 'IPHONE_USE_USB_DEVICE_ID', 'IPHONE_USE_BLUETOOTH_HOST',
     'IPHONE_USE_HELD_DRAG_PROFILE', 'IPHONE_USE_TRACE_POINTER', 'IPHONE_USE_ALLOW_USB_TETHER_PREEMPTION',
-    'IPHONE_USE_USB_CLIPBOARD_PYTHON', 'IPHONE_USE_AX_HELPER', 'IPHONE_USE_TOUCH_HELPER', 'IPHONE_USE_KEYBOARD_HELPER']) {
+    'IPHONE_USE_USB_CLIPBOARD_PYTHON', 'IPHONE_USE_AX_HELPER', 'IPHONE_USE_TOUCH_HELPER', 'IPHONE_USE_KEYBOARD_HELPER',
+    'IPHONE_USE_USB_SCREENSHOT_HELPER']) {
     delete env[key];
   }
   return env;
@@ -179,7 +221,10 @@ export async function discover(paths, { checkBuild = requireBuild, hosts = other
   await checkBuild(paths);
   if (hosts().length) throw new Error('An iPhone Use host is running; stop it before discovery. No USB configuration was changed.');
   const result = await worker(paths.binary, ['--discover-usb-setup'], { env: discoveryEnvironment(paths) });
-  if (result.status === 'configuration_candidate') validateConfig(result.config_candidate);
+  if (result.status === 'configuration_candidate') {
+    const config = validateConfig(result.config_candidate);
+    return { ...result, config_candidate: { usbDeviceId: config.usbDeviceId, port: config.port } };
+  }
   return result;
 }
 
