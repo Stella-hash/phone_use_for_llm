@@ -1,0 +1,58 @@
+diff --git a/Sources/iPhoneUse/Localization/StringsMCP.swift b/Sources/iPhoneUse/Localization/StringsMCP.swift
+index c2c25da..0ccf5ae 100644
+--- a/Sources/iPhoneUse/Localization/StringsMCP.swift
++++ b/Sources/iPhoneUse/Localization/StringsMCP.swift
+@@ -94,7 +94,7 @@ struct StringsMCP: LocalizedTable {
+         toolLongPress: "长按某个点，例如打开上下文菜单。",
+         toolSwipe: "沿至少两个点的有序路径持续拖动，直到最后一个点才抬起。默认使用最新截图像素；normalized=true 时每轴使用 0...1000。",
+         toolTypeText:
+-            "配置 USB 剪贴板后，默认将原样 Unicode（中文、emoji 等）写入指定手机剪贴板再按 Cmd+V；use_clipboard=false 显式选择 HID。未配置时默认 HID，true 使用 Mac 剪贴板。会覆盖所用剪贴板，不读取旧内容。clear_before 先清空；press_enter 最后按回车；请检查字段结果，剪贴板送达不代表字段验证。HID 中文转拼音选首词；ensure_chinese_ime=false 保持当前输入法，拼音可能消费数字/回车；可 Ctrl+Space 切换后观察。",
++            "配置 USB 剪贴板后，默认将原样 Unicode（中文、emoji 等）写入指定手机剪贴板再按 Cmd+V；use_clipboard=false 显式选择 HID。未配置时默认 HID，true 使用 Mac 剪贴板。会覆盖所用剪贴板，不读取旧内容。clear_before 先清空；commit_ime 发送空格以确认拼音候选，原样粘贴时应省略；press_enter 最后按回车；请检查字段结果，剪贴板送达不代表字段验证。HID 中文转拼音选首词；ensure_chinese_ime=false 保持当前输入法，拼音可能消费数字/回车；可 Ctrl+Space 切换后观察。",
+         toolPressKey:
+             "按下按键，可带修饰键。按键：enter、escape、backspace、tab、space、up、down、left、right 或单个字符。修饰键：cmd、shift、alt、ctrl。cmd+space 打开聚焦搜索。",
+         toolKeyboardSequence:
+@@ -161,7 +161,7 @@ struct StringsMCP: LocalizedTable {
+         toolSwipe:
+             "Drag continuously through an ordered path of at least two points, keeping contact until the last point. Coordinates default to pixels of the latest screenshot; normalized=true uses 0...1000 per axis.",
+         toolTypeText:
+-            "With USB clipboard configured, default pastes literal Unicode (Chinese, emoji, etc.) through the selected phone clipboard and Cmd+V; use_clipboard=false explicitly selects HID. Otherwise default is HID and true uses the Mac clipboard. Overwrites that clipboard without reading its old content. clear_before clears first; press_enter sends Enter last. Inspect the field: clipboard delivery is not field verification. HID turns Hanzi into pinyin; ensure_chinese_ime=false preserves the active IME. Pinyin may consume digits/Enter; cycle with Ctrl+Space then inspect.",
++            "With USB clipboard configured, default pastes literal Unicode (Chinese, emoji, etc.) through the selected phone clipboard and Cmd+V; use_clipboard=false explicitly selects HID. Otherwise default is HID and true uses the Mac clipboard. Overwrites that clipboard without reading its old content. clear_before clears first; commit_ime sends Space to commit a pinyin candidate, so omit it for literal paste; press_enter sends Enter last. Inspect the field: clipboard delivery is not field verification. HID turns Hanzi into pinyin; ensure_chinese_ime=false preserves the active IME. Pinyin may consume digits/Enter; cycle with Ctrl+Space then inspect.",
+         toolPressKey:
+             "Press a key, optionally with modifiers. Keys: enter, escape, backspace, tab, space, up, down, left, right, or a character. Modifiers: cmd, shift, alt, ctrl. cmd+space opens Spotlight.",
+         toolKeyboardSequence:
+diff --git a/Tests/iPhoneUseTests/API/HTTPAPITests.swift b/Tests/iPhoneUseTests/API/HTTPAPITests.swift
+index 428e893..56823fe 100644
+--- a/Tests/iPhoneUseTests/API/HTTPAPITests.swift
++++ b/Tests/iPhoneUseTests/API/HTTPAPITests.swift
+@@ -192,13 +192,25 @@ final class SwipeRequestTests: XCTestCase {
+             reportSender: { reports.append(($0, $1)) })
+         try input.swipe(points: swipe.points, duration: swipe.duration)
+ 
+-        // One absolute hover carries the start position; the whole drag —
+-        // press, movement and release — stays on the relative collection.
+-        XCTAssertEqual(reports.first?.1, [0, 0, 0, 255, 127])
+-        XCTAssertEqual(reports.filter { $0.0 == .absolutePointer }.count, 1)
+-        XCTAssertEqual(reports.first { $0.0 == .relativeMouse }?.1, [1, 0, 0, 0])
++        // Unknown phone-side absolute state is first primed nearby, separated
++        // by a neutral relative barrier, then set to the requested origin.
++        // The whole drag after that prefix stays on the relative collection.
++        XCTAssertGreaterThanOrEqual(reports.count, 5)
++        guard reports.count >= 5 else { return }
++        XCTAssertEqual(reports[0].0, .absolutePointer)
++        XCTAssertEqual(reports[0].1[0], 0)
++        XCTAssertNotEqual(Array(reports[0].1[1...2]), [0, 0])
++        XCTAssertNotEqual(Array(reports[0].1[3...4]), [255, 127])
++        XCTAssertEqual(reports[1].0, .relativeMouse)
++        XCTAssertEqual(reports[1].1, [0, 0, 0, 0])
++        XCTAssertEqual(reports[2].0, .absolutePointer)
++        XCTAssertEqual(reports[2].1, [0, 0, 0, 255, 127])
++        XCTAssertEqual(reports.filter { $0.0 == .absolutePointer }.count, 2)
++        XCTAssertEqual(reports[3].0, .relativeMouse)
++        XCTAssertEqual(reports[3].1, [1, 0, 0, 0])
+         XCTAssertEqual(reports.last?.1, [0, 0, 0, 0])
+-        let movement = reports.filter { $0.0 == .relativeMouse }.dropFirst().dropLast()
++        let movement = reports.dropFirst(4).dropLast()
++        XCTAssertTrue(movement.allSatisfy { $0.0 == .relativeMouse })
+         XCTAssertTrue(movement.allSatisfy { $0.1[0] == 1 })
+         var position = CGPoint(x: swipe.points[0].0 * size.width, y: swipe.points[0].1 * size.height)
+         for (_, bytes) in movement {

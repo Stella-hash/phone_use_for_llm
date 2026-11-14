@@ -1,0 +1,331 @@
+diff --git a/Sources/iPhoneUse/API/ControlAPI.swift b/Sources/iPhoneUse/API/ControlAPI.swift
+index e9f9dd9..8ce6a33 100644
+--- a/Sources/iPhoneUse/API/ControlAPI.swift
++++ b/Sources/iPhoneUse/API/ControlAPI.swift
+@@ -233,6 +233,7 @@ enum ControlAPI {
+         }
+         return .json([
+             "runtime_identity": RuntimeIdentity.current.json,
++            "runMode": AppRunModeStore.shared.mode.rawValue,
+             "bluetooth": HIDPeripheral.shared.state,
+             "bluetoothEnabled": HIDPeripheral.shared.bluetoothEnabled,
+             "bluetoothHosts": hosts,
+diff --git a/Sources/iPhoneUse/App/AppRunMode.swift b/Sources/iPhoneUse/App/AppRunMode.swift
+index f3fce00..ff56b04 100644
+--- a/Sources/iPhoneUse/App/AppRunMode.swift
++++ b/Sources/iPhoneUse/App/AppRunMode.swift
+@@ -1,3 +1,4 @@
++import AppKit
+ import Foundation
+ 
+ /// Controls whether closing the last window exits the app (`desktop`) or leaves
+@@ -6,6 +7,16 @@ enum AppRunMode: String, CaseIterable {
+     case desktop
+     case residentQuiet
+ 
++    /// USB-only service runs have no native window entry. Legacy Bluetooth
++    /// desktop/quiet behavior remains available, including explicit quiet previews.
++    func permitsNativeWindows(bluetoothEnabled: Bool) -> Bool {
++        self == .desktop || bluetoothEnabled
++    }
++
++    func activationPolicy(bluetoothEnabled: Bool) -> NSApplication.ActivationPolicy {
++        permitsNativeWindows(bluetoothEnabled: bluetoothEnabled) ? .regular : .accessory
++    }
++
+     static let residentQuietFlag = "--resident-quiet"
+     static let desktopFlag = "--desktop"
+ 
+diff --git a/Sources/iPhoneUse/App/Application.swift b/Sources/iPhoneUse/App/Application.swift
+index 5f5edd5..c1b364c 100644
+--- a/Sources/iPhoneUse/App/Application.swift
++++ b/Sources/iPhoneUse/App/Application.swift
+@@ -48,6 +48,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
+     }
+ 
+     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
++        guard AppRunModeStore.shared.mode.permitsNativeWindows(
++            bluetoothEnabled: HIDPeripheral.shared.bluetoothEnabled)
++        else { return false }
+         windows.showAllDevices()
+         return true
+     }
+@@ -144,6 +147,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
+         bringToFrontItem = bringToFront
+         NSApp.mainMenu = menu
+         NSApp.windowsMenu = windowMenu
++        refreshRunModeMenuState()
+     }
+ 
+     private func refreshMenuTitles() {
+@@ -163,7 +167,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
+     }
+ 
+     private func refreshRunModeMenuState() {
+-        quietModeItem?.state = AppRunModeStore.shared.mode == .residentQuiet ? .on : .off
++        let mode = AppRunModeStore.shared.mode
++        let bluetoothEnabled = HIDPeripheral.shared.bluetoothEnabled
++        quietModeItem?.state = mode == .residentQuiet ? .on : .off
++        windowItem?.isHidden = !mode.permitsNativeWindows(bluetoothEnabled: bluetoothEnabled)
++        NSApp.setActivationPolicy(mode.activationPolicy(bluetoothEnabled: bluetoothEnabled))
+     }
+ }
+ 
+@@ -180,7 +188,8 @@ enum Application {
+         let port = UInt16(ProcessInfo.processInfo.environment["IPHONE_USE_PORT"] ?? "") ?? 7390
+ 
+         let app = NSApplication.shared
+-        app.setActivationPolicy(.regular)
++        app.setActivationPolicy(AppRunModeStore.shared.mode.activationPolicy(
++            bluetoothEnabled: HIDPeripheral.shared.bluetoothEnabled))
+         // A packaged app uses its bundle icon; SwiftPM runs use the copied resource.
+         if let iconURL = Bundle.main.url(forResource: "AppIcon", withExtension: "icns")
+             ?? Bundle.module.url(forResource: "AppIcon", withExtension: "icns"),
+diff --git a/Sources/iPhoneUse/UI/ControlWindow.swift b/Sources/iPhoneUse/UI/ControlWindow.swift
+index 60a8d29..3f4ed9d 100644
+--- a/Sources/iPhoneUse/UI/ControlWindow.swift
++++ b/Sources/iPhoneUse/UI/ControlWindow.swift
+@@ -11,15 +11,20 @@ enum ControlWindowUpdateReason {
+ /// plugged in again (in `desktop` mode). Device names are deliberately never used as identity.
+ struct ControlWindowState {
+     private(set) var mode: AppRunMode
++    private let bluetoothEnabled: Bool
+     private(set) var deviceIDs: Set<String> = []
+     private var dismissedDeviceIDs: Set<String> = []
+     private var waitingWindowPresented = false
+ 
+-    init(mode: AppRunMode = .desktop) {
++    init(mode: AppRunMode = .desktop, bluetoothEnabled: Bool = true) {
+         self.mode = mode
++        self.bluetoothEnabled = bluetoothEnabled
+     }
+ 
++    var permitsNativeWindows: Bool { mode.permitsNativeWindows(bluetoothEnabled: bluetoothEnabled) }
++
+     var needsWaitingWindow: Bool {
++        guard permitsNativeWindows else { return false }
+         switch mode {
+         case .desktop:
+             return deviceIDs.isEmpty
+@@ -43,6 +48,7 @@ struct ControlWindowState {
+         reason: ControlWindowUpdateReason,
+         canReplaceWaitingWindow: Bool = true
+     ) -> [String] {
++        guard permitsNativeWindows else { return [] }
+         dismissedDeviceIDs.formIntersection(connectedIDs)
+         switch mode {
+         case .desktop:
+@@ -106,7 +112,8 @@ final class ControlWindowCoordinator {
+ 
+     init(modeStore: AppRunModeStore = .shared) {
+         self.modeStore = modeStore
+-        self.state = ControlWindowState(mode: modeStore.mode)
++        self.state = ControlWindowState(
++            mode: modeStore.mode, bluetoothEnabled: HIDPeripheral.shared.bluetoothEnabled)
+     }
+ 
+     func start() {
+@@ -142,6 +149,7 @@ final class ControlWindowCoordinator {
+     }
+ 
+     func showAllDevices() {
++        guard state.permitsNativeWindows else { return }
+         QuietModeActivityController.shared.setOpenWindows(true)
+         refresh(reason: .userRequest)
+         let windows = controllers.sorted { $0.key < $1.key }.compactMap { $0.value.window }
+@@ -160,12 +168,18 @@ final class ControlWindowCoordinator {
+         guard mode != state.mode else { return }
+         let hadOpenWindow = !controllers.isEmpty || waitingController != nil
+         state.setMode(mode)
+-        if mode == .desktop {
++        if !state.permitsNativeWindows {
++            // Switch state before closing: USB desktop -> quiet must keep the
++            // host alive and release each view's timer/window activity demand.
++            for controller in Array(controllers.values) { controller.close() }
++            waitingController?.close()
++        } else if mode == .desktop {
+             refresh(reason: hadOpenWindow ? .discovery : .resumeDesktopMode)
+         }
+     }
+ 
+     private func refresh(reason: ControlWindowUpdateReason) {
++        guard state.permitsNativeWindows else { return }
+         let devices = DeviceRegistry.shared.all().sorted {
+             $0.screen.name == $1.screen.name ? $0.id < $1.id : $0.screen.name < $1.screen.name
+         }
+@@ -272,7 +286,7 @@ final class ControlWindowCoordinator {
+ final class ControlWindowController: NSWindowController, NSWindowDelegate {
+     let deviceID: String?
+     private let controlView: PhoneControlView
+-    private let sidebar: ControlSidebar
++    private let sidebar: ControlSidebar?
+     private let content: ControlWindowContent
+     private var lastKnownDevice: Device?
+     private var languageObserver: NSObjectProtocol?
+@@ -282,7 +296,7 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate {
+     init(deviceID: String?, name: String? = nil) {
+         self.deviceID = deviceID
+         controlView = PhoneControlView(deviceID: deviceID, frame: NSRect(x: 0, y: 0, width: 390, height: 700))
+-        sidebar = ControlSidebar(frame: .zero)
++        sidebar = HIDPeripheral.shared.bluetoothEnabled ? ControlSidebar(frame: .zero) : nil
+         let content = ControlWindowContent(phoneView: controlView, sidebar: sidebar)
+         self.content = content
+         let window = NSWindow(
+@@ -294,13 +308,13 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate {
+         window.isReleasedWhenClosed = false
+         window.contentView = content
+         window.acceptsMouseMovedEvents = true
+-        window.contentMinSize = NSSize(width: 240 + ControlSidebar.width, height: 460)
++        window.contentMinSize = NSSize(width: 240 + (sidebar == nil ? 0 : ControlSidebar.width), height: 460)
+         window.center()
+         super.init(window: window)
+         window.delegate = self
+         window.initialFirstResponder = controlView
+         window.makeFirstResponder(controlView)
+-        sidebar.onAction = { [weak controlView] shortcut in
++        sidebar?.onAction = { [weak controlView] shortcut in
+             controlView?.performShortcut(shortcut)
+         }
+         controlView.onShortcutStateChanged = { [weak sidebar] available, status in
+@@ -331,7 +345,10 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate {
+         if let device = lastKnownDevice {
+             window?.title = "\(device.screen.name) — \(device.id)"
+             let lockState = device.lockState
+-            window?.subtitle = lockState.showsNotice ? lockState.title : ""
++            window?.subtitle = [
++                sidebar == nil ? StringsUI.current.statusUSBPreviewOnly : "",
++                lockState.showsNotice ? lockState.title : "",
++            ].filter { !$0.isEmpty }.joined(separator: " · ")
+         } else if deviceID != nil {
+             // A bound window keeps its last device title so it stays clear which
+             // phone is being waited for; only the subtitle explains the disconnect.
+@@ -344,7 +361,7 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate {
+ 
+     private func refreshLocalization() {
+         applyWindowStrings()
+-        sidebar.refreshLocalization()
++        sidebar?.refreshLocalization()
+         content.refreshLocalization()
+     }
+ 
+@@ -383,13 +400,24 @@ private final class ControlWindowContent: NSView {
+     private let connectionOverlay = ControlConnectionOverlay(frame: .zero)
+     private let lockNotice = ControlLockNotice(frame: .zero)
+ 
+-    init(phoneView: NSView, sidebar: ControlSidebar) {
++    init(phoneView: NSView, sidebar: ControlSidebar?) {
+         self.phoneView = phoneView
+-        super.init(frame: NSRect(x: 0, y: 0, width: 390 + ControlSidebar.width, height: 700))
++        super.init(frame: NSRect(x: 0, y: 0, width: 390 + (sidebar == nil ? 0 : ControlSidebar.width), height: 700))
+         phoneView.translatesAutoresizingMaskIntoConstraints = false
+-        sidebar.translatesAutoresizingMaskIntoConstraints = false
+         addSubview(phoneView)
+-        addSubview(sidebar)
++        if let sidebar {
++            sidebar.translatesAutoresizingMaskIntoConstraints = false
++            addSubview(sidebar)
++            NSLayoutConstraint.activate([
++                phoneView.trailingAnchor.constraint(equalTo: sidebar.leadingAnchor),
++                sidebar.widthAnchor.constraint(equalToConstant: ControlSidebar.width),
++                sidebar.topAnchor.constraint(equalTo: topAnchor),
++                sidebar.trailingAnchor.constraint(equalTo: trailingAnchor),
++                sidebar.bottomAnchor.constraint(equalTo: bottomAnchor),
++            ])
++        } else {
++            phoneView.trailingAnchor.constraint(equalTo: trailingAnchor).isActive = true
++        }
+         lockNotice.translatesAutoresizingMaskIntoConstraints = false
+         connectionOverlay.translatesAutoresizingMaskIntoConstraints = false
+         // Last sibling receives hit testing first while the overlay is visible.
+@@ -401,11 +429,6 @@ private final class ControlWindowContent: NSView {
+             phoneView.leadingAnchor.constraint(equalTo: leadingAnchor),
+             phoneView.topAnchor.constraint(equalTo: topAnchor),
+             phoneView.bottomAnchor.constraint(equalTo: bottomAnchor),
+-            phoneView.trailingAnchor.constraint(equalTo: sidebar.leadingAnchor),
+-            sidebar.widthAnchor.constraint(equalToConstant: ControlSidebar.width),
+-            sidebar.topAnchor.constraint(equalTo: topAnchor),
+-            sidebar.trailingAnchor.constraint(equalTo: trailingAnchor),
+-            sidebar.bottomAnchor.constraint(equalTo: bottomAnchor),
+             lockNotice.centerXAnchor.constraint(equalTo: phoneView.centerXAnchor),
+             lockNotice.bottomAnchor.constraint(equalTo: phoneView.bottomAnchor, constant: -24),
+             lockNotice.widthAnchor.constraint(equalTo: phoneView.widthAnchor, constant: -24),
+diff --git a/Tests/iPhoneUseTests/UI/ControlWindowTests.swift b/Tests/iPhoneUseTests/UI/ControlWindowTests.swift
+index ea14f21..cee694a 100644
+--- a/Tests/iPhoneUseTests/UI/ControlWindowTests.swift
++++ b/Tests/iPhoneUseTests/UI/ControlWindowTests.swift
+@@ -3,6 +3,49 @@ import XCTest
+ @testable import iPhoneUse
+ 
+ final class ControlWindowStateTests: XCTestCase {
++    func testUSBQuietRefusesEveryNativeWindowRequest() {
++        var state = ControlWindowState(mode: .residentQuiet, bluetoothEnabled: false)
++        for devices in [[], ["phone-a"]] {
++            for reason in [ControlWindowUpdateReason.discovery, .userRequest, .resumeDesktopMode] {
++                XCTAssertEqual(state.update(connectedIDs: devices, reason: reason), [])
++                XCTAssertEqual(state.deviceIDs, [])
++                XCTAssertFalse(state.needsWaitingWindow)
++            }
++        }
++    }
++
++    func testUSBDesktopQuietTransitionClosesWithoutExitingAndReopensOnlyInDesktop() {
++        var state = ControlWindowState(mode: .desktop, bluetoothEnabled: false)
++        XCTAssertEqual(state.update(connectedIDs: ["phone-a"]), ["phone-a"])
++        state.setMode(.residentQuiet)
++        XCTAssertFalse(state.permitsNativeWindows)
++        XCTAssertFalse(state.close(deviceID: "phone-a"))
++        XCTAssertEqual(state.update(connectedIDs: ["phone-a"], reason: .userRequest), [])
++        XCTAssertFalse(state.needsWaitingWindow)
++        state.setMode(.desktop)
++        XCTAssertEqual(state.update(connectedIDs: ["phone-a"], reason: .resumeDesktopMode), ["phone-a"])
++        XCTAssertTrue(state.close(deviceID: "phone-a"))
++    }
++
++    func testUSBWaitingPlaceholderDoesNotSurviveQuietTransition() {
++        var state = ControlWindowState(mode: .desktop, bluetoothEnabled: false)
++        _ = state.update(connectedIDs: [])
++        XCTAssertTrue(state.needsWaitingWindow)
++        state.setMode(.residentQuiet)
++        XCTAssertFalse(state.needsWaitingWindow)
++        XCTAssertFalse(state.close(deviceID: nil))
++        XCTAssertEqual(state.update(connectedIDs: ["phone-a"]), [])
++    }
++
++    func testOnlyUSBQuietUsesAccessoryPresentation() {
++        XCTAssertEqual(AppRunMode.residentQuiet.activationPolicy(bluetoothEnabled: false), .accessory)
++        XCTAssertFalse(AppRunMode.residentQuiet.permitsNativeWindows(bluetoothEnabled: false))
++        for (mode, bluetooth) in [(AppRunMode.desktop, false), (.desktop, true), (.residentQuiet, true)] {
++            XCTAssertEqual(mode.activationPolicy(bluetoothEnabled: bluetooth), .regular)
++            XCTAssertTrue(mode.permitsNativeWindows(bluetoothEnabled: bluetooth))
++        }
++    }
++
+     func testStartupWaitsWithoutADeviceAndOpensEachConnectedPhoneOnce() {
+         var state = ControlWindowState()
+         XCTAssertEqual(state.update(connectedIDs: []), [])
+diff --git a/docs/architecture.md b/docs/architecture.md
+index 5b85565..39baaf2 100644
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -28,6 +28,8 @@
+ 
+ USB 断开后保留原窗口，清除旧画面与输入绑定并显示等待状态；原设备重新连接后恢复，不允许改绑其他手机。用户主动关闭窗口时停止该窗口的刷新和输入交互，但不停止设备采集或 API/MCP 服务，也不应在下一次刷新时自动重新打开。菜单“窗口 → 显示所有设备”和 Dock 重新激活可以恢复已关闭的已连接设备窗口。默认 `desktop` 模式下关闭最后一个窗口退出应用；显式开启 `residentQuiet`（`AppRunModeStore`）后，关闭最后一个窗口保留后台服务且不生成等待占位窗口。无未最小化的等待占位窗口时，启动与 USB 热插拔保持静默，不自动打开或前置窗口；若屏幕上已有未最小化的等待占位窗口（例如无设备时显式打开，或从 `desktop` 切换保留），接入手机时会原地替换为当前已连接设备的窗口（仅在原占位窗为 key 时保持 key，否则停留在原后台层级），其余情况仅由用户显式点击 Dock /“显示所有设备”或切回默认模式时恢复窗口。
+ 
++USB-only 是上述蓝牙兼容窗口规则的例外：当 Bluetooth lifecycle 已禁用且模式为 `residentQuiet` 时，应用使用 accessory 策略，拒绝原生 reopen/show/discovery，并隐藏窗口菜单；`/viewer` 是显式预览入口。USB `desktop` 仍可显示只读原生预览，但不构造旧快捷按钮侧栏。从 USB desktop 切入 quiet 时先更新窗口状态再关闭控制器，避免关闭最后窗口触发退出，并释放预览的刷新/活动需求。`/status` 的 `runMode` 读取实际内存模式，不能用启动参数替代。蓝牙兼容模式语义保持不变。
++
+ 窗口通过 `DeviceRegistry` 异步获取对应的共享 `DeviceInput`，避免配对探测或输入对象初始化阻塞主线程。异步结果返回时应重新检查窗口生命周期与设备连接，丢弃已关闭窗口或已断开设备的结果。窗口、HTTP 和 MCP 不创建各自独立的输入状态。
+ 
+ ## 文件组织原则
+diff --git a/docs/user-guide.md b/docs/user-guide.md
+index 46fd165..1a6ce3e 100644
+--- a/docs/user-guide.md
++++ b/docs/user-guide.md
+@@ -2,6 +2,8 @@
+ 
+ 本手册收录控制窗口、HTTP API、MCP、指针校准、多设备配对和故障排查的详细说明。首次使用可先读项目首页（[简体中文](../README.md) / [English](../README.en.md)）；代码模块与维护约束见[架构说明](architecture.md)。
+ 
++USB-only 集成的日常 `residentQuiet` 主程序运行在后台，不显示 Dock 图标，也不因重新打开应用或 MCP 调用弹出原生窗口。需要观察时打开本地 `/viewer`。显式 `desktop` 模式的 USB 原生窗口仅预览，已去掉不可用的 Home/Paste 等侧栏；切入 quiet 会关闭这些预览而保留服务。下文蓝牙桌面操作保留给兼容模式。`GET /status?wake=0` 的 `runMode` 可核对运行中模式。
++
+ ## 目录
+ 
+ - [工作方式](#工作方式)

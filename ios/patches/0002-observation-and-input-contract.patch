@@ -1,0 +1,903 @@
+diff --git a/Sources/iPhoneUse/API/ControlAPI.swift b/Sources/iPhoneUse/API/ControlAPI.swift
+index 6dd62a5..af90d9e 100644
+--- a/Sources/iPhoneUse/API/ControlAPI.swift
++++ b/Sources/iPhoneUse/API/ControlAPI.swift
+@@ -261,8 +261,8 @@ enum ControlAPI {
+         let png = query["format"] == "png" || includeOCR
+         let maxWidth = query["maxWidth"].flatMap(Int.init)
+         let maxEdge = query["maxEdge"].flatMap(Int.init)
+-        guard let size = device.screen.size,
+-            let data = device.screen.snapshot(png: png, maxWidth: maxWidth, maxEdge: maxEdge)
++        guard let frame = device.screen.observationFrame(),
++            let data = device.screen.snapshot(frame: frame, png: png, maxWidth: maxWidth, maxEdge: maxEdge)
+         else {
+             if let error = device.screen.captureError {
+                 return .error(
+@@ -270,11 +270,15 @@ enum ControlAPI {
+             }
+             return .error(StringsAPI.current.noFrameFromDevice(device.screen.name), status: 503)
+         }
++        let size = CGSize(width: CVPixelBufferGetWidth(frame.buffer), height: CVPixelBufferGetHeight(frame.buffer))
+         let image = RequestCoordinates.imageSize(size, maxWidth: maxWidth, maxEdge: maxEdge)
+         var headers = [
+             "X-Device": device.id,
+             "X-Screen-Width": "\(Int(size.width))", "X-Screen-Height": "\(Int(size.height))",
+             "X-Image-Width": "\(image.0)", "X-Image-Height": "\(image.1)",
++            "X-Frame-Source": device.screen.sourceInstanceID.uuidString,
++            "X-Frame-Sequence": String(frame.sequence),
++            "X-Frame-Received-At": String(frame.receivedAt),
+         ]
+         if includeOCR {
+             // Return OCR of these exact bytes from the app's cache. The stdio process
+diff --git a/Sources/iPhoneUse/Capture/ScreenCapture.swift b/Sources/iPhoneUse/Capture/ScreenCapture.swift
+index b006ea3..2b7a5e3 100644
+--- a/Sources/iPhoneUse/Capture/ScreenCapture.swift
++++ b/Sources/iPhoneUse/Capture/ScreenCapture.swift
+@@ -828,6 +828,12 @@ final class ScreenCaptureSession {
+         source.snapshot(png: png, maxWidth: maxWidth, maxEdge: maxEdge)
+     }
+ 
++    func snapshot(
++        frame: ScreenCaptureFrameStore.Snapshot, png: Bool, maxWidth: Int? = nil, maxEdge: Int? = nil
++    ) -> Data? {
++        source.snapshot(frame: frame, png: png, maxWidth: maxWidth, maxEdge: maxEdge)
++    }
++
+     func thumbnail(width: Int, height: Int) -> [UInt8]? { source.thumbnail(width: width, height: height) }
+ }
+ 
+@@ -1230,8 +1236,15 @@ final class ScreenCaptureSource:
+ 
+     /// JPEG or PNG of the latest frame, scaled so neither edge exceeds the limits.
+     func snapshot(png: Bool, maxWidth: Int? = nil, maxEdge: Int? = nil) -> Data? {
+-        guard let buffer = frame() else { return nil }
+-        var image = CIImage(cvPixelBuffer: buffer)
++        guard let frame = observationFrame() else { return nil }
++        return snapshot(frame: frame, png: png, maxWidth: maxWidth, maxEdge: maxEdge)
++    }
++
++    /// Encode the retained frame so its pixels and freshness metadata cannot race.
++    func snapshot(
++        frame: ScreenCaptureFrameStore.Snapshot, png: Bool, maxWidth: Int? = nil, maxEdge: Int? = nil
++    ) -> Data? {
++        var image = CIImage(cvPixelBuffer: frame.buffer)
+         var scale = 1.0
+         if let maxWidth { scale = min(scale, Double(maxWidth) / image.extent.width) }
+         if let maxEdge { scale = min(scale, Double(maxEdge) / max(image.extent.width, image.extent.height)) }
+diff --git a/Sources/iPhoneUse/Localization/StringsAPI.swift b/Sources/iPhoneUse/Localization/StringsAPI.swift
+index af8dc97..60b28d1 100644
+--- a/Sources/iPhoneUse/Localization/StringsAPI.swift
++++ b/Sources/iPhoneUse/Localization/StringsAPI.swift
+@@ -50,7 +50,7 @@ struct StringsAPI: LocalizedTable {
+ 
+     static let zh = StringsAPI(
+         pairHostRequired: "缺少 host（应为 unmatchedHosts 中的 UUID）",
+-        noFrameFromDevice: { "尚未收到来自 \($0) 的画面：请先解锁" },
++        noFrameFromDevice: { "尚未收到来自 \($0) 的画面：请检查唤醒、解锁和 USB 采集状态；原因尚未确认" },
+         captureFailedFromDevice: { "来自 \($0) 的 USB 画面捕获失败：\($1)" },
+         pointerNotReady: "指针未就绪：请等待蓝牙鼠标订阅与有效校准",
+         textRequired: "缺少 text",
+@@ -87,7 +87,7 @@ struct StringsAPI: LocalizedTable {
+ 
+     static let en = StringsAPI(
+         pairHostRequired: "host is required (a UUID from unmatchedHosts)",
+-        noFrameFromDevice: { "no frame yet from \($0): unlock it" },
++        noFrameFromDevice: { "no frame yet from \($0): check wake, unlock and USB capture; cause is not confirmed" },
+         captureFailedFromDevice: { "USB screen capture failed for \($0): \($1)" },
+         pointerNotReady: "pointer is not ready: wait for Bluetooth mouse subscription and a valid calibration",
+         textRequired: "text is required",
+diff --git a/Sources/iPhoneUse/Localization/StringsMCP.swift b/Sources/iPhoneUse/Localization/StringsMCP.swift
+index f30567a..3012570 100644
+--- a/Sources/iPhoneUse/Localization/StringsMCP.swift
++++ b/Sources/iPhoneUse/Localization/StringsMCP.swift
+@@ -94,11 +94,11 @@ struct StringsMCP: LocalizedTable {
+         toolLongPress: "长按某个点，例如打开上下文菜单。",
+         toolSwipe: "沿至少两个点的有序路径持续拖动，直到最后一个点才抬起。默认使用最新截图像素；normalized=true 时每轴使用 0...1000。",
+         toolTypeText:
+-            "通过蓝牙键盘输入 ASCII 或中文（中文转拼音并以空格选择首个候选词）。clear_before 先全选清空；commit_ime 在文字后按空格提交输入法候选词；press_enter 最后按回车；ensure_chinese_ime 使用屏幕 OCR 尝试切换中文输入法。",
++            "通过蓝牙键盘输入 ASCII 或中文（中文转拼音并以空格选择首个候选词）。clear_before 先全选清空；commit_ime 在文字后按空格提交候选词；press_enter 最后按回车。ensure_chinese_ime 使用 OCR 尝试切换中文；设为 false 只保持当前输入法，不会切到英文。字面 ASCII/URL 需先在画面确认拉丁输入法；拼音可能把数字用于选择候选、回车用于提交。可用 press_key 的 Ctrl+Space 切换，然后观察。",
+         toolPressKey:
+             "按下按键，可带修饰键。按键：enter、escape、backspace、tab、space、up、down、left、right 或单个字符。修饰键：cmd、shift、alt、ctrl。cmd+space 打开聚焦搜索。",
+         toolKeyboardSequence:
+-            "在当前应用中执行一段简短、已知的键盘序列，最后返回一张截图。所有步骤在输入前完成校验；同一手机的 MCP 锁覆盖整个序列。出错即停止且不会重放。需要查看中间画面时请拆分为多次调用。支持 steps/actions 别名、可选 type 字段及 0...5 秒的 delay/wait 步骤。文字步骤支持 clear_before、commit_ime、press_enter、ensure_chinese_ime。最多 16 步、文字总量 256 字符；中文转拼音并选择首个候选词。",
++            "在当前应用中执行简短键盘序列，最后返回截图；预先校验全部步骤，同一手机全程加锁，失败即停且不重放。支持 steps/actions 别名、可选 type、0...5 秒的 delay/wait；最多 16 步、文字总量 256 字符。文字步骤支持 clear_before、commit_ime、press_enter、ensure_chinese_ime；中文转拼音并选择首个候选。ensure_chinese_ime=false 保持当前输入法。字面 ASCII/URL 需先在画面确认拉丁输入法；拼音可能消费数字和回车以选择/提交候选。切换用 press_key 的 Ctrl+Space 后单独观察，再继续序列。",
+         toolHome: "回到主屏幕。",
+         unknownTool: { "未知工具 \($0)" },
+         coordinateFinite: { "\($0) 必须是有限且非负的截图坐标" },
+@@ -161,11 +161,11 @@ struct StringsMCP: LocalizedTable {
+         toolSwipe:
+             "Drag continuously through an ordered path of at least two points, keeping contact until the last point. Coordinates default to pixels of the latest screenshot; normalized=true uses 0...1000 per axis.",
+         toolTypeText:
+-            "Type ASCII or Chinese with the Bluetooth keyboard (Hanzi becomes pinyin and selects the first candidate). clear_before selects all and deletes first; commit_ime presses space after text; press_enter presses enter last; ensure_chinese_ime uses screen OCR to attempt switching to a Chinese IME.",
++            "Type with the Bluetooth keyboard; Hanzi becomes pinyin and selects the first candidate. clear_before selects all and deletes; commit_ime presses space after text; press_enter presses Enter. ensure_chinese_ime uses OCR to attempt Chinese selection; false leaves the active IME unchanged and does not select English. Literal ASCII/URLs require a visually verified Latin IME: Pinyin may consume digits as candidate selection and Enter as composition commit. Cycle with press_key Ctrl+Space, then inspect.",
+         toolPressKey:
+             "Press a key, optionally with modifiers. Keys: enter, escape, backspace, tab, space, up, down, left, right, or a character. Modifiers: cmd, shift, alt, ctrl. cmd+space opens Spotlight.",
+         toolKeyboardSequence:
+-            "Run a short, known keyboard sequence in the current app with one final screenshot. All steps are validated before input; the same-phone MCP lock covers the whole sequence. Stops on error without replay. Use separate calls when an intermediate screen needs inspection. Accepts steps/actions aliases, optional type tags and delay/wait steps of 0...5 seconds. Text steps accept clear_before, commit_ime, press_enter and ensure_chinese_ime. Up to 16 steps and 256 total characters; Hanzi becomes pinyin and selects the first candidate.",
++            "Run a short keyboard sequence with one final screenshot. Validates all steps first, locks the phone throughout and stops on error without replay. Accepts steps/actions aliases, optional type tags, 0...5-second delay/wait steps; maximum 16 steps and 256 text characters. Text accepts clear_before, commit_ime, press_enter and ensure_chinese_ime; Hanzi becomes pinyin and selects the first candidate. ensure_chinese_ime=false preserves the active IME. Literal ASCII/URLs require a visually verified Latin IME; Pinyin may consume digits/Enter as candidate selection/commit. Cycle with press_key Ctrl+Space and inspect separately before continuing.",
+         toolHome: "Go to the Home Screen.",
+         unknownTool: { "unknown tool \($0)" },
+         coordinateFinite: { "\($0) must be a finite, nonnegative screenshot coordinate" },
+diff --git a/Sources/iPhoneUse/MCP/MCPKeyboardSequence.swift b/Sources/iPhoneUse/MCP/MCPKeyboardSequence.swift
+index cf900ce..67d0d87 100644
+--- a/Sources/iPhoneUse/MCP/MCPKeyboardSequence.swift
++++ b/Sources/iPhoneUse/MCP/MCPKeyboardSequence.swift
+@@ -44,7 +44,9 @@ enum MCPKeyboardSequence {
+     static func actions(arguments: [String: Any], language: AppLanguage = .en) throws -> [MCPKeyboardAction] {
+         let table = StringsMCP(language: language)
+         guard
+-            Set(arguments.keys).isSubset(of: ["steps", "actions", "device", "device_id", "include_image", "observe"]),
++            Set(arguments.keys).isSubset(of: [
++                "steps", "actions", "device", "device_id", "include_image", "observe", "observation_timeout",
++            ]),
+             ["device", "device_id"].allSatisfy({ arguments[$0] == nil || arguments[$0] is String }),
+             arguments["include_image"] == nil || isBoolean(arguments["include_image"]),
+             let steps = (arguments["steps"] ?? arguments["actions"]) as? [[String: Any]],
+diff --git a/Sources/iPhoneUse/MCP/MCPServer.swift b/Sources/iPhoneUse/MCP/MCPServer.swift
+index 8432068..3af1308 100644
+--- a/Sources/iPhoneUse/MCP/MCPServer.swift
++++ b/Sources/iPhoneUse/MCP/MCPServer.swift
+@@ -113,6 +113,7 @@ enum MCPServer {
+             guard arguments["observe"] == nil || arguments["observe"] is String,
+                 ["full", "ocr_diff", "none"].contains(observe)
+             else { throw MCPError("observe must be full, ocr_diff or none") }
++            let observationTimeout = try observationTimeout(arguments["observation_timeout"])
+             let includeImage: Bool
+             if let raw = arguments["include_image"] {
+                 guard let value = raw as? NSNumber, CFGetTypeID(value) == CFBooleanGetTypeID() else {
+@@ -158,6 +159,14 @@ enum MCPServer {
+                         let data = try client.post(action.path, body)
+                         return ["content": [["type": "text", "text": String(decoding: data, as: UTF8.self)]]]
+                     }
++                    let shouldObserve =
++                        observe != "none"
++                        && !(name == "keyboard_sequence" && arguments["include_image"] as? Bool == false
++                            && arguments["observe"] == nil)
++                    // A baseline is diagnostic only: failure must not prevent authorized input.
++                    let baseline =
++                        !actions.isEmpty && shouldObserve
++                        ? try? readScreenshot(device, baseline: true, timeout: 0.4) : nil
+                     for (index, action) in actions.enumerated() {
+                         do {
+                             switch action {
+@@ -178,30 +187,30 @@ enum MCPServer {
+                             Thread.sleep(forTimeInterval: 0.15)
+                         }
+                     }
+-                    if observe == "none"
+-                        || (name == "keyboard_sequence" && arguments["include_image"] as? Bool == false
+-                            && arguments["observe"] == nil)
+-                    {
+-                        return ["content": [["type": "text", "text": "{\"ok\":true}"]]]
++                    guard !actions.isEmpty else {
++                        return try screenshot(device, includeImage: includeImage, diff: observe == "ocr_diff")
+                     }
+-                    if !actions.isEmpty {
+-                        // Keep the device lock through settling and final observation.
+-                        waitForStableFrame { remaining in
+-                            let encoded =
+-                                device.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? device
+-                            guard
+-                                let data = try? client.get(
+-                                    "/screenshot?maxEdge=64&device=\(encoded)&stability=1", timeout: remaining
+-                                ).0
+-                            else { return nil }
+-                            let hash = ScreenOCR.stabilitySignature(data)
+-                            return hash.isEmpty ? nil : hash
+-                        }
++                    guard shouldObserve else {
++                        return observationContent(
++                            ObservationResult(status: .unobserved, reason: "disabled"),
++                            includeImage: false, diff: false)
+                     }
+-                    if observe == "ocr_diff" {
+-                        return try screenshot(device, includeImage: false, diff: true)
++                    // HTTP acknowledgement is not a HID drain or application-completion signal.
++                    // Keep the device lock until the exact returned frame has been observed.
++                    let acknowledgedAt = ProcessInfo.processInfo.systemUptime
++                    var captureError: String?
++                    var observation = observeAfterAction(
++                        baseline: baseline, acknowledgedAt: acknowledgedAt, timeout: observationTimeout
++                    ) { remaining in
++                        do {
++                            return try readScreenshot(device, timeout: remaining)
++                        } catch {
++                            captureError = "\(error)"
++                            return nil
++                        }
+                     }
+-                    return try screenshot(device, includeImage: includeImage)
++                    if observation.status == .unobserved { observation.detail = captureError }
++                    return observationContent(observation, includeImage: includeImage, diff: observe == "ocr_diff")
+                 }
+             }
+         } catch {
+@@ -210,32 +219,142 @@ enum MCPServer {
+         }
+     }
+ 
+-    /// Bounded accumulated delays keep injected no-op sleep closures deterministic.
+-    static func waitForStableFrame(
++    static func observationTimeout(_ raw: Any?) throws -> TimeInterval {
++        guard let raw else { return 1.5 }
++        guard let number = raw as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
++            number.doubleValue.isFinite, (0.2...5).contains(number.doubleValue)
++        else { throw MCPError("observation_timeout must be a finite number from 0.2 to 5 seconds") }
++        return number.doubleValue
++    }
++
++    struct FrameIdentity: Equatable {
++        let source: String
++        let sequence: UInt64
++        let receivedAt: TimeInterval
++
++        var json: [String: Any] {
++            ["source": source, "sequence": String(sequence), "received_at_uptime": receivedAt]
++        }
++
++        func isNewer(than previous: FrameIdentity?) -> Bool {
++            guard let previous else { return true }
++            return receivedAt > previous.receivedAt && (source != previous.source || sequence > previous.sequence)
++        }
++
++        static func parse(_ response: HTTPURLResponse) -> FrameIdentity? {
++            guard let source = response.value(forHTTPHeaderField: "X-Frame-Source"), !source.isEmpty,
++                let rawSequence = response.value(forHTTPHeaderField: "X-Frame-Sequence"),
++                let sequence = UInt64(rawSequence), sequence > 0,
++                let rawTime = response.value(forHTTPHeaderField: "X-Frame-Received-At"),
++                let receivedAt = Double(rawTime), receivedAt.isFinite, receivedAt >= 0
++            else { return nil }
++            return FrameIdentity(source: source, sequence: sequence, receivedAt: receivedAt)
++        }
++    }
++
++    struct ObservationFrame {
++        let image: Data
++        let device: String
++        let width: String
++        let height: String
++        let mimeType: String
++        let identity: FrameIdentity?
++        let signature: String
++        var ocr: ScreenOCR.Result?
++    }
++
++    enum ObservationStatus: String { case changed, stable, unobserved, timeout }
++
++    struct ObservationResult {
++        var status: ObservationStatus
++        var frame: ObservationFrame?
++        var elapsed: TimeInterval = 0
++        var fresh = false
++        var changed: Bool?
++        var stable = false
++        var reason: String?
++        var detail: String?
++
++        var json: [String: Any] {
++            var result: [String: Any] = [
++                "status": status.rawValue, "fresh": fresh, "visually_stable": stable,
++                "changed_from_baseline": changed.map { $0 as Any } ?? NSNull(),
++                "elapsed_ms": Int((elapsed * 1000).rounded()),
++                "comparison": "coarse_luminance",
++            ]
++            if let identity = frame?.identity { result["frame"] = identity.json }
++            if let reason { result["reason"] = reason }
++            if let detail { result["detail"] = detail }
++            return result
++        }
++    }
++
++    /// Fresh capture is independent of visual stability and of application completion.
++    /// Unchanged output uses the entire window: two old images cannot end it early.
++    /// Accumulated delays keep injected no-op sleeps bounded too.
++    static func observeAfterAction(
++        baseline: ObservationFrame?, acknowledgedAt: TimeInterval, timeout: TimeInterval,
+         sleep: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) },
+         now: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+-        frame: (TimeInterval) -> String?
+-    ) {
++        frame: (TimeInterval) -> ObservationFrame?
++    ) -> ObservationResult {
+         let start = now()
+-        sleep(0.15)
+-        var elapsed = max(0.15, now() - start)
+-        guard elapsed < 0.6 else { return }
+-        var previous = frame(0.6 - elapsed)
+-        elapsed = max(elapsed, now() - start)
+-        if previous == nil {
+-            sleep(max(0, min(0.1, 0.6 - elapsed)))
+-            return
+-        }
+-        while elapsed < 0.6 {
+-            let interval = min(0.08, 0.6 - elapsed)
++        var result = ObservationResult(status: .unobserved, reason: "no_frame")
++        var lastFresh: FrameIdentity?
++        var signature: String?
++        var stableSince: TimeInterval?
++        var elapsed: TimeInterval = 0
++        while elapsed < timeout {
++            let interval = min(0.12, timeout - elapsed)
+             sleep(interval)
+             elapsed = max(elapsed + interval, now() - start)
+-            guard elapsed < 0.6 else { return }
+-            let current = frame(0.6 - elapsed)
+-            if let current, current == previous { return }
+-            previous = current
++            guard elapsed < timeout else { break }
++            guard let current = frame(timeout - elapsed) else {
++                elapsed = max(elapsed, now() - start)
++                continue
++            }
+             elapsed = max(elapsed, now() - start)
++            // Old apps may return pixels without metadata. Keep the image, but do
++            // not imply freshness or retry an already acknowledged action.
++            guard let identity = current.identity, !current.signature.isEmpty else {
++                result.frame = current
++                result.fresh = false
++                result.changed = nil
++                result.stable = false
++                result.reason = current.identity == nil ? "missing_frame_metadata" : "invalid_frame"
++                result.elapsed = elapsed
++                return result
++            }
++            if result.frame == nil { result.frame = current }
++            guard identity.receivedAt > acknowledgedAt, identity.isNewer(than: baseline?.identity),
++                identity.isNewer(than: lastFresh)
++            else {
++                if !result.fresh { result.reason = "no_fresh_frame" }
++                continue
++            }
++            result.frame = current
++            result.fresh = true
++            result.reason = nil
++            if let baseline, !baseline.signature.isEmpty {
++                result.changed = current.signature != baseline.signature
++            }
++            if signature != current.signature {
++                signature = current.signature
++                stableSince = identity.receivedAt
++                result.stable = false
++            } else if let stableSince {
++                result.stable = identity.receivedAt - stableSince >= 0.16
++            }
++            lastFresh = identity
++            if result.changed == true, result.stable, elapsed >= 0.35, elapsed <= timeout {
++                result.status = .changed
++                result.elapsed = elapsed
++                return result
++            }
+         }
++        result.elapsed = elapsed
++        if result.fresh { result.status = result.stable ? .stable : .timeout }
++        return result
+     }
+ 
+     static func resolveDevice(
+@@ -281,27 +400,69 @@ enum MCPServer {
+     }
+ 
+     private static func screenshot(_ device: String?, includeImage: Bool, diff: Bool = false) throws -> [String: Any] {
++        screenshotContent(try readScreenshot(device), includeImage: includeImage, diff: diff)
++    }
++
++    private static func readScreenshot(
++        _ device: String?, baseline: Bool = false, timeout: TimeInterval = 60
++    ) throws -> ObservationFrame {
+         var path = "/screenshot?maxEdge=\(longEdge)"
+         if let device, let encoded = device.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
+             path += "&device=\(encoded)"
+         }
+-        path += "&ocr=1"
+-        let (image, response) = try client.get(path)
++        path += baseline ? "&format=png&stability=1" : "&ocr=1"
++        let (image, response) = try client.get(path, timeout: timeout)
+         let width = response.value(forHTTPHeaderField: "X-Image-Width") ?? "?"
+         let height = response.value(forHTTPHeaderField: "X-Image-Height") ?? "?"
+         let id = response.value(forHTTPHeaderField: "X-Device") ?? ""
+         let serverOCR = response.value(forHTTPHeaderField: "X-Screen-OCR")
+             .flatMap { Data(base64Encoded: $0) }.flatMap(ScreenOCR.decode)
+-        let ocr = serverOCR ?? ScreenOCR.recognize(image, device: id)
++        return ObservationFrame(
++            image: image, device: id, width: width, height: height,
++            mimeType: response.value(forHTTPHeaderField: "Content-Type") ?? "image/jpeg",
++            identity: FrameIdentity.parse(response), signature: ScreenOCR.stabilitySignature(image), ocr: serverOCR)
++    }
++
++    private static func screenshotContent(
++        _ frame: ObservationFrame, includeImage: Bool, diff: Bool
++    ) -> [String: Any] {
++        let ocr = frame.ocr ?? ScreenOCR.recognize(frame.image, device: frame.device)
+         if diff {
+-            guard !ocr.screenHash.isEmpty else { throw MCPError("OCR observation unavailable") }
+-            return ["content": [["type": "text", "text": ScreenOCR.summaryDiff(for: ocr, device: id)]]]
++            let text =
++                ocr.screenHash.isEmpty
++                ? "OCR observation unavailable"
++                : ScreenOCR.summaryDiff(for: ocr, device: frame.device)
++            return ["content": [["type": "text", "text": text]]]
+         }
+-        if !ocr.screenHash.isEmpty { _ = ScreenOCR.diff(device: id, current: ocr) }
++        if !ocr.screenHash.isEmpty { _ = ScreenOCR.diff(device: frame.device, current: ocr) }
+         return screenshotContent(
+-            image: image, device: id, width: width, height: height,
++            image: frame.image, device: frame.device, width: frame.width, height: frame.height,
+             includeImage: includeImage, ocr: ocr,
+-            mimeType: response.value(forHTTPHeaderField: "Content-Type") ?? "image/jpeg")
++            mimeType: frame.mimeType)
++    }
++
++    static func observationContent(
++        _ observation: ObservationResult, includeImage: Bool, diff: Bool
++    ) -> [String: Any] {
++        let metadata: [String: Any] = [
++            "ok": true, "action_acknowledged": true, "hid_delivery": "unverified",
++            "app_completion": "unverified", "observation": observation.json,
++        ]
++        var result =
++            observation.frame.map { screenshotContent($0, includeImage: includeImage, diff: diff) }
++            ?? ["content": [["type": "text", "text": "Action acknowledged; no screen observation."]]]
++        var content = result["content"] as? [[String: Any]] ?? []
++        let encoded = try? JSONSerialization.data(withJSONObject: metadata, options: [.sortedKeys])
++        let summary = encoded.map { String(decoding: $0, as: UTF8.self) } ?? "Observation metadata unavailable"
++        if let index = content.lastIndex(where: { $0["type"] as? String == "text" }) {
++            let prefix = content[index]["text"] as? String ?? ""
++            content[index]["text"] = observation.reason == "disabled" ? summary : prefix + "\n" + summary
++        } else {
++            content.append(["type": "text", "text": summary])
++        }
++        result["content"] = content
++        result["structuredContent"] = metadata
++        return result
+     }
+ 
+     /// Shared by image and text-only screenshots; OCR describes these exact bytes.
+@@ -373,7 +534,7 @@ private struct MCPHTTPClient {
+         let done = DispatchSemaphore(value: 0)
+         var request = request
+         request.timeoutInterval = timeout
+-        URLSession.shared.dataTask(with: request) { data, response, error in
++        let task = URLSession.shared.dataTask(with: request) { data, response, error in
+             if let error {
+                 result = .failure(MCPServer.MCPError(table.appNotRunning(error.localizedDescription)))
+             } else if let data, let http = response as? HTTPURLResponse {
+@@ -384,8 +545,12 @@ private struct MCPHTTPClient {
+                 }
+             }
+             done.signal()
+-        }.resume()
+-        done.wait()
++        }
++        task.resume()
++        guard done.wait(timeout: .now() + timeout) == .success else {
++            task.cancel()
++            throw MCPServer.MCPError("HTTP response timed out after \(timeout) seconds")
++        }
+         return try result.get()
+     }
+ }
+diff --git a/Sources/iPhoneUse/MCP/MCPTools.swift b/Sources/iPhoneUse/MCP/MCPTools.swift
+index 6ae75ae..65fc593 100644
+--- a/Sources/iPhoneUse/MCP/MCPTools.swift
++++ b/Sources/iPhoneUse/MCP/MCPTools.swift
+@@ -169,6 +169,11 @@ enum MCPToolCatalog {
+         ]
+         if !readOnly {
+             properties["observe"] = ["type": "string", "enum": ["full", "ocr_diff", "none"], "default": "full"]
++            properties["observation_timeout"] = [
++                "type": "number", "minimum": 0.2, "maximum": 5, "default": 1.5,
++                "description":
++                    "Seconds to observe after input. Reports fresh visual change/stability, not app completion; never retries input.",
++            ]
+         }
+         var schema: [String: Any] = ["type": "object", "properties": properties, "required": required]
+         if name == "keyboard_sequence" {
+diff --git a/Tests/PythonTests/test_mcp_stdio.py b/Tests/PythonTests/test_mcp_stdio.py
+index 6cc6570..ee39634 100644
+--- a/Tests/PythonTests/test_mcp_stdio.py
++++ b/Tests/PythonTests/test_mcp_stdio.py
+@@ -1,13 +1,17 @@
+ """Exercise the actual MCP launcher and Swift-to-HTTP bridge without phone input."""
+ import base64
+ from concurrent.futures import ThreadPoolExecutor
++import ctypes
+ import fcntl
+ import json
+ import os
++import struct
+ import subprocess
+ import tempfile
+ import threading
++import time
+ import unittest
++import zlib
+ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+ from pathlib import Path
+ from urllib.parse import parse_qs, urlsplit
+@@ -20,6 +24,35 @@ IMAGE = b"mock JPEG payload"
+ CONFIG = os.environ.get("IPHONE_USE_TEST_CONFIG", "debug")
+ 
+ 
++def capture_uptime():
++    # Match Foundation's systemUptime. Python's monotonic origin is not required
++    # to match the app's clock (and some execution hosts offset it per process).
++    class Timebase(ctypes.Structure):
++        _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
++
++    library = ctypes.CDLL(None)
++    library.mach_absolute_time.restype = ctypes.c_uint64
++    timebase = Timebase()
++    library.mach_timebase_info(ctypes.byref(timebase))
++    return library.mach_absolute_time() * timebase.numer / timebase.denom / 1_000_000_000
++
++
++def capture_reply(gray, sequence, received_at, source="capture-1"):
++    """Real decoded pixels plus metadata, without a platform image dependency."""
++    def chunk(kind, value):
++        return struct.pack(">I", len(value)) + kind + value + struct.pack(">I", zlib.crc32(kind + value))
++
++    pixels = (b"\0" + bytes([gray]) * 16) * 16
++    image = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 16, 16, 8, 0, 0, 0, 0))
++             + chunk(b"IDAT", zlib.compress(pixels)) + chunk(b"IEND", b""))
++    ocr = {"device": "phone-1", "width": 16, "height": 16, "screenHash": str(gray), "items": []}
++    return 200, image, {
++        "Content-Type": "image/png", "X-Device": "phone-1", "X-Image-Width": "16", "X-Image-Height": "16",
++        "X-Frame-Source": source, "X-Frame-Sequence": str(sequence), "X-Frame-Received-At": str(received_at),
++        "X-Screen-OCR": base64.b64encode(json.dumps(ocr).encode()).decode(),
++    }
++
++
+ class MockApp(BaseHTTPRequestHandler):
+     def log_message(self, *args):
+         pass
+@@ -37,6 +70,9 @@ class MockApp(BaseHTTPRequestHandler):
+         elif self.path.startswith("/screenshot?"):
+             if self.server.before_screenshot and "stability=1" not in self.path:
+                 self.server.before_screenshot(self.path)
++            if self.server.screenshot_response:
++                self.send(*self.server.screenshot_response(self.path))
++                return
+             device = parse_qs(urlsplit(self.path).query)["device"][0]
+             headers = {"Content-Type": "image/jpeg", "X-Device": device,
+                        "X-Image-Width": "500", "X-Image-Height": "1000"}
+@@ -86,6 +122,7 @@ class MCPStdioTests(unittest.TestCase):
+         self.server.devices_requested = threading.Event()
+         self.server.before_post = None
+         self.server.before_screenshot = None
++        self.server.screenshot_response = None
+         self.server.screen_ocr = None
+         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+         self.thread.start()
+@@ -126,7 +163,11 @@ class MCPStdioTests(unittest.TestCase):
+                  {"type": "key", "key": "enter"}]
+         result = self.exchange([("act", {"steps": steps, "device": "First", "observe": "none"})])[0]
+         self.assertNotIn("isError", result)
+-        self.assertEqual(json.loads(result["content"][0]["text"]), {"ok": True})
++        metadata = json.loads(result["content"][0]["text"])
++        self.assertTrue(metadata["ok"])
++        self.assertTrue(metadata["action_acknowledged"])
++        self.assertEqual(metadata["observation"]["status"], "unobserved")
++        self.assertEqual(metadata["observation"]["reason"], "disabled")
+         self.assertEqual(self.server.events, [
+             ("GET", "/config?wake=0"), ("GET", "/devices"),
+             ("POST", "/act", {"steps": steps, "device": "phone-1"}),
+@@ -188,11 +229,86 @@ class MCPStdioTests(unittest.TestCase):
+ 
+     def test_invalid_observation_and_later_act_step_never_send_input(self):
+         calls = [("home", {"observe": value}) for value in ("bad", True, 1)]
++        calls += [("home", {"observation_timeout": value}) for value in (True, "1", 0, 0.1, 5.1)]
++        calls += [("keyboard_sequence", {"steps": [{"key": "enter"}], "observation_timeout": value})
++                  for value in (True, "1", 0, 0.1, 5.1)]
+         calls += [("act", {"steps": [{"type": "home"}, {"type": "key", "key": "invalid-key"}]})]
+         for call in calls:
+             self.assertTrue(self.exchange([call])[0]["isError"])
+         self.assertEqual(self.server.events, [("GET", "/config?wake=0")] * len(calls))
+ 
++    def test_keyboard_sequence_accepts_its_advertised_observation_timeout(self):
++        result = self.exchange([("keyboard_sequence", {
++            "steps": [{"key": "enter"}], "observation_timeout": 0.5,
++        })])[0]
++        self.assertNotIn("isError", result)
++        self.assertTrue(result["structuredContent"]["action_acknowledged"])
++        self.assertEqual([event for event in self.server.events if event[0] == "POST"], [
++            ("POST", "/key", {"key": "enter", "modifiers": [], "device": "phone-1"}),
++        ])
++
++    def test_delayed_transition_returns_its_observed_image_without_replaying_input(self):
++        state = {"posted_at": None, "sequence": 0}
++        self.server.before_post = lambda body: state.update(posted_at=time.monotonic())
++
++        def screenshot(path):
++            now = time.monotonic()
++            state["sequence"] += 1
++            changed = state["posted_at"] is not None and now - state["posted_at"] >= 0.55
++            return capture_reply(240 if changed else 0, state["sequence"], capture_uptime())
++
++        self.server.screenshot_response = screenshot
++        result = self.exchange([("tap", {"x": 5, "y": 5})])[0]
++        self.assertNotIn("isError", result)
++        metadata = result["structuredContent"]
++        observation = metadata["observation"]
++        self.assertEqual(observation["status"], "changed")
++        self.assertTrue(observation["fresh"])
++        self.assertTrue(observation["visually_stable"])
++        self.assertTrue(observation["changed_from_baseline"])
++        self.assertGreaterEqual(observation["elapsed_ms"], 700)
++        self.assertLess(observation["elapsed_ms"], 1500)
++        self.assertEqual(result["content"][0]["data"], base64.b64encode(capture_reply(240, 1, 0)[1]).decode())
++        self.assertEqual(observation["frame"]["sequence"], str(state["sequence"]))
++        self.assertEqual(metadata["hid_delivery"], "unverified")
++        self.assertEqual(metadata["app_completion"], "unverified")
++        self.assertEqual(sum(event[0] == "POST" for event in self.server.events), 1)
++
++    def test_frozen_capture_is_unobserved_and_fresh_unchanged_capture_waits_full_window(self):
++        fixed_time = capture_uptime()
++        self.server.screenshot_response = lambda path: capture_reply(0, 1, fixed_time)
++        frozen = self.exchange([("home", {"observation_timeout": 0.5})])[0]
++        observation = frozen["structuredContent"]["observation"]
++        self.assertEqual(observation["status"], "unobserved")
++        self.assertEqual(observation["reason"], "no_fresh_frame")
++        self.assertFalse(observation["fresh"])
++        self.assertGreaterEqual(observation["elapsed_ms"], 500)
++        sequence = [0]
++
++        def fresh(path):
++            sequence[0] += 1
++            return capture_reply(0, sequence[0], capture_uptime())
++
++        self.server.screenshot_response = fresh
++        unchanged = self.exchange([("home", {"observation_timeout": 0.5})])[0]
++        observation = unchanged["structuredContent"]["observation"]
++        self.assertEqual(observation["status"], "stable")
++        self.assertTrue(observation["fresh"])
++        self.assertFalse(observation["changed_from_baseline"])
++        self.assertGreaterEqual(observation["elapsed_ms"], 500)
++        self.assertEqual(sum(event[0] == "POST" for event in self.server.events), 2)
++
++    def test_failed_capture_does_not_turn_acknowledged_input_into_a_retryable_action_error(self):
++        self.server.screenshot_response = lambda path: (503, b'{"error":"capture unavailable"}', None)
++        result = self.exchange([("home", {"observation_timeout": 0.3})])[0]
++        self.assertNotIn("isError", result)
++        metadata = result["structuredContent"]
++        self.assertTrue(metadata["action_acknowledged"])
++        self.assertEqual(metadata["observation"]["status"], "unobserved")
++        self.assertEqual(metadata["observation"]["reason"], "no_frame")
++        self.assertIn("capture unavailable", metadata["observation"]["detail"])
++        self.assertEqual(sum(event[0] == "POST" for event in self.server.events), 1)
++
+     def test_cached_selector_miss_refreshes_list_without_replaying_input(self):
+         def attach_second(body):
+             if len(self.server.devices) == 1:
+diff --git a/Tests/iPhoneUseTests/API/Phase2Tests.swift b/Tests/iPhoneUseTests/API/Phase2Tests.swift
+index 6e03900..ab3e99f 100644
+--- a/Tests/iPhoneUseTests/API/Phase2Tests.swift
++++ b/Tests/iPhoneUseTests/API/Phase2Tests.swift
+@@ -348,19 +348,6 @@ final class Phase2Tests: XCTestCase {
+         XCTAssertEqual(steps[2]["use_clipboard"] as? Bool, true)
+     }
+ 
+-    func testDynamicSettlingConvergesAndHonorsCeilingWithInjectedSleep() {
+-        var delays: [Double] = []
+-        var frames = ["a", "b", "b"]
+-        MCPServer.waitForStableFrame(sleep: { delays.append($0) }, now: { 0 }, frame: { _ in frames.removeFirst() })
+-        XCTAssertEqual(delays, [0.15, 0.08, 0.08])
+-        delays = []
+-        MCPServer.waitForStableFrame(sleep: { delays.append($0) }, now: { 0 }, frame: { _ in UUID().uuidString })
+-        XCTAssertEqual(delays.reduce(0, +), 0.6, accuracy: 0.00001)
+-        delays = []
+-        MCPServer.waitForStableFrame(sleep: { delays.append($0) }, now: { 0 }, frame: { _ in nil })
+-        XCTAssertEqual(delays, [0.15, 0.1])
+-    }
+-
+     func testDeviceCacheExpiresInvalidatesAndDoesNotCacheErrors() throws {
+         var cache = MCPServer.DeviceListCache()
+         var calls = 0
+diff --git a/Tests/iPhoneUseTests/MCP/MCPObservationTests.swift b/Tests/iPhoneUseTests/MCP/MCPObservationTests.swift
+new file mode 100644
+index 0000000..f3c9866
+--- /dev/null
++++ b/Tests/iPhoneUseTests/MCP/MCPObservationTests.swift
+@@ -0,0 +1,187 @@
++import Foundation
++import XCTest
++
++@testable import iPhoneUse
++
++final class MCPObservationTests: XCTestCase {
++    private func sample(
++        _ signature: String, sequence: UInt64, at: TimeInterval, source: String = "capture-1"
++    ) -> MCPServer.ObservationFrame {
++        MCPServer.ObservationFrame(
++            image: Data(signature.utf8), device: "phone-1", width: "500", height: "1000", mimeType: "image/png",
++            identity: MCPServer.FrameIdentity(source: source, sequence: sequence, receivedAt: at),
++            signature: signature)
++    }
++
++    func testDelayedTransitionCannotFinishOnTwoEqualOldFrames() {
++        var clock: TimeInterval = 10
++        var sequence: UInt64 = 1
++        let result = MCPServer.observeAfterAction(
++            baseline: sample("old", sequence: sequence, at: 9.9), acknowledgedAt: 10, timeout: 1.5,
++            sleep: { clock += $0 }, now: { clock },
++            frame: { remaining in
++                XCTAssertGreaterThan(remaining, 0)
++                sequence += 1
++                return self.sample(clock < 10.55 ? "old" : "new", sequence: sequence, at: clock)
++            })
++        XCTAssertEqual(result.status, .changed)
++        XCTAssertGreaterThanOrEqual(result.elapsed, 0.8)
++        XCTAssertLessThan(result.elapsed, 1.5)
++        XCTAssertTrue(result.fresh)
++        XCTAssertTrue(result.stable)
++        XCTAssertEqual(result.changed, true)
++        XCTAssertEqual(result.frame?.image, Data("new".utf8))
++    }
++
++    func testFrozenBaselineIsUnobservedEvenIfPixelsKeepMatching() {
++        var clock: TimeInterval = 10
++        let baseline = sample("old", sequence: 1, at: 9.9)
++        let result = MCPServer.observeAfterAction(
++            baseline: baseline, acknowledgedAt: 10, timeout: 1.5,
++            sleep: { clock += $0 }, now: { clock }, frame: { _ in baseline })
++        XCTAssertEqual(result.status, .unobserved)
++        XCTAssertEqual(result.reason, "no_fresh_frame")
++        XCTAssertFalse(result.fresh)
++        XCTAssertFalse(result.stable)
++        XCTAssertNil(result.changed)
++        XCTAssertEqual(result.elapsed, 1.5, accuracy: 0.00001)
++    }
++
++    func testFreshUnchangedOutputUsesEntireWindowAndDoesNotClaimAppCompletion() throws {
++        var clock: TimeInterval = 10
++        var sequence: UInt64 = 1
++        let result = MCPServer.observeAfterAction(
++            baseline: sample("same", sequence: sequence, at: 9.9), acknowledgedAt: 10, timeout: 1.5,
++            sleep: { clock += $0 }, now: { clock },
++            frame: { _ in
++                sequence += 1
++                return self.sample("same", sequence: sequence, at: clock)
++            })
++        XCTAssertEqual(result.status, .stable)
++        XCTAssertTrue(result.fresh)
++        XCTAssertTrue(result.stable)
++        XCTAssertEqual(result.changed, false)
++        XCTAssertEqual(result.elapsed, 1.5, accuracy: 0.00001)
++        let content = MCPServer.observationContent(result, includeImage: true, diff: false)
++        let metadata = try XCTUnwrap(content["structuredContent"] as? [String: Any])
++        XCTAssertEqual(metadata["action_acknowledged"] as? Bool, true)
++        XCTAssertEqual(metadata["hid_delivery"] as? String, "unverified")
++        XCTAssertEqual(metadata["app_completion"] as? String, "unverified")
++        let blocks = try XCTUnwrap(content["content"] as? [[String: Any]])
++        XCTAssertEqual(blocks.first?["data"] as? String, result.frame?.image.base64EncodedString())
++        XCTAssertTrue(try XCTUnwrap(blocks.last?["text"] as? String).contains("\"status\":\"stable\""))
++    }
++
++    func testRepeatedSingleFreshFrameCannotEstablishStability() {
++        var clock: TimeInterval = 10
++        let fresh = sample("new", sequence: 2, at: 10.1)
++        let result = MCPServer.observeAfterAction(
++            baseline: sample("old", sequence: 1, at: 9.9), acknowledgedAt: 10, timeout: 1.5,
++            sleep: { clock += $0 }, now: { clock }, frame: { _ in fresh })
++        XCTAssertEqual(result.status, .timeout)
++        XCTAssertTrue(result.fresh)
++        XCTAssertEqual(result.changed, true)
++        XCTAssertFalse(result.stable)
++    }
++
++    func testContinuousAnimationTimesOutWithLatestObservedImage() {
++        var clock: TimeInterval = 10
++        var sequence: UInt64 = 1
++        let result = MCPServer.observeAfterAction(
++            baseline: sample("old", sequence: sequence, at: 9.9), acknowledgedAt: 10, timeout: 0.5,
++            sleep: { clock += $0 }, now: { clock },
++            frame: { _ in
++                sequence += 1
++                return self.sample("frame-\(sequence)", sequence: sequence, at: clock)
++            })
++        XCTAssertEqual(result.status, .timeout)
++        XCTAssertTrue(result.fresh)
++        XCTAssertFalse(result.stable)
++        XCTAssertEqual(result.frame?.image, Data("frame-\(sequence)".utf8))
++        XCTAssertEqual(result.elapsed, 0.5, accuracy: 0.00001)
++    }
++
++    func testMissingFramesRemainExplicitAndNoOpSleepStillTerminates() {
++        var delays: [TimeInterval] = []
++        let result = MCPServer.observeAfterAction(
++            baseline: nil, acknowledgedAt: 10, timeout: 1.5,
++            sleep: { delays.append($0) }, now: { 10 }, frame: { _ in nil })
++        XCTAssertEqual(result.status, .unobserved)
++        XCTAssertEqual(result.reason, "no_frame")
++        XCTAssertNil(result.frame)
++        XCTAssertEqual(delays.reduce(0, +), 1.5, accuracy: 0.00001)
++    }
++
++    func testMissingMetadataDoesNotPretendAnOldServerProvedFreshness() {
++        var legacy = sample("new", sequence: 2, at: 10.1)
++        legacy = MCPServer.ObservationFrame(
++            image: legacy.image, device: legacy.device, width: legacy.width, height: legacy.height,
++            mimeType: legacy.mimeType, identity: nil, signature: legacy.signature)
++        let result = MCPServer.observeAfterAction(
++            baseline: nil, acknowledgedAt: 10, timeout: 1.5,
++            sleep: { _ in }, now: { 10 }, frame: { _ in legacy })
++        XCTAssertEqual(result.status, .unobserved)
++        XCTAssertEqual(result.reason, "missing_frame_metadata")
++        XCTAssertFalse(result.fresh)
++        XCTAssertEqual(result.frame?.image, legacy.image)
++    }
++
++    func testMissingBaselineLeavesChangeUnknownDespiteFreshStableFrames() {
++        var clock: TimeInterval = 10
++        var sequence: UInt64 = 0
++        let result = MCPServer.observeAfterAction(
++            baseline: nil, acknowledgedAt: 10, timeout: 0.8,
++            sleep: { clock += $0 }, now: { clock },
++            frame: { _ in
++                sequence += 1
++                return self.sample("same", sequence: sequence, at: clock)
++            })
++        XCTAssertEqual(result.status, .stable)
++        XCTAssertNil(result.changed)
++        XCTAssertEqual(result.elapsed, 0.8, accuracy: 0.00001)
++    }
++
++    func testCaptureRestartAcceptsResetSequenceOnlyWithNewerTimestamp() {
++        var clock: TimeInterval = 10
++        var sequence: UInt64 = 0
++        let result = MCPServer.observeAfterAction(
++            baseline: sample("old", sequence: 1000, at: 9.9), acknowledgedAt: 10, timeout: 1.5,
++            sleep: { clock += $0 }, now: { clock },
++            frame: { _ in
++                sequence += 1
++                return self.sample("new", sequence: sequence, at: clock, source: "capture-2")
++            })
++        XCTAssertEqual(result.status, .changed)
++        XCTAssertEqual(result.frame?.identity?.source, "capture-2")
++        XCTAssertLessThan(result.frame?.identity?.sequence ?? 1000, 1000)
++        XCTAssertFalse(
++            MCPServer.FrameIdentity(source: "capture-2", sequence: 1, receivedAt: 9.8)
++                .isNewer(than: sample("old", sequence: 1000, at: 9.9).identity))
++    }
++
++    func testAFrameBeforeAcknowledgementCannotConfirmTheFinalAction() {
++        let result = MCPServer.observeAfterAction(
++            baseline: sample("old", sequence: 1, at: 8), acknowledgedAt: 10, timeout: 0.5,
++            sleep: { _ in }, now: { 10 }, frame: { _ in self.sample("new", sequence: 2, at: 9) })
++        XCTAssertEqual(result.status, .unobserved)
++        XCTAssertFalse(result.fresh)
++    }
++
++    func testTimeoutAndFrameMetadataRejectInvalidFiniteValues() throws {
++        for raw: Any in [true, "1", 0, 0.1, 5.01, Double.nan, Double.infinity, -Double.infinity] {
++            XCTAssertThrowsError(try MCPServer.observationTimeout(raw))
++        }
++        XCTAssertEqual(try MCPServer.observationTimeout(nil), 1.5)
++        XCTAssertEqual(try MCPServer.observationTimeout(0.2), 0.2)
++        XCTAssertEqual(try MCPServer.observationTimeout(5), 5)
++        for timestamp in ["nan", "inf", "-1", "missing"] {
++            let response = try XCTUnwrap(
++                HTTPURLResponse(
++                    url: URL(string: "http://127.0.0.1/screenshot")!, statusCode: 200, httpVersion: nil,
++                    headerFields: [
++                        "X-Frame-Source": "capture", "X-Frame-Sequence": "1", "X-Frame-Received-At": timestamp,
++                    ]))
++            XCTAssertNil(MCPServer.FrameIdentity.parse(response))
++        }
++    }
++}
+diff --git a/Tests/iPhoneUseTests/MCP/MCPProtocolTests.swift b/Tests/iPhoneUseTests/MCP/MCPProtocolTests.swift
+index 6103401..7795616 100644
+--- a/Tests/iPhoneUseTests/MCP/MCPProtocolTests.swift
++++ b/Tests/iPhoneUseTests/MCP/MCPProtocolTests.swift
+@@ -151,7 +151,10 @@ final class MCPProtocolTests: XCTestCase {
+         let properties = try XCTUnwrap(schema["properties"] as? [String: [String: Any]])
+         XCTAssertEqual(
+             Set(properties.keys),
+-            ["points", "duration", "normalized", "device", "device_id", "include_image", "observe"])
++            [
++                "points", "duration", "normalized", "device", "device_id", "include_image", "observe",
++                "observation_timeout",
++            ])
+         let points = try XCTUnwrap(properties["points"])
+         XCTAssertEqual(points["type"] as? String, "array")
+         XCTAssertEqual(points["minItems"] as? Int, 2)

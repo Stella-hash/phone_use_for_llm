@@ -1,0 +1,898 @@
+diff --git a/Sources/iPhoneUse/Devices/DeviceRegistry.swift b/Sources/iPhoneUse/Devices/DeviceRegistry.swift
+index a177073..8acdcd3 100644
+--- a/Sources/iPhoneUse/Devices/DeviceRegistry.swift
++++ b/Sources/iPhoneUse/Devices/DeviceRegistry.swift
+@@ -356,6 +356,7 @@ final class DeviceRegistry {
+                 // Bluetooth session may remain unchanged.
+                 { ScreenCaptureManager.shared.all.first { $0.id == id }?.size }
+             },
++            displayMappingProvider: DeviceDisplayMapping.provider(screenID: screenID),
+             inputIsAllowed: { [weak screen] in
+                 let manager = ScreenCaptureManager.shared
+                 guard let screen else { return screenID == nil && manager.permitsPointerAssociation }
+diff --git a/Sources/iPhoneUse/Input/DeviceAccessibility.swift b/Sources/iPhoneUse/Input/DeviceAccessibility.swift
+index 4156266..f0ddf96 100644
+--- a/Sources/iPhoneUse/Input/DeviceAccessibility.swift
++++ b/Sources/iPhoneUse/Input/DeviceAccessibility.swift
+@@ -17,17 +17,36 @@ enum DeviceAccessibility {
+         guard ["app", "point"].contains(scope), x.isFinite, y.isFinite,
+             (0...1000).contains(x), (0...1000).contains(y)
+         else { throw DeviceError("Native AX scope must be app or point, with x/y in 0...1000") }
++        return try run(
++            request: ["scope": scope, "x": x, "y": y, "include_hidden": includeHidden],
++            arguments: [], source: "ios-native-ax", purpose: "Native AX", environment: environment, timeout: timeout)
++    }
++
++    /// Reads CoreDevice's current display orientation without opening an AX
++    /// subscription. Coordinate input uses a shorter deadline than observations.
++    static func readDisplay(
++        environment: [String: String] = ProcessInfo.processInfo.environment,
++        timeout: TimeInterval = 3
++    ) throws -> [String: Any] {
++        try run(
++            request: [:], arguments: ["--display-only"], source: "ios-native-display", purpose: "Native display",
++            environment: environment, timeout: timeout)
++    }
++
++    private static func run(
++        request: [String: Any], arguments: [String], source: String, purpose: String,
++        environment: [String: String], timeout: TimeInterval
++    ) throws -> [String: Any] {
+         guard timeout.isFinite, timeout > 0, timeout <= 12 else {
+-            throw DeviceError("Native AX timeout must be positive and no greater than 12 seconds")
++            throw DeviceError("\(purpose) timeout must be positive and no greater than 12 seconds")
+         }
+         let configuration = try DeviceClipboard.Configuration(environment: environment)
+         guard let helper = environment[helperKey], helper.hasPrefix("/"), !helper.contains("\0"),
+             FileManager.default.isReadableFile(atPath: helper)
+-        else { throw DeviceError("Native AX helper is unavailable; configure IPHONE_USE_AX_HELPER") }
++        else { throw DeviceError("\(purpose) helper is unavailable; configure IPHONE_USE_AX_HELPER") }
+         guard FileManager.default.isExecutableFile(atPath: configuration.python.path) else {
+-            throw DeviceError("Native AX Python is unavailable; run the configured USB setup")
++            throw DeviceError("\(purpose) Python is unavailable; run the configured USB setup")
+         }
+-        let request: [String: Any] = ["scope": scope, "x": x, "y": y, "include_hidden": includeHidden]
+         let directory = FileManager.default.temporaryDirectory
+             .appendingPathComponent("iphone-use-native-ax-\(UUID().uuidString)")
+         try FileManager.default.createDirectory(
+@@ -43,7 +62,7 @@ enum DeviceAccessibility {
+             guard
+                 FileManager.default.createFile(
+                     atPath: url.path, contents: contents, attributes: [.posixPermissions: 0o600])
+-            else { throw DeviceError("Could not prepare private native AX helper files") }
++            else { throw DeviceError("Could not prepare private \(purpose) helper files") }
+         }
+         let input = try FileHandle(forReadingFrom: inputURL)
+         let output = try FileHandle(forWritingTo: outputURL)
+@@ -55,7 +74,7 @@ enum DeviceAccessibility {
+         }
+         let process = Process()
+         process.executableURL = configuration.python
+-        process.arguments = [helper]
++        process.arguments = [helper] + arguments
+         process.environment = configuration.childEnvironment(environment)
+         process.standardInput = input
+         process.standardOutput = output
+@@ -63,7 +82,7 @@ enum DeviceAccessibility {
+         let finished = DispatchSemaphore(value: 0)
+         process.terminationHandler = { _ in finished.signal() }
+         do { try process.run() } catch {
+-            throw DeviceError("Could not start native AX helper: \(error.localizedDescription)")
++            throw DeviceError("Could not start \(purpose) helper: \(error.localizedDescription)")
+         }
+         guard finished.wait(timeout: .now() + timeout) == .success else {
+             // SIGTERM lets the owned helper close its AX subscription and
+@@ -73,25 +92,25 @@ enum DeviceAccessibility {
+                 if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+                 _ = finished.wait(timeout: .now() + 1)
+             }
+-            throw DeviceError("Native AX observation timed out; no screenshot/OCR fallback or UI action was performed")
++            throw DeviceError("\(purpose) read timed out; no fallback was used")
+         }
+         guard process.terminationReason == .exit, process.terminationStatus == 0 else {
+             let file = try? FileHandle(forReadingFrom: errorURL)
+             defer { try? file?.close() }
+             let data = (try? file?.read(upToCount: 1200)) ?? Data()
+             let detail = String(data: data, encoding: .utf8) ?? ""
+-            throw DeviceError("Native AX helper failed (\(process.terminationStatus)): \(detail)")
++            throw DeviceError("\(purpose) helper failed (\(process.terminationStatus)): \(detail)")
+         }
+         let attributes = try FileManager.default.attributesOfItem(atPath: outputURL.path)
+         guard let size = attributes[.size] as? NSNumber, size.intValue <= maximumOutputBytes else {
+-            throw DeviceError("Native AX helper exceeded the JSON byte budget; no partial tree returned")
++            throw DeviceError("\(purpose) helper exceeded the JSON byte budget; no partial result returned")
+         }
+         let data = try Data(contentsOf: outputURL)
+         guard let result = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+             result["schema_version"] as? Int == 1,
+-            result["source"] as? String == "ios-native-ax",
++            result["source"] as? String == source,
+             let status = result["status"] as? String, ["ok", "unavailable"].contains(status)
+-        else { throw DeviceError("Native AX helper returned an invalid observation envelope") }
++        else { throw DeviceError("\(purpose) helper returned an invalid observation envelope") }
+         return result
+     }
+ }
+diff --git a/Sources/iPhoneUse/Input/DeviceDisplayMapping.swift b/Sources/iPhoneUse/Input/DeviceDisplayMapping.swift
+new file mode 100644
+index 0000000..29be4d0
+--- /dev/null
++++ b/Sources/iPhoneUse/Input/DeviceDisplayMapping.swift
+@@ -0,0 +1,111 @@
++import CoreFoundation
++import Foundation
++
++/// The display's rotation relative to the native HID axes, observed through
++/// CoreDevice for the configured USB phone. Capture aspect alone cannot identify
++/// which of the two landscape rotations is active.
++struct DeviceDisplayMapping: Equatable {
++    let rotationDegrees: Int
++    let nativeWidth: Int
++    let nativeHeight: Int
++
++    var displaySize: CGSize {
++        rotationDegrees == 90 || rotationDegrees == 270
++            ? CGSize(width: nativeHeight, height: nativeWidth)
++            : CGSize(width: nativeWidth, height: nativeHeight)
++    }
++
++    init(rotationDegrees: Int, nativeWidth: Int, nativeHeight: Int) throws {
++        guard [0, 90, 180, 270].contains(rotationDegrees),
++            (1...16384).contains(nativeWidth), (1...16384).contains(nativeHeight)
++        else { throw DeviceError("Native display returned an invalid rotation or size") }
++        self.rotationDegrees = rotationDegrees
++        self.nativeWidth = nativeWidth
++        self.nativeHeight = nativeHeight
++    }
++
++    init(result: [String: Any], deviceID: String) throws {
++        guard Self.integer(result["schema_version"]) == 1,
++            result["source"] as? String == "ios-native-display"
++        else { throw DeviceError("Native display returned an invalid observation envelope") }
++        if result["status"] as? String == "unavailable" {
++            // Opening the selected service can fail before an identity is
++            // available. Preserve that diagnosis rather than calling it a
++            // wrong-device response; only successful reads may authorize input.
++            let reason = result["reason"] as? [String: Any]
++            let code = Self.bounded(reason?["code"] as? String ?? "unavailable", bytes: 80)
++            let message = Self.bounded(reason?["message"] as? String ?? "", bytes: 240)
++            throw DeviceError(
++                "Native display orientation unavailable (\(code)): \(message); no coordinate input was sent by this read")
++        }
++        guard result["status"] as? String == "ok" else {
++            throw DeviceError("Native display returned an invalid observation status")
++        }
++        guard result["device_id"] as? String == deviceID else {
++            throw DeviceError("Native display identity does not match the configured USB phone")
++        }
++        guard let display = result["display"] as? [String: Any] else {
++            throw DeviceError("Native display returned no orientation; no coordinate input was sent by this read")
++        }
++        let rotations = ["rot0": 0, "rot90": 90, "rot180": 180, "rot270": 270]
++        guard let nativeName = display["native_orientation"] as? String,
++            let currentName = display["current_orientation"] as? String,
++            let native = rotations[nativeName], let current = rotations[currentName],
++            let rotation = Self.integer(display["rotation_degrees"]), rotation == (current - native + 360) % 360,
++            let width = Self.integer(display["native_width"]), let height = Self.integer(display["native_height"])
++        else { throw DeviceError("Native display orientation is malformed; no coordinate input was sent by this read") }
++        try self.init(rotationDegrees: rotation, nativeWidth: width, nativeHeight: height)
++        guard Self.integer(display["display_width"]) == Int(displaySize.width),
++            Self.integer(display["display_height"]) == Int(displaySize.height)
++        else { throw DeviceError("Native display dimensions disagree with its orientation") }
++    }
++
++    private static func bounded(_ value: String, bytes: Int) -> String {
++        String(decoding: value.utf8.prefix(bytes), as: UTF8.self)
++    }
++
++    private static func integer(_ value: Any?) -> Int? {
++        guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
++            number.doubleValue.isFinite, number.doubleValue == number.doubleValue.rounded(),
++            (-16384...16384).contains(number.doubleValue)
++        else { return nil }
++        return number.intValue
++    }
++
++    func validate(captureSize: CGSize?) throws {
++        guard let captureSize, captureSize.width.isFinite, captureSize.height.isFinite,
++            captureSize.width > 0, captureSize.height > 0,
++            // USB capture rasterizes the observed 1179-pixel native width to
++            // 1180. This allowance is for raster rounding, not inferred rotation.
++            abs(captureSize.width - displaySize.width) <= 2,
++            abs(captureSize.height - displaySize.height) <= 2
++        else { throw DeviceError("Native display orientation does not match the current capture dimensions") }
++    }
++
++    /// Inverse of the phone's HID-to-display map. Coordinates remain normalized
++    /// to the visible capture everywhere above this absolute-report boundary.
++    func hidPoint(x: Double, y: Double) -> (x: Double, y: Double) {
++        switch rotationDegrees {
++        case 90: (y, 1 - x)
++        case 180: (1 - x, 1 - y)
++        case 270: (1 - y, x)
++        default: (x, y)
++        }
++    }
++
++    /// No helper configured means unchanged upstream behavior. A configured but
++    /// invalid provider fails explicitly, never silently falls back to portrait.
++    static func provider(
++        screenID: String?, environment: [String: String] = ProcessInfo.processInfo.environment
++    ) -> (() throws -> DeviceDisplayMapping)? {
++        guard environment[DeviceAccessibility.helperKey] != nil else { return nil }
++        return {
++            guard let screenID, let selected = environment["IPHONE_USE_DEVICE_ID"], screenID == selected else {
++                throw DeviceError("Native display requires the exact configured capture device")
++            }
++            let configuration = try DeviceClipboard.Configuration(environment: environment)
++            return try DeviceDisplayMapping(
++                result: DeviceAccessibility.readDisplay(environment: environment), deviceID: configuration.deviceID)
++        }
++    }
++}
+diff --git a/Sources/iPhoneUse/Input/DeviceInput.swift b/Sources/iPhoneUse/Input/DeviceInput.swift
+index 8c34487..5aab2fb 100644
+--- a/Sources/iPhoneUse/Input/DeviceInput.swift
++++ b/Sources/iPhoneUse/Input/DeviceInput.swift
+@@ -50,6 +50,7 @@ final class DeviceInput {
+     private let sleep: (TimeInterval) -> Void
+     private var windowDragging = false
+     let calibration: RelativePointerCalibration?
++    /// Raw HID coordinates, including when the visible display is rotated.
+     private var absolutePointerPosition: (x: UInt16, y: UInt16)?
+     /// The last report handed to the transport, independent of the estimated
+     /// landing after relative movement. Transport acceptance is not a device ack.
+@@ -64,6 +65,9 @@ final class DeviceInput {
+     /// drag runs on the relative collection. Nil outside a drag.
+     private var dragPosition: CGPoint?
+     private let motionSequence = PointerMotionSequence()
++    /// Cancellation may arrive while a window press is reading USB orientation.
++    /// Normal drag/release supersede motion, but must not cancel their own press.
++    private let windowCancellationSequence = PointerMotionSequence()
+     // Background cancellation must not supersede a foreground hover already
+     // submitted by the timer for the same AppKit mouse event.
+     private let backgroundSequence = PointerMotionSequence()
+@@ -75,6 +79,10 @@ final class DeviceInput {
+     private let screenID: String?
+     private let screenSize: (() -> CGSize?)?
+     private let heldDragProfile: HeldDragProfile.Selection
++    private let displayMappingProvider: (() throws -> DeviceDisplayMapping)?
++    /// Queue-confined. Refresh at a gesture boundary; never change coordinate
++    /// systems in the middle of a held touch.
++    private var displayMapping: DeviceDisplayMapping?
+ 
+     /// A read-only snapshot for `/status`, including the curve actually loaded
+     /// in memory so diagnostics do not infer it from potentially stale files.
+@@ -166,6 +174,7 @@ final class DeviceInput {
+         screenID: String? = nil,
+         screenSize: (() -> CGSize?)? = nil,
+         heldDragProfile: HeldDragProfile.Selection = .load(),
++        displayMappingProvider: (() throws -> DeviceDisplayMapping)? = nil,
+         inputIsAllowed: @escaping () -> Bool = { true },
+         sleep: @escaping (TimeInterval) -> Void = Thread.sleep(forTimeInterval:),
+         reportSender: ((ReportID, [UInt8]) -> Void)? = nil,
+@@ -179,6 +188,7 @@ final class DeviceInput {
+         self.screenID = screenID
+         self.screenSize = screenSize
+         self.heldDragProfile = heldDragProfile
++        self.displayMappingProvider = displayMappingProvider
+         self.inputIsAllowed = inputIsAllowed
+         self.sleep = sleep
+         self.reportReadiness =
+@@ -457,6 +467,8 @@ extension DeviceInput {
+                 }
+             }
+ 
++            try refreshDisplayMapping()
++
+             // The explicit profile can differ from this input's screen mapping.
+             // Do not reuse either mapping's estimate across that boundary.
+             clearPointerEstimate()
+@@ -527,6 +539,12 @@ extension DeviceInput {
+             // Calibrated movement may take several connection intervals. Drop
+             // old hover targets instead of replaying a growing mouse backlog.
+             guard self.motionSequence.isCurrent(sequence) else { return }
++            do { try self.refreshDisplayMapping() }
++            catch {
++                if self.windowDragging { self.rejectWindowDrag(error) }
++                else { log("pointer mapping unavailable: \(error)") }
++                return
++            }
+             self.pointer(x, y, sequence: sequence)
+         }
+     }
+@@ -536,16 +554,26 @@ extension DeviceInput {
+     /// forwarded while it is happening instead of being buffered as one long swipe.
+     func press(x: Double, y: Double) {
+         discardPendingMotion()
++        let cancellation = windowCancellationSequence.current
+         queue.async {
+             guard !self.windowDragging, self.coordinateMappingAvailable else { return }
+-            do { _ = try self.activeHeldDragProfile() }
++            do {
++                try self.refreshDisplayMapping()
++                _ = try self.activeHeldDragProfile()
++            }
+             catch { log("held drag rejected: \(error)"); return }
++            guard self.windowCancellationSequence.isCurrent(cancellation), self.coordinateMappingAvailable else { return }
+             self.windowDragging = true
+             // Position through the absolute collection, then press on the
+             // relative collection: iOS synthesizes the touch there.
+             self.pointer(x, y)
+             // Use the same positioning interval as the coordinate tap API.
+             self.pause(self.step * 2)
++            guard self.windowCancellationSequence.isCurrent(cancellation), self.coordinateMappingAvailable else {
++                self.windowDragging = false
++                self.endEstimatedDrag()
++                return
++            }
+             self.beginEstimatedDrag(x: x, y: y)
+             self.button(down: true)
+         }
+@@ -557,7 +585,10 @@ extension DeviceInput {
+             guard self.windowDragging,
+                 self.motionSequence.isCurrent(sequence)
+             else { return }
+-            do { try self.dragMove(x, y, sequence: sequence) }
++            do {
++                try self.refreshDisplayMapping()
++                try self.dragMove(x, y, sequence: sequence)
++            }
+             catch { self.rejectWindowDrag(error) }
+         }
+     }
+@@ -566,7 +597,10 @@ extension DeviceInput {
+         discardPendingMotion()
+         queue.async {
+             guard self.windowDragging else { return }
+-            do { try self.dragMove(x, y, sequence: nil, finishing: true) }
++            do {
++                try self.refreshDisplayMapping()
++                try self.dragMove(x, y, sequence: nil, finishing: true)
++            }
+             catch { self.rejectWindowDrag(error); return }
+             self.button(down: false)
+             self.windowDragging = false
+@@ -584,6 +618,7 @@ extension DeviceInput {
+     /// Always clear the phone-side button state when the window loses focus or
+     /// the mouse interaction is cancelled outside the view.
+     func cancelPointer() {
++        windowCancellationSequence.advance()
+         discardPendingMotion()
+         queue.async {
+             self.windowDragging = false
+@@ -591,6 +626,10 @@ extension DeviceInput {
+             if self.estimatedPosition == nil { self.relativeHomingReportIndex = 0 }
+             guard self.buttons != 0 else { return }
+             self.button(down: false)
++            // Configured display mode never sends absolute button-down while
++            // dragging. Release its relative touch immediately, without a USB
++            // query or replay of coordinates from a possibly rotated display.
++            guard self.displayMappingProvider == nil else { return }
+             // The drag positioned the pointer through the absolute collection.
+             // Clear that collection at its last position so no cancellation
+             // path can leave a held button behind on either collection.
+@@ -783,9 +822,11 @@ extension DeviceInput {
+         _ x: Double, _ y: Double, sequence: UInt64?, isReady: () -> Bool = { true }
+     ) {
+         guard shouldContinueMotion(sequence), isReady() else { return }
+-        let max = Double(HIDReportMap.absoluteMax)
+-        let px = UInt16(Swift.max(0, Swift.min(max, (x * max).rounded())))
+-        let py = UInt16(Swift.max(0, Swift.min(max, (y * max).rounded())))
++        // Held touches use only the relative collection. Do not introduce an
++        // absolute press that cancellation would need to clear by replaying an
++        // old coordinate after the display rotates.
++        guard buttons == 0 || displayMappingProvider == nil else { return }
++        let (px, py) = absoluteCoordinates(x, y)
+         let repeatsAfterRelativeMotion = relativeMotionSinceAbsoluteReport
+             && lastAbsoluteReportPosition.map { $0.x == px && $0.y == py } == true
+         if buttons == 0, lastAbsoluteReportPosition == nil || repeatsAfterRelativeMotion {
+@@ -794,7 +835,7 @@ extension DeviceInput {
+             // of the phone's last report (for example after quiet capture restarts).
+             // Reassert both axes through a nearby,
+             // button-up coordinate before returning to the exact requested one.
+-            let size = screenSize?()
++            let size = displayMapping.map { CGSize(width: $0.nativeWidth, height: $0.nativeHeight) } ?? screenSize?()
+             let nx = Self.absoluteResetNeighbor(px, screenDimension: size.map { Double($0.width) })
+             let ny = Self.absoluteResetNeighbor(py, screenDimension: size.map { Double($0.height) })
+             absolutePointerPosition = (nx, ny)
+@@ -811,6 +852,14 @@ extension DeviceInput {
+         send(.absolutePointer, HIDReportPayload.absolutePointer(buttons: buttons, x: px, y: py))
+     }
+ 
++    private func absoluteCoordinates(_ x: Double, _ y: Double) -> (UInt16, UInt16) {
++        let point = displayMapping?.hidPoint(x: x, y: y) ?? (x: x, y: y)
++        let maximum = Double(HIDReportMap.absoluteMax)
++        return (
++            UInt16(max(0, min(maximum, (point.x * maximum).rounded()))),
++            UInt16(max(0, min(maximum, (point.y * maximum).rounded()))))
++    }
++
+     private static func absoluteResetNeighbor(_ coordinate: UInt16, screenDimension: Double?) -> UInt16 {
+         let maximum = HIDReportMap.absoluteMax
+         // Two physical pixels avoid a subpixel-only transition. Without frame
+@@ -921,11 +970,7 @@ extension DeviceInput {
+         dragPosition = position
+         // Keep the absolute bookkeeping where the phone most likely shows the
+         // pointer, so a later hover or cancellation does not jump it.
+-        let unit = Double(HIDReportMap.absoluteMax)
+-        absolutePointerPosition = (
+-            UInt16(max(0, min(unit, (position.x / size.width * unit).rounded()))),
+-            UInt16(max(0, min(unit, (position.y / size.height * unit).rounded())))
+-        )
++        absolutePointerPosition = absoluteCoordinates(position.x / size.width, position.y / size.height)
+         return movementWait
+     }
+ 
+@@ -933,15 +978,20 @@ extension DeviceInput {
+     /// absolute move/tap and keyboard input remain available for recovery.
+     private func activeHeldDragProfile() throws -> HeldDragProfile? {
+         guard calibration == nil else { return nil }
++        let profile: HeldDragProfile?
+         switch heldDragProfile {
+-        case .notConfigured: return nil
++        case .notConfigured: profile = nil
+         case .invalid(let issue): throw InputError.heldDragProfileUnavailable(issue)
+-        case .loaded(let profile):
+-            if let issue = profile.bindingIssue(host: host, screenID: screenID, size: screenSize?(), interval: step) {
++        case .loaded(let loaded):
++            if let issue = loaded.bindingIssue(host: host, screenID: screenID, size: screenSize?(), interval: step) {
+                 throw InputError.heldDragProfileUnavailable(issue)
+             }
+-            return profile
++            profile = loaded
++        }
++        if let displayMapping, displayMapping.rotationDegrees != 0 {
++            throw InputError.heldDragProfileUnavailable("Held motion has not been validated for this display rotation")
+         }
++        return profile
+     }
+ 
+     private func moveMeasuredDragPointer(
+@@ -961,10 +1011,7 @@ extension DeviceInput {
+                 x: max(0, min(size.width - 1, movement.position.x)),
+                 y: max(0, min(size.height - 1, movement.position.y)))
+             dragPosition = position
+-            let unit = Double(HIDReportMap.absoluteMax)
+-            absolutePointerPosition = (
+-                UInt16((position.x / size.width * unit).rounded()),
+-                UInt16((position.y / size.height * unit).rounded()))
++            absolutePointerPosition = absoluteCoordinates(position.x / size.width, position.y / size.height)
+             pause(profile.reportInterval)
+             movementWait += profile.reportInterval
+             if !finishing { break }
+@@ -1027,10 +1074,51 @@ extension DeviceInput {
+         try queue.sync {
+             try requireIdlePointer()
+             try requireCoordinateMapping()
++            try refreshDisplayMapping()
+             try gesture()
+         }
+     }
+ 
++    private func refreshDisplayMapping() throws {
++        guard let displayMappingProvider else { return }
++        do {
++            if buttons != 0 || windowDragging {
++                // press→drag→release is one gesture, just like API swipe. Do
++                // not hold a touch through another USB subprocess or change
++                // axes mid-gesture. Dimension changes stop the touch; a same-
++                // aspect rotation during the hold cannot be detected here.
++                guard let displayMapping else {
++                    throw DeviceError("Held gesture lost its display mapping; release without replay")
++                }
++                try displayMapping.validate(captureSize: screenSize?())
++                guard !isRetired, inputIsAllowed() else { throw InputError.calibrationMismatch }
++                return
++            }
++            let observed = try displayMappingProvider()
++            try observed.validate(captureSize: screenSize?())
++            guard !isRetired, inputIsAllowed() else { throw InputError.calibrationMismatch }
++            if calibration != nil, observed.rotationDegrees != 0 {
++                throw DeviceError("Relative calibration has not been validated for this display rotation")
++            }
++            if displayMapping != observed {
++                clearPointerEstimate()
++                absolutePointerPosition = nil
++                lastAbsoluteReportPosition = nil
++                relativeMotionSinceAbsoluteReport = false
++                displayMapping = observed
++            }
++        } catch {
++            // An unsuccessful read cannot authorize using a previous mapping on
++            // the next request. Recovery must observe and prime again.
++            displayMapping = nil
++            absolutePointerPosition = nil
++            lastAbsoluteReportPosition = nil
++            relativeMotionSinceAbsoluteReport = false
++            clearPointerEstimate()
++            throw error
++        }
++    }
++
+     fileprivate func clearPointerEstimate() {
+         estimatedPosition = nil
+         relativeHomingReportIndex = 0
+diff --git a/Tests/iPhoneUseTests/Input/DeviceAccessibilityTests.swift b/Tests/iPhoneUseTests/Input/DeviceAccessibilityTests.swift
+index ae41d01..7eebde7 100644
+--- a/Tests/iPhoneUseTests/Input/DeviceAccessibilityTests.swift
++++ b/Tests/iPhoneUseTests/Input/DeviceAccessibilityTests.swift
+@@ -64,6 +64,21 @@ final class DeviceAccessibilityTests: XCTestCase {
+         XCTAssertEqual((result["reason"] as? [String: Any])?["code"] as? String, "service_unavailable")
+     }
+ 
++    func testDisplayOnlyUsesTheSameExactTargetIsolationAndFixedCLI() throws {
++        let directory = try temporary()
++        let environment = try helper(
++            "printf '%s\\n' \"$@\" > '\(directory.path)/arguments'\n"
++                + "printf '%s' \"$PYMOBILEDEVICE3_UDID\" > '\(directory.path)/target'\n"
++                + "printf '%s' '{\"schema_version\":1,\"source\":\"ios-native-display\",\"status\":\"ok\"}'\n",
++            in: directory)
++        let result = try DeviceAccessibility.readDisplay(environment: environment)
++        XCTAssertEqual(result["source"] as? String, "ios-native-display")
++        XCTAssertEqual(try String(contentsOf: directory.appendingPathComponent("target"), encoding: .utf8), deviceID)
++        XCTAssertEqual(
++            try String(contentsOf: directory.appendingPathComponent("arguments"), encoding: .utf8),
++            directory.appendingPathComponent("tree.py").path + "\n--display-only\n")
++    }
++
+     func testInvalidOptionsFailBeforeLaunchingHelper() throws {
+         let directory = try temporary()
+         let environment = try helper("touch '\(directory.path)/called'\n", in: directory)
+diff --git a/Tests/iPhoneUseTests/Input/DeviceDisplayMappingTests.swift b/Tests/iPhoneUseTests/Input/DeviceDisplayMappingTests.swift
+new file mode 100644
+index 0000000..1a4f40a
+--- /dev/null
++++ b/Tests/iPhoneUseTests/Input/DeviceDisplayMappingTests.swift
+@@ -0,0 +1,73 @@
++import Foundation
++import XCTest
++
++@testable import iPhoneUse
++
++final class DeviceDisplayMappingTests: XCTestCase {
++    private let deviceID = "00000000-0000000000000001"
++
++    private func envelope() -> [String: Any] {
++        ["schema_version": 1, "source": "ios-native-display", "status": "ok", "device_id": deviceID,
++            "display": ["native_orientation": "rot0", "current_orientation": "rot270", "rotation_degrees": 270,
++                "native_width": 1179, "native_height": 2556, "display_width": 2556, "display_height": 1179]]
++    }
++
++    func testNativeEnvelopeAcceptsObservedRasterRoundingButNotAStaleCapture() throws {
++        let mapping = try DeviceDisplayMapping(result: envelope(), deviceID: deviceID)
++        XCTAssertEqual(mapping.rotationDegrees, 270)
++        try mapping.validate(captureSize: CGSize(width: 2556, height: 1180))
++        XCTAssertThrowsError(try mapping.validate(captureSize: CGSize(width: 1180, height: 2556)))
++        XCTAssertThrowsError(try mapping.validate(captureSize: CGSize(width: 1000, height: 462)))
++        XCTAssertThrowsError(try mapping.validate(captureSize: nil))
++    }
++
++    func testMalformedUnavailableAndForeignDisplayEvidenceIsRejected() {
++        for invalid in [
++            envelope().merging(["device_id": "another-phone"]) { _, new in new },
++            envelope().merging(["source": "ios-native-ax"]) { _, new in new },
++            envelope().merging(["schema_version": true]) { _, new in new },
++            envelope().merging(["status": "unavailable"]) { _, new in new },
++        ] { XCTAssertThrowsError(try DeviceDisplayMapping(result: invalid, deviceID: deviceID)) }
++        for change: [String: Any] in [
++            ["current_orientation": "landscape"], ["rotation_degrees": 90], ["native_width": true],
++            ["native_width": 1179.5], ["display_width": 1179], ["native_height": 0],
++        ] {
++            var value = envelope()
++            let display = value["display"] as! [String: Any]
++            value["display"] = display.merging(change) { _, new in new }
++            XCTAssertThrowsError(try DeviceDisplayMapping(result: value, deviceID: deviceID))
++        }
++    }
++
++    func testRelativeRotationUsesNativeOrientationRatherThanPhysicalPhonePose() throws {
++        var value = envelope()
++        var display = value["display"] as! [String: Any]
++        display["native_orientation"] = "rot90"
++        display["current_orientation"] = "rot0"
++        value["display"] = display
++        XCTAssertEqual(try DeviceDisplayMapping(result: value, deviceID: deviceID).rotationDegrees, 270)
++    }
++
++    func testUnavailableBeforeIdentityPreservesTheActualBoundedReason() {
++        let unavailable: [String: Any] = [
++            "schema_version": 1, "source": "ios-native-display", "status": "unavailable",
++            "reason": ["code": "service_unavailable", "message": "Display service missing " + String(repeating: "x", count: 500)],
++        ]
++        XCTAssertThrowsError(try DeviceDisplayMapping(result: unavailable, deviceID: deviceID)) { error in
++            let detail = String(describing: error)
++            XCTAssertTrue(detail.contains("service_unavailable"))
++            XCTAssertTrue(detail.contains("Display service missing"))
++            XCTAssertFalse(detail.contains("identity does not match"))
++            XCTAssertLessThan(detail.utf8.count, 450)
++        }
++    }
++
++    func testAbsentProviderPreservesUpstreamButConfiguredWrongCaptureCannotLaunch() throws {
++        XCTAssertNil(DeviceDisplayMapping.provider(screenID: "phone", environment: [:]))
++        let environment = [DeviceAccessibility.helperKey: "/must-not-be-run", "IPHONE_USE_DEVICE_ID": "configured"]
++        let provider = try XCTUnwrap(DeviceDisplayMapping.provider(screenID: "other", environment: environment))
++        XCTAssertThrowsError(try provider()) { error in
++            XCTAssertTrue(String(describing: error).contains("exact configured capture"))
++        }
++    }
++}
+diff --git a/Tests/iPhoneUseTests/Input/DeviceInputDisplayMappingTests.swift b/Tests/iPhoneUseTests/Input/DeviceInputDisplayMappingTests.swift
+new file mode 100644
+index 0000000..d84c4a0
+--- /dev/null
++++ b/Tests/iPhoneUseTests/Input/DeviceInputDisplayMappingTests.swift
+@@ -0,0 +1,272 @@
++import Foundation
++import XCTest
++
++@testable import iPhoneUse
++
++/// An independent host-side map. Tests assert displayed landings and presses,
++/// rather than comparing the implementation's inverse with itself.
++private final class RotatingAbsoluteHost {
++    var rotation = 0
++    var reports: [(ReportID, [UInt8])] = []
++    var point = CGPoint.zero
++    var presses: [CGPoint] = []
++
++    func send(_ id: ReportID, _ bytes: [UInt8]) {
++        reports.append((id, bytes))
++        if id == .absolutePointer {
++            let hx = Double(Int(bytes[1]) | Int(bytes[2]) << 8) / 32767
++            let hy = Double(Int(bytes[3]) | Int(bytes[4]) << 8) / 32767
++            switch rotation {
++            case 90: point = CGPoint(x: 1 - hy, y: hx)
++            case 180: point = CGPoint(x: 1 - hx, y: 1 - hy)
++            case 270: point = CGPoint(x: hy, y: 1 - hx)
++            default: point = CGPoint(x: hx, y: hy)
++            }
++        } else if id == .relativeMouse, bytes[0] == 1 {
++            presses.append(point)
++        }
++    }
++
++    var captureSize: CGSize {
++        rotation == 90 || rotation == 270 ? CGSize(width: 2556, height: 1180) : CGSize(width: 1180, height: 2556)
++    }
++
++    func mapping() throws -> DeviceDisplayMapping {
++        try DeviceDisplayMapping(rotationDegrees: rotation, nativeWidth: 1179, nativeHeight: 2556)
++    }
++}
++
++final class DeviceInputDisplayMappingTests: XCTestCase {
++    func testAllQuarterTurnsLandAtAsymmetricVisibleTargets() throws {
++        for rotation in [0, 90, 180, 270] {
++            let phone = RotatingAbsoluteHost()
++            phone.rotation = rotation
++            let input = DeviceInput(
++                host: UUID(), session: UUID(), screenSize: { phone.captureSize }, heldDragProfile: .notConfigured,
++                displayMappingProvider: { try phone.mapping() }, sleep: { _ in }, reportSender: phone.send)
++            for (x, y) in [(0.144, 28.0 / 462), (0.23, 0.71), (0.86, 0.31)] {
++                try input.tap(x: x, y: y)
++                let pressed = try XCTUnwrap(phone.presses.last)
++                XCTAssertEqual(pressed.x, x, accuracy: 1.0 / 32767)
++                XCTAssertEqual(pressed.y, y, accuracy: 1.0 / 32767)
++                XCTAssertEqual(phone.reports.last?.1, [0, 0, 0, 0])
++            }
++        }
++    }
++
++    func testMappingChangeRefreshesAndPrimesEvenWhenRawTargetRepeats() throws {
++        let phone = RotatingAbsoluteHost()
++        var queries = 0
++        let input = DeviceInput(
++            host: UUID(), session: UUID(), screenSize: { phone.captureSize }, heldDragProfile: .notConfigured,
++            displayMappingProvider: { queries += 1; return try phone.mapping() },
++            sleep: { _ in }, reportSender: phone.send)
++        try input.move(x: 0.21, y: 0.63)
++        let oldRawTarget = phone.reports.last?.1
++        let before = phone.reports.count
++        phone.rotation = 270
++        try input.move(x: 0.63, y: 0.79)
++        let fresh = Array(phone.reports.dropFirst(before))
++        XCTAssertEqual(queries, 2)
++        XCTAssertEqual(fresh.map { $0.0 }, [.absolutePointer, .relativeMouse, .absolutePointer])
++        XCTAssertNotEqual(fresh.first?.1, oldRawTarget)
++        XCTAssertEqual(fresh.last?.1, oldRawTarget)
++        XCTAssertEqual(phone.point.x, 0.63, accuracy: 1.0 / 32767)
++        XCTAssertEqual(phone.point.y, 0.79, accuracy: 1.0 / 32767)
++        let next = phone.reports.count
++        try input.move(x: 0.4, y: 0.7)
++        XCTAssertEqual(queries, 3)
++        XCTAssertEqual(phone.reports.count - next, 1, "unchanged mapping does not prime every gesture")
++    }
++
++    func testUnavailableOrientationSendsNoInputAndRecoveryPrimesAgain() throws {
++        let phone = RotatingAbsoluteHost()
++        var unavailable = true
++        let input = DeviceInput(
++            host: UUID(), session: UUID(), screenSize: { phone.captureSize }, heldDragProfile: .notConfigured,
++            displayMappingProvider: {
++                if unavailable { throw DeviceError("display unavailable") }
++                return try phone.mapping()
++            }, sleep: { _ in }, reportSender: phone.send)
++        XCTAssertThrowsError(try input.tap(x: 0.2, y: 0.7))
++        XCTAssertTrue(phone.reports.isEmpty)
++        unavailable = false
++        try input.move(x: 0.2, y: 0.7)
++        let before = phone.reports.count
++        unavailable = true
++        XCTAssertThrowsError(try input.tap(x: 0.8, y: 0.3))
++        XCTAssertEqual(phone.reports.count, before)
++        unavailable = false
++        try input.move(x: 0.2, y: 0.7)
++        XCTAssertEqual(phone.reports.count - before, 3)
++        XCTAssertTrue(phone.presses.isEmpty)
++    }
++
++    func testCaptureMismatchAndAssociationLossDuringReadRejectBeforeInput() throws {
++        for invalidateAssociation in [false, true] {
++            let phone = RotatingAbsoluteHost()
++            var allowed = true
++            let input = DeviceInput(
++                host: UUID(), session: UUID(), screenSize: { phone.captureSize }, heldDragProfile: .notConfigured,
++                displayMappingProvider: {
++                    if invalidateAssociation { allowed = false }
++                    return try DeviceDisplayMapping(
++                        rotationDegrees: invalidateAssociation ? 0 : 270, nativeWidth: 1179, nativeHeight: 2556)
++                }, inputIsAllowed: { allowed }, sleep: { _ in }, reportSender: phone.send)
++            XCTAssertThrowsError(try input.tap(x: 0.2, y: 0.7))
++            XCTAssertTrue(phone.reports.isEmpty)
++        }
++    }
++
++    func testRotatedHeldMotionIsRefusedButAbsoluteTapRemainsAvailable() throws {
++        let phone = RotatingAbsoluteHost()
++        phone.rotation = 270
++        let input = DeviceInput(
++            host: UUID(), session: UUID(), screenSize: { phone.captureSize }, heldDragProfile: .notConfigured,
++            displayMappingProvider: { try phone.mapping() }, sleep: { _ in }, reportSender: phone.send)
++        XCTAssertThrowsError(try input.swipe(points: [(0.2, 0.3), (0.7, 0.8)], duration: 0.1))
++        XCTAssertTrue(phone.reports.isEmpty)
++        try input.tap(x: 0.2, y: 0.3)
++        XCTAssertEqual(phone.presses.count, 1)
++        XCTAssertEqual(phone.point.x, 0.2, accuracy: 1.0 / 32767)
++        XCTAssertEqual(phone.point.y, 0.3, accuracy: 1.0 / 32767)
++    }
++
++    func testConfiguredDragCancellationOnlyReleasesWithoutQueryOrAbsoluteReplay() throws {
++        let phone = RotatingAbsoluteHost()
++        var queries = 0
++        let input = DeviceInput(
++            host: UUID(), session: UUID(), screenSize: { phone.captureSize }, heldDragProfile: .notConfigured,
++            displayMappingProvider: { queries += 1; return try phone.mapping() },
++            sleep: { _ in }, reportSender: phone.send)
++        input.press(x: 0.2, y: 0.3)
++        try input.type("")
++        input.drag(x: 0.21, y: 0.31)
++        try input.type("")
++        let before = phone.reports.count
++        let reads = queries
++        XCTAssertEqual(reads, 1, "split drag continues the mapping observed before its press")
++        phone.rotation = 270
++        input.cancelPointer()
++        try input.type("")
++        let released = Array(phone.reports.dropFirst(before))
++        XCTAssertEqual(queries, reads)
++        XCTAssertEqual(released.map { $0.0 }, [.relativeMouse])
++        XCTAssertEqual(released.first?.1, [0, 0, 0, 0])
++        XCTAssertTrue(phone.reports.filter { $0.0 == .absolutePointer }.allSatisfy { $0.1[0] == 0 })
++    }
++
++    func testChangedCaptureDuringSplitReleaseOnlyReleasesAcceptedTouch() throws {
++        let phone = RotatingAbsoluteHost()
++        var queries = 0
++        let input = DeviceInput(
++            host: UUID(), session: UUID(), screenSize: { phone.captureSize }, heldDragProfile: .notConfigured,
++            displayMappingProvider: {
++                queries += 1
++                return try phone.mapping()
++            }, sleep: { _ in }, reportSender: phone.send)
++        input.press(x: 0.2, y: 0.3)
++        try input.type("")
++        XCTAssertEqual(phone.presses.count, 1)
++        let before = phone.reports.count
++        phone.rotation = 270
++        input.release(x: 0.8, y: 0.7)
++        try input.type("")
++        let released = Array(phone.reports.dropFirst(before))
++        XCTAssertEqual(released.map { $0.0 }, [.relativeMouse])
++        XCTAssertEqual(released.first?.1, [0, 0, 0, 0])
++        XCTAssertEqual(queries, 1)
++        try input.tap(x: 0.4, y: 0.6)
++        XCTAssertEqual(phone.presses.count, 2, "interrupted touch is not replayed")
++    }
++
++    func testReleaseDoesNotWaitForANewUSBReadAndNextGestureReadsAgain() throws {
++        let phone = RotatingAbsoluteHost()
++        var queries = 0
++        let input = DeviceInput(
++            host: UUID(), session: UUID(), screenSize: { phone.captureSize }, heldDragProfile: .notConfigured,
++            displayMappingProvider: {
++                queries += 1
++                if queries > 1 { throw DeviceError("display unavailable") }
++                return try phone.mapping()
++            }, sleep: { _ in }, reportSender: phone.send)
++        input.press(x: 0.2, y: 0.3)
++        try input.type("")
++        let before = phone.reports.count
++        input.release(x: 0.2, y: 0.3)
++        try input.type("")
++        XCTAssertEqual(queries, 1)
++        XCTAssertEqual(phone.reports.count - before, 1)
++        XCTAssertEqual(phone.reports.last?.1, [0, 0, 0, 0])
++        let released = phone.reports.count
++        XCTAssertThrowsError(try input.tap(x: 0.4, y: 0.6))
++        XCTAssertEqual(queries, 2)
++        XCTAssertEqual(phone.reports.count, released)
++    }
++
++    func testCancelDuringPrePressDisplayReadOrPositioningSuppressesTheUnsentPress() throws {
++        for cancelDuringRead in [true, false] {
++            let phone = RotatingAbsoluteHost()
++            let waiting = DispatchSemaphore(value: 0)
++            let resume = DispatchSemaphore(value: 0)
++            let input = DeviceInput(
++                host: UUID(), session: UUID(), screenSize: { phone.captureSize }, heldDragProfile: .notConfigured,
++                displayMappingProvider: {
++                    if cancelDuringRead {
++                        waiting.signal()
++                        guard resume.wait(timeout: .now() + 2) == .success else {
++                            throw DeviceError("test display read was not released")
++                        }
++                    }
++                    return try phone.mapping()
++                }, sleep: { seconds in
++                    if !cancelDuringRead, seconds == 0.06 {
++                        waiting.signal()
++                        XCTAssertTrue(resume.wait(timeout: .now() + 2) == .success)
++                    }
++                }, reportSender: phone.send)
++            input.press(x: 0.2, y: 0.3)
++            XCTAssertTrue(waiting.wait(timeout: .now() + 2) == .success)
++            input.cancelPointer()
++            resume.signal()
++            try input.type("")
++            XCTAssertTrue(phone.presses.isEmpty, "cancellation must suppress a later button-down")
++            if cancelDuringRead {
++                XCTAssertTrue(phone.reports.isEmpty, "cancelled read must not be followed by a late absolute move")
++            }
++        }
++    }
++
++    func testOrdinaryReleaseQueuedDuringDisplayReadDoesNotCancelItsOwnPress() throws {
++        let phone = RotatingAbsoluteHost()
++        let waiting = DispatchSemaphore(value: 0)
++        let resume = DispatchSemaphore(value: 0)
++        var queries = 0
++        let input = DeviceInput(
++            host: UUID(), session: UUID(), screenSize: { phone.captureSize }, heldDragProfile: .notConfigured,
++            displayMappingProvider: {
++                queries += 1
++                waiting.signal()
++                guard resume.wait(timeout: .now() + 2) == .success else {
++                    throw DeviceError("test display read was not released")
++                }
++                return try phone.mapping()
++            }, sleep: { _ in }, reportSender: phone.send)
++        input.press(x: 0.2, y: 0.3)
++        XCTAssertTrue(waiting.wait(timeout: .now() + 2) == .success)
++        input.release(x: 0.2, y: 0.3)
++        resume.signal()
++        try input.type("")
++        XCTAssertEqual(queries, 1)
++        XCTAssertEqual(phone.presses.count, 1)
++        XCTAssertEqual(phone.reports.last?.1, [0, 0, 0, 0])
++    }
++
++    func testNoProviderKeepsPortraitReportCoordinates() throws {
++        let phone = RotatingAbsoluteHost()
++        let input = DeviceInput(host: UUID(), session: UUID(), sleep: { _ in }, reportSender: phone.send)
++        try input.tap(x: 0.144, y: 0.061)
++        XCTAssertEqual(phone.presses.last?.x ?? -1, 0.144, accuracy: 1.0 / 32767)
++        XCTAssertEqual(phone.presses.last?.y ?? -1, 0.061, accuracy: 1.0 / 32767)
++    }
++}

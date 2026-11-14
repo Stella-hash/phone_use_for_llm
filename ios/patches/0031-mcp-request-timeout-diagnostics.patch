@@ -1,0 +1,97 @@
+diff --git a/Sources/iPhoneUse/MCP/MCPServer.swift b/Sources/iPhoneUse/MCP/MCPServer.swift
+index 2362a8b..4a39c49 100644
+--- a/Sources/iPhoneUse/MCP/MCPServer.swift
++++ b/Sources/iPhoneUse/MCP/MCPServer.swift
+@@ -755,6 +755,22 @@ struct MCPHTTPClient {
+             frameRejected: body["frame_rejected"] as? Bool == true)
+     }
+ 
++    static func requestError(_ error: Error, timeout: TimeInterval, language: AppLanguage) -> MCPServer.MCPError {
++        let native = error as NSError
++        // A request deadline or cancellation says nothing about whether the host is running.
++        if native.domain == NSURLErrorDomain {
++            switch native.code {
++            case URLError.timedOut.rawValue:
++                return MCPServer.MCPError("HTTP response timed out after \(timeout) seconds")
++            case URLError.cancelled.rawValue:
++                return MCPServer.MCPError("HTTP request was cancelled")
++            default:
++                break
++            }
++        }
++        return MCPServer.MCPError(StringsMCP(language: language).appNotRunning(error.localizedDescription))
++    }
++
+     private func request(_ request: URLRequest, timeout: TimeInterval) throws -> (Data, HTTPURLResponse) {
+         let table = StringsMCP(language: language)
+         var result: Result<(Data, HTTPURLResponse), Error> = .failure(MCPServer.MCPError(table.noResponse))
+@@ -763,7 +779,7 @@ struct MCPHTTPClient {
+         request.timeoutInterval = timeout
+         let task = URLSession.shared.dataTask(with: request) { data, response, error in
+             if let error {
+-                result = .failure(MCPServer.MCPError(table.appNotRunning(error.localizedDescription)))
++                result = .failure(Self.requestError(error, timeout: timeout, language: language))
+             } else if let data, let http = response as? HTTPURLResponse {
+                 if http.statusCode == 200 {
+                     result = .success((data, http))
+@@ -776,7 +792,7 @@ struct MCPHTTPClient {
+         task.resume()
+         guard done.wait(timeout: .now() + timeout) == .success else {
+             task.cancel()
+-            throw MCPServer.MCPError("HTTP response timed out after \(timeout) seconds")
++            throw Self.requestError(URLError(.timedOut), timeout: timeout, language: language)
+         }
+         return try result.get()
+     }
+diff --git a/Tests/PythonTests/test_mcp_stdio.py b/Tests/PythonTests/test_mcp_stdio.py
+index 2566f62..c2fd5df 100644
+--- a/Tests/PythonTests/test_mcp_stdio.py
++++ b/Tests/PythonTests/test_mcp_stdio.py
+@@ -985,6 +985,47 @@ class MCPStdioTests(unittest.TestCase):
+         self.assertIn("capture unavailable", metadata["observation"]["detail"])
+         self.assertEqual(sum(event[0] == "POST" for event in self.server.events), 1)
+ 
++    def test_observation_deadline_is_not_host_death_and_never_replays_sent_input(self):
++        transport = {"backend": "coredevice", "input_status": "sent_unverified",
++                     "frame_bound": True, "device_delivery": "unverified"}
++        self.server.act_response = (200, {"ok": True, "completed": 1, "step_receipts": [
++            {"step": 1, "type": "tap", "ok": True, "touch_receipt": transport}]})
++        sequence = 0
++
++        def screenshot(path):
++            nonlocal sequence
++            sequence += 1
++            return identified_capture_reply(160, sequence, capture_uptime())
++
++        def slow_first_observation(path):
++            self.server.before_screenshot = None
++            time.sleep(0.3)  # Exceeds the first observation's remaining 0.2s budget.
++
++        original_handle_error = self.server.handle_error
++
++        def handle_error(request, address):
++            if not isinstance(sys.exc_info()[1], (BrokenPipeError, ConnectionResetError)):
++                original_handle_error(request, address)
++
++        self.server.handle_error = handle_error
++        self.server.screenshot_response = screenshot
++        self.server.before_screenshot = slow_first_observation
++        result, recovered = self.exchange([
++            ("act", {"steps": [{"type": "tap", "frame_id": FRAME, "x": 7, "y": 9}],
++                     "observe": "full", "observation_timeout": 0.2}),
++            ("screenshot", {}),
++        ])
++        self.assertNotIn("isError", result)
++        metadata = result["structuredContent"]
++        self.assertEqual(metadata["input_receipt"]["status"], "sent_unverified")
++        self.assertEqual(metadata["observation"]["status"], "unobserved")
++        self.assertEqual(metadata["observation"]["reason"], "no_frame")
++        self.assertIn("HTTP response timed out after", metadata["observation"]["detail"])
++        self.assertNotIn("app is not running", metadata["observation"]["detail"])
++        self.assertEqual(sum(event[0] == "POST" for event in self.server.events), 1)
++        self.assertNotIn("isError", recovered)
++        self.assertTrue(recovered["structuredContent"]["frame"]["id"])
++
+     def test_cached_selector_miss_refreshes_list_without_replaying_input(self):
+         def attach_second(body):
+             if len(self.server.devices) == 1:

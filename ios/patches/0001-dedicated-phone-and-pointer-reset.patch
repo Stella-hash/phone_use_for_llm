@@ -1,0 +1,775 @@
+diff --git a/Sources/iPhoneUse/API/ControlAPI.swift b/Sources/iPhoneUse/API/ControlAPI.swift
+index 76622b7..6dd62a5 100644
+--- a/Sources/iPhoneUse/API/ControlAPI.swift
++++ b/Sources/iPhoneUse/API/ControlAPI.swift
+@@ -193,6 +193,7 @@ enum ControlAPI {
+             var info: [String: Any] = [
+                 "host": detail.host.uuidString,
+                 "subscribed": detail.channels,
++                "inputAllowed": HIDPeripheral.shared.allowsHost(detail.host),
+             ]
+             if let session = detail.session { info["session"] = session.uuidString }
+             if let screen = screenByHost[detail.host] { info["screen"] = screen }
+@@ -201,6 +202,7 @@ enum ControlAPI {
+         return .json([
+             "bluetooth": HIDPeripheral.shared.state,
+             "bluetoothHosts": hosts,
++            "bluetoothHostSelection": HIDPeripheral.shared.selectedHostDescription,
+             "capture": captureStatus(),
+             "devices": DeviceRegistry.shared.status(),
+             "unmatchedHosts": DeviceRegistry.shared.unmatchedHosts().map(\.uuidString),
+diff --git a/Sources/iPhoneUse/Bluetooth/HIDConnectionState.swift b/Sources/iPhoneUse/Bluetooth/HIDConnectionState.swift
+index a3a6825..3c665b3 100644
+--- a/Sources/iPhoneUse/Bluetooth/HIDConnectionState.swift
++++ b/Sources/iPhoneUse/Bluetooth/HIDConnectionState.swift
+@@ -4,6 +4,8 @@ import Foundation
+ /// State owned exclusively by HIDPeripheral's Bluetooth queue. Keeping it separate
+ /// from CoreBluetooth lets disconnect and backpressure handling run without hardware.
+ struct HIDConnectionState {
++    var hostSelection: HIDHostSelection = .all
++
+     enum Channel: Hashable {
+         case report(ReportID)
+         case serviceChanged
+@@ -41,6 +43,7 @@ struct HIDConnectionState {
+     /// A connected keyboard does not imply that the host has subscribed to its
+     /// pointer reports yet. Check the report as well as the current session.
+     func isReady(report: ReportID, host: UUID, session: UUID?) -> Bool {
++        guard hostSelection.allows(host) else { return false }
+         guard let session, sessions[host] == session else { return false }
+         return subscriptions[host]?.contains(.report(report)) == true
+     }
+@@ -65,6 +68,7 @@ struct HIDConnectionState {
+     mutating func enqueue(
+         _ channel: Channel, data: Data, host: UUID, session: UUID? = nil, isAllowed: (() -> Bool)? = nil
+     ) {
++        guard hostSelection.allows(host) else { return }
+         guard subscriptions[host]?.contains(channel) == true else { return }
+         if channel.isInput {
+             guard let session, sessions[host] == session else { return }
+@@ -102,7 +106,7 @@ struct HIDConnectionState {
+             let subscribed = subscriptions[report.host]?.contains(report.channel) == true
+             let currentSession =
+                 !report.channel.isInput || (report.session != nil && sessions[report.host] == report.session)
+-            if subscribed, currentSession, report.permissionIsCurrent {
++            if hostSelection.allows(report.host), subscribed, currentSession, report.permissionIsCurrent {
+                 return (index, report)
+             }
+             pending.remove(at: index)
+diff --git a/Sources/iPhoneUse/Bluetooth/HIDPeripheral.swift b/Sources/iPhoneUse/Bluetooth/HIDPeripheral.swift
+index a5222e4..18033f0 100644
+--- a/Sources/iPhoneUse/Bluetooth/HIDPeripheral.swift
++++ b/Sources/iPhoneUse/Bluetooth/HIDPeripheral.swift
+@@ -30,7 +30,8 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate, CBCentralManag
+     private var serviceChanged: CBMutableCharacteristic?
+ 
+     private var centrals: [UUID: CBCentral] = [:]
+-    private var connections = HIDConnectionState()
++    private let hostSelection: HIDHostSelection
++    private var connections: HIDConnectionState
+     private var serviceChangedSent = Set<UUID>()
+ 
+     private var stateDescription = "starting"
+@@ -43,6 +44,17 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate, CBCentralManag
+     var onHostsChanged: (() -> Void)?
+     private let queryOnlineDisplayState: () -> HIDOnlineDisplayState = HIDPeripheral.onlineDisplayState
+ 
++    override init() {
++        let selection = HIDHostSelection(
++            environmentValue: ProcessInfo.processInfo.environment["IPHONE_USE_BLUETOOTH_HOST"])
++        hostSelection = selection
++        connections = HIDConnectionState(hostSelection: selection)
++        super.init()
++    }
++
++    var selectedHostDescription: String { hostSelection.description }
++    func allowsHost(_ host: UUID) -> Bool { hostSelection.allows(host) }
++
+     /// Classifies online displays via CoreGraphics, explicitly separating query errors
+     /// (`.unknown`) from confirmed zero-display headless Macs (`.noOnlineDisplays`),
+     /// clamshell/DarkWake sleep (`.allAsleep`), and active displays (`.atLeastOneAwake`).
+@@ -263,6 +275,7 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate, CBCentralManag
+     /// Initiates a bounded BLE link to saved bonded iPhones whose USB screens are
+     /// present, waking their HOGP client without requiring manual Settings > Bluetooth taps.
+     func reconnectKnownHosts(_ hosts: Set<UUID>, resetExhausted: Bool = true) {
++        let hosts = Set(hosts.filter(hostSelection.allows))
+         queue.async {
+             if !hosts.isEmpty {
+                 self.refreshUnresolvedDisplayQueryIfNeededOnQueue()
+@@ -330,7 +343,7 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate, CBCentralManag
+     }
+ 
+     private var hostsWithInput: [UUID] {
+-        Array(connections.sessions.keys)
++        connections.sessions.keys.filter(hostSelection.allows)
+     }
+ 
+     func connectionSession(for host: UUID) -> UUID? {
+diff --git a/Sources/iPhoneUse/Devices/DeviceRegistry.swift b/Sources/iPhoneUse/Devices/DeviceRegistry.swift
+index 2dc3014..238dbd9 100644
+--- a/Sources/iPhoneUse/Devices/DeviceRegistry.swift
++++ b/Sources/iPhoneUse/Devices/DeviceRegistry.swift
+@@ -264,6 +264,9 @@ final class DeviceRegistry {
+     func input(for device: Device) throws -> DeviceInput {
+         let matched = try find(device.id)
+         if let host = matched.host {
++            guard HIDPeripheral.shared.allowsHost(host) else {
++                throw DeviceError("This Bluetooth host is excluded by IPHONE_USE_BLUETOOTH_HOST")
++            }
+             guard ScreenCaptureManager.shared.permitsPointerAssociation(for: matched.screen) else {
+                 throw DeviceError(StringsAPI.current.screenIdentityUnverified(matched.screen.name))
+             }
+diff --git a/Sources/iPhoneUse/Input/DeviceInput.swift b/Sources/iPhoneUse/Input/DeviceInput.swift
+index efc0356..ee172d2 100644
+--- a/Sources/iPhoneUse/Input/DeviceInput.swift
++++ b/Sources/iPhoneUse/Input/DeviceInput.swift
+@@ -51,6 +51,10 @@ final class DeviceInput {
+     private var windowDragging = false
+     let calibration: RelativePointerCalibration?
+     private var absolutePointerPosition: (x: UInt16, y: UInt16)?
++    /// The last report handed to the transport, independent of the estimated
++    /// landing after relative movement. Transport acceptance is not a device ack.
++    private var lastAbsoluteReportPosition: (x: UInt16, y: UInt16)?
++    private var relativeMotionSinceAbsoluteReport = false
+     private var estimatedPosition: CGPoint?
+     /// Queue-confined progress lets fresh hover targets share one homing path.
+     /// Cancelling the interaction or invalidating its mapping starts a new path.
+@@ -729,10 +733,43 @@ extension DeviceInput {
+         let max = Double(HIDReportMap.absoluteMax)
+         let px = UInt16(Swift.max(0, Swift.min(max, (x * max).rounded())))
+         let py = UInt16(Swift.max(0, Swift.min(max, (y * max).rounded())))
++        if buttons == 0, relativeMotionSinceAbsoluteReport,
++            let previous = lastAbsoluteReportPosition, previous.x == px, previous.y == py
++        {
++            // iOS can ignore an unchanged absolute report even after relative
++            // reports moved its pointer. Reassert both axes through a nearby,
++            // button-up coordinate before returning to the exact requested one.
++            let size = screenSize?()
++            let nx = Self.absoluteResetNeighbor(px, screenDimension: size.map { Double($0.width) })
++            let ny = Self.absoluteResetNeighbor(py, screenDimension: size.map { Double($0.height) })
++            absolutePointerPosition = (nx, ny)
++            send(.absolutePointer, HIDReportPayload.absolutePointer(buttons: 0, x: nx, y: ny))
++            // A neutral relative report is also an ordering barrier: the HID
++            // pending queue coalesces consecutive absolute hovers under pressure.
++            // No press is held here, so this neither clicks nor releases a drag.
++            send(.relativeMouse, HIDReportPayload.relativeMouse(buttons: 0))
++            pause(step)
++            guard shouldContinueMotion(sequence), buttons == 0 else { return }
++        }
+         absolutePointerPosition = (px, py)
+         send(.absolutePointer, HIDReportPayload.absolutePointer(buttons: buttons, x: px, y: py))
+     }
+ 
++    private static func absoluteResetNeighbor(_ coordinate: UInt16, screenDimension: Double?) -> UInt16 {
++        let maximum = HIDReportMap.absoluteMax
++        // Two physical pixels avoid a subpixel-only transition. Without frame
++        // dimensions, use a small logical offset; hardware still owns quantization.
++        let offset: Double
++        if let dimension = screenDimension, dimension.isFinite, dimension > 0 {
++            offset = (2 * Double(maximum) / dimension).rounded(.up)
++        } else {
++            offset = 32
++        }
++        let distance = Int(Swift.max(1, Swift.min(Double(maximum / 2), offset)))
++        let value = Int(coordinate)
++        return UInt16(value <= maximum - distance ? value + distance : value - distance)
++    }
++
+     /// Movement while the pointer button is held: calibrated hosts follow
+     /// their measured curve, uncalibrated hosts the estimated relative drag.
+     /// Absolute reports can never carry this movement: iOS pins the touch to
+@@ -919,6 +956,16 @@ extension DeviceInput {
+         // A capture can be invalidated while an input is queued. Stop stale
+         // movement and presses, while still releasing any held button or key.
+         guard inputIsAllowed() || (id != .absolutePointer && bytes.allSatisfy { $0 == 0 }) else { return }
++        if id == .absolutePointer, bytes.count == 5 {
++            lastAbsoluteReportPosition = (
++                UInt16(bytes[1]) | UInt16(bytes[2]) << 8,
++                UInt16(bytes[3]) | UInt16(bytes[4]) << 8
++            )
++            relativeMotionSinceAbsoluteReport = false
++        } else if id == .relativeMouse, bytes.count >= 3, bytes[1] != 0 || bytes[2] != 0 {
++            // Include direct nudge reports as well as drag/probe helpers.
++            relativeMotionSinceAbsoluteReport = true
++        }
+         reportSender(id, bytes)
+     }
+ 
+diff --git a/Sources/iPhoneUse/MCP/MCPServer.swift b/Sources/iPhoneUse/MCP/MCPServer.swift
+index f5717eb..8432068 100644
+--- a/Sources/iPhoneUse/MCP/MCPServer.swift
++++ b/Sources/iPhoneUse/MCP/MCPServer.swift
+@@ -67,7 +67,7 @@ enum MCPServer {
+     /// language, so an unreachable app never stalls or breaks the handshake.
+     private static func refreshLanguage() {
+         guard !languageLoaded else { return }
+-        guard let (data, http) = try? client.get("/config", timeout: 2), http.statusCode == 200,
++        guard let (data, http) = try? client.get("/config?wake=0", timeout: 2), http.statusCode == 200,
+             let raw = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+             let parsed = (raw["language"] as? String).flatMap(AppLanguage.init(rawValue:))
+         else { return }
+@@ -238,10 +238,28 @@ enum MCPServer {
+         }
+     }
+ 
+-    private static func resolveDevice(_ query: String?, data: Data) throws -> String {
++    static func resolveDevice(
++        _ query: String?, data: Data,
++        configuredDevice: String? = ProcessInfo.processInfo.environment["IPHONE_USE_DEVICE_ID"]
++    ) throws -> String {
+         guard let response = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+             let devices = response["devices"] as? [[String: Any]]
+         else { throw MCPError(StringsMCP(language: language).invalidDeviceList) }
++        if let configuredDevice {
++            guard !configuredDevice.isEmpty else {
++                throw MCPError("IPHONE_USE_DEVICE_ID is empty; device input disabled")
++            }
++            if let query, query.caseInsensitiveCompare(configuredDevice) != .orderedSame {
++                throw MCPError("This MCP entry is restricted to its configured iPhone device ID")
++            }
++            let exact = devices.filter {
++                ($0["id"] as? String)?.caseInsensitiveCompare(configuredDevice) == .orderedSame
++            }
++            guard exact.count == 1, let id = exact.first?["id"] as? String else {
++                throw MCPError("Configured iPhone is unavailable; refusing to select another device")
++            }
++            return id
++        }
+         var matches = devices
+         if let query, !query.isEmpty {
+             let q = query.lowercased()
+diff --git a/Tests/PythonTests/test_mcp_stdio.py b/Tests/PythonTests/test_mcp_stdio.py
+index 12193c1..6cc6570 100644
+--- a/Tests/PythonTests/test_mcp_stdio.py
++++ b/Tests/PythonTests/test_mcp_stdio.py
+@@ -32,7 +32,7 @@ class MockApp(BaseHTTPRequestHandler):
+         if self.path == "/devices":
+             self.server.devices_requested.set()
+             self.send(200, json.dumps({"devices": self.server.devices}).encode())
+-        elif self.path == "/config":
++        elif self.path == "/config?wake=0":
+             self.send(200, json.dumps({"language": self.server.language}).encode())
+         elif self.path.startswith("/screenshot?"):
+             if self.server.before_screenshot and "stability=1" not in self.path:
+@@ -128,7 +128,7 @@ class MCPStdioTests(unittest.TestCase):
+         self.assertNotIn("isError", result)
+         self.assertEqual(json.loads(result["content"][0]["text"]), {"ok": True})
+         self.assertEqual(self.server.events, [
+-            ("GET", "/config"), ("GET", "/devices"),
++            ("GET", "/config?wake=0"), ("GET", "/devices"),
+             ("POST", "/act", {"steps": steps, "device": "phone-1"}),
+         ])
+         self.assertEqual(self.server.stability_events, [])
+@@ -191,7 +191,7 @@ class MCPStdioTests(unittest.TestCase):
+         calls += [("act", {"steps": [{"type": "home"}, {"type": "key", "key": "invalid-key"}]})]
+         for call in calls:
+             self.assertTrue(self.exchange([call])[0]["isError"])
+-        self.assertEqual(self.server.events, [("GET", "/config")] * len(calls))
++        self.assertEqual(self.server.events, [("GET", "/config?wake=0")] * len(calls))
+ 
+     def test_cached_selector_miss_refreshes_list_without_replaying_input(self):
+         def attach_second(body):
+@@ -217,7 +217,7 @@ class MCPStdioTests(unittest.TestCase):
+         self.assertEqual(process.returncode, 0, process.stderr)
+         self.assertIn("15 tools", process.stdout)
+         # The checker's initialize fetches /config; tools/list reuses the value.
+-        self.assertEqual(self.server.events, [("GET", "/config")])
++        self.assertEqual(self.server.events, [("GET", "/config?wake=0")])
+ 
+     def test_device_list_and_tap_preserve_routing_scaling_and_confirmation_image(self):
+         listed, tapped = self.exchange([
+@@ -230,7 +230,7 @@ class MCPStdioTests(unittest.TestCase):
+         })
+         self.assertIn("500x1000 px", tapped["content"][1]["text"])
+         self.assertEqual(self.server.events, [
+-            ("GET", "/config"),
++            ("GET", "/config?wake=0"),
+             ("GET", "/devices"),
+             ("POST", "/tap", {"x": 120.5, "y": 400, "device": "phone-1", "maxEdge": 1000}),
+             ("GET", "/screenshot?maxEdge=1000&device=phone-1&ocr=1"),
+@@ -246,7 +246,7 @@ class MCPStdioTests(unittest.TestCase):
+             "items": [{"text": "设置", "x": 120, "y": 400}],
+         })
+         self.assertEqual(self.server.events, [
+-            ("GET", "/config"), ("GET", "/devices"),
++            ("GET", "/config?wake=0"), ("GET", "/devices"),
+             ("POST", "/ocr", {"device": "phone-1", "maxEdge": 800}),
+         ])
+ 
+@@ -274,7 +274,7 @@ class MCPStdioTests(unittest.TestCase):
+                  ("screenshot", {"include_image": "false"})]
+         for name, arguments in calls:
+             self.assertTrue(self.exchange([(name, arguments)])[0]["isError"])
+-        self.assertEqual(self.server.events, [("GET", "/config")] * len(calls))
++        self.assertEqual(self.server.events, [("GET", "/config?wake=0")] * len(calls))
+ 
+     def test_failed_action_and_unknown_tool_return_errors_without_a_screenshot(self):
+         self.server.fail_actions = True
+@@ -330,7 +330,7 @@ class MCPStdioTests(unittest.TestCase):
+             with self.subTest(name=name, arguments=arguments):
+                 self.assertTrue(self.exchange([(name, arguments)])[0]["isError"])
+         # Every exchange still fetches /config at initialize; nothing else may run.
+-        self.assertEqual(self.server.events, [("GET", "/config")] * len(calls))
++        self.assertEqual(self.server.events, [("GET", "/config?wake=0")] * len(calls))
+ 
+     def test_keyboard_sequence_preserves_order_and_captures_only_the_final_screen(self):
+         result = self.exchange([("keyboard_sequence", {"device": "First", "steps": [
+@@ -339,7 +339,7 @@ class MCPStdioTests(unittest.TestCase):
+         self.assertNotIn("isError", result)
+         self.assertEqual(result["content"][0]["type"], "image")
+         self.assertEqual(self.server.events, [
+-            ("GET", "/config"),
++            ("GET", "/config?wake=0"),
+             ("GET", "/devices"),
+             ("POST", "/key", {"key": "l", "modifiers": ["cmd"], "device": "phone-1"}),
+             ("POST", "/type", {"text": "https://www.baidu.com", "device": "phone-1"}),
+@@ -419,14 +419,14 @@ class MCPStdioTests(unittest.TestCase):
+         for arguments in invalid:
+             self.assertTrue(self.exchange([("keyboard_sequence", arguments)])[0]["isError"])
+         self.assertTrue(self.exchange([("type_text", {"text": "a", "press_enter": 1})])[0]["isError"])
+-        self.assertEqual(self.server.events, [("GET", "/config")] * (len(invalid) + 1))
++        self.assertEqual(self.server.events, [("GET", "/config?wake=0")] * (len(invalid) + 1))
+ 
+     def test_sequence_can_omit_confirmation_image(self):
+         result = self.exchange([("keyboard_sequence", {
+             "actions": [{"wait": 0}], "include_image": False,
+         })])[0]
+         self.assertNotIn("isError", result)
+-        self.assertEqual(self.server.events, [("GET", "/config"), ("GET", "/devices")])
++        self.assertEqual(self.server.events, [("GET", "/config?wake=0"), ("GET", "/devices")])
+ 
+     def test_invalid_later_keyboard_step_prevents_all_input_and_device_queries(self):
+         bad_steps = [
+@@ -447,7 +447,7 @@ class MCPStdioTests(unittest.TestCase):
+             with self.subTest(steps=steps):
+                 self.assertTrue(self.exchange([("keyboard_sequence", {"steps": steps})])[0]["isError"])
+         # Validation fails before any device query; only initialize's /config ran.
+-        self.assertEqual(self.server.events, [("GET", "/config")] * (len(bad_steps) + 4))
++        self.assertEqual(self.server.events, [("GET", "/config?wake=0")] * (len(bad_steps) + 4))
+ 
+     def test_keyboard_sequence_stops_at_failed_step_without_replaying(self):
+         def fail_second_step(body):
+@@ -462,7 +462,7 @@ class MCPStdioTests(unittest.TestCase):
+         self.assertIn("stopped at step 2/3", result["content"][0]["text"])
+         self.assertIn("fresh screenshot", result["content"][0]["text"])
+         self.assertEqual([event[:2] for event in self.server.events], [
+-            ("GET", "/config"), ("GET", "/devices"), ("POST", "/key"), ("POST", "/type"),
++            ("GET", "/config?wake=0"), ("GET", "/devices"), ("POST", "/key"), ("POST", "/type"),
+         ])
+ 
+     def test_same_phone_cannot_interleave_a_keyboard_sequence(self):
+@@ -548,7 +548,7 @@ class MCPStdioTests(unittest.TestCase):
+         result = self.exchange([("tap", {"x": 1, "y": 1, "device": "First"})])[0]
+         self.assertTrue(result["isError"])
+         self.assertIn("found 2", result["content"][0]["text"])
+-        self.assertEqual(self.server.events, [("GET", "/config"), ("GET", "/devices")])
++        self.assertEqual(self.server.events, [("GET", "/config?wake=0"), ("GET", "/devices")])
+ 
+     def test_live_checker_only_lists_devices(self):
+         process = subprocess.run(
+@@ -557,7 +557,7 @@ class MCPStdioTests(unittest.TestCase):
+         )
+         self.assertEqual(process.returncode, 0, process.stderr)
+         self.assertIn("App reachable: 1 iPhone(s)", process.stdout)
+-        self.assertEqual(self.server.events, [("GET", "/config"), ("GET", "/devices")])
++        self.assertEqual(self.server.events, [("GET", "/config?wake=0"), ("GET", "/devices")])
+ 
+     def test_tools_and_errors_follow_the_app_language(self):
+         self.server.language = "zh"
+@@ -585,7 +585,7 @@ class MCPStdioTests(unittest.TestCase):
+         self.assertEqual(home["description"], "回到主屏幕。")
+         error = replies[2]["result"]["content"][0]["text"]
+         self.assertIn("截图坐标", error)
+-        self.assertEqual(self.server.events, [("GET", "/config")])
++        self.assertEqual(self.server.events, [("GET", "/config?wake=0")])
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/Sources/iPhoneUse/Bluetooth/HIDHostSelection.swift b/Sources/iPhoneUse/Bluetooth/HIDHostSelection.swift
+new file mode 100644
+index 0000000..e7c100e
+--- /dev/null
++++ b/Sources/iPhoneUse/Bluetooth/HIDHostSelection.swift
+@@ -0,0 +1,37 @@
++import Foundation
++
++/// Optional process-wide routing for a dedicated phone. A malformed configured
++/// value denies input instead of silently reverting to all connected hosts.
++enum HIDHostSelection: Equatable {
++    case all
++    case only(UUID)
++    case invalid
++
++    init(environmentValue: String?) {
++        guard let environmentValue else {
++            self = .all
++            return
++        }
++        if let host = UUID(uuidString: environmentValue) {
++            self = .only(host)
++        } else {
++            self = .invalid
++        }
++    }
++
++    func allows(_ host: UUID) -> Bool {
++        switch self {
++        case .all: return true
++        case .only(let selected): return host == selected
++        case .invalid: return false
++        }
++    }
++
++    var description: String {
++        switch self {
++        case .all: return "all hosts"
++        case .only(let host): return host.uuidString
++        case .invalid: return "invalid IPHONE_USE_BLUETOOTH_HOST; input disabled"
++        }
++    }
++}
+diff --git a/Tests/iPhoneUseTests/Bluetooth/HIDHostSelectionTests.swift b/Tests/iPhoneUseTests/Bluetooth/HIDHostSelectionTests.swift
+new file mode 100644
+index 0000000..bf4c071
+--- /dev/null
++++ b/Tests/iPhoneUseTests/Bluetooth/HIDHostSelectionTests.swift
+@@ -0,0 +1,51 @@
++import XCTest
++
++@testable import iPhoneUse
++
++final class HIDHostSelectionTests: XCTestCase {
++    func testUnsetAllowsAllButEmptyOrMalformedConfigurationDeniesAll() {
++        let host = UUID()
++        XCTAssertTrue(HIDHostSelection(environmentValue: nil).allows(host))
++        XCTAssertFalse(HIDHostSelection(environmentValue: "").allows(host))
++        XCTAssertFalse(HIDHostSelection(environmentValue: "not-a-uuid").allows(host))
++        XCTAssertTrue(HIDHostSelection(environmentValue: host.uuidString.lowercased()).allows(host))
++    }
++
++    func testSelectedHostRejectsOtherHostInputEvenNeutralRelease() throws {
++        let selected = UUID()
++        let other = UUID()
++        var state = HIDConnectionState(hostSelection: .only(selected))
++        for host in [selected, other] {
++            state.subscribe(.report(.absolutePointer), host: host)
++            state.subscribe(.report(.relativeMouse), host: host)
++            state.enqueue(
++                .report(.absolutePointer), data: Data([0, 1, 0, 1, 0]),
++                host: host, session: state.sessions[host])
++            state.enqueue(
++                .report(.relativeMouse), data: Data([0, 0, 0, 0]),
++                host: host, session: state.sessions[host], isAllowed: { false })
++        }
++        XCTAssertTrue(state.isReady(report: .absolutePointer, host: selected, session: state.sessions[selected]))
++        XCTAssertFalse(state.isReady(report: .absolutePointer, host: other, session: state.sessions[other]))
++        XCTAssertEqual(state.pending.count, 2)
++        XCTAssertTrue(state.pending.allSatisfy { $0.host == selected })
++    }
++
++    func testNotificationBoundaryDropsQueuedReportsForExcludedHost() throws {
++        let selected = UUID()
++        let other = UUID()
++        var state = HIDConnectionState()
++        for host in [other, selected] {
++            state.subscribe(.report(.relativeMouse), host: host)
++            state.enqueue(
++                .report(.relativeMouse), data: Data([0, 0, 0, 0]),
++                host: host, session: state.sessions[host])
++        }
++        state.hostSelection = .only(selected)
++        XCTAssertEqual(state.nextPendingReport()?.host, selected)
++        XCTAssertEqual(state.pending.map(\.host), [selected])
++        state.hostSelection = .invalid
++        XCTAssertNil(state.nextPendingReport())
++        XCTAssertTrue(state.pending.isEmpty)
++    }
++}
+diff --git a/Tests/iPhoneUseTests/Input/DeviceInputAbsoluteResetTests.swift b/Tests/iPhoneUseTests/Input/DeviceInputAbsoluteResetTests.swift
+new file mode 100644
+index 0000000..d5fe5be
+--- /dev/null
++++ b/Tests/iPhoneUseTests/Input/DeviceInputAbsoluteResetTests.swift
+@@ -0,0 +1,251 @@
++import XCTest
++
++@testable import iPhoneUse
++
++/// Models the observed device behavior: relative movement changes the pointer,
++/// but repeating its last absolute report does not reassert that position.
++/// Reports pass through the production pending queue so a reset cannot rely on
++/// two absolute notifications surviving backpressure merely because both were sent.
++private final class AbsoluteResetHost {
++    struct Point: Equatable {
++        var x: Int
++        var y: Int
++    }
++
++    let host = UUID()
++    var connection = HIDConnectionState()
++    var congested = false
++    var allowed = true
++    var offered: [(ReportID, [UInt8])] = []
++    var delivered: [(ReportID, [UInt8])] = []
++    var point = Point(x: 0, y: 0)
++    var presses: [Point] = []
++    private var lastAbsolute: Point?
++    private var buttons: UInt8 = 0
++
++    init() {
++        connection.subscribe(.report(.absolutePointer), host: host)
++        connection.subscribe(.report(.relativeMouse), host: host)
++    }
++
++    var session: UUID { connection.sessions[host]! }
++
++    func send(_ id: ReportID, _ bytes: [UInt8]) {
++        offered.append((id, bytes))
++        connection.enqueue(
++            .report(id), data: Data(bytes), host: host, session: session,
++            isAllowed: { [unowned self] in allowed })
++        if !congested { drain() }
++    }
++
++    func drain() {
++        while let (index, report) = connection.nextPendingReportIndex() {
++            connection.removePending(at: index)
++            guard case .report(let id) = report.channel else { continue }
++            let bytes = [UInt8](report.data)
++            delivered.append((id, bytes))
++            switch id {
++            case .absolutePointer:
++                let target = Self.decode(bytes)
++                if target != lastAbsolute { point = target }
++                lastAbsolute = target
++            case .relativeMouse:
++                // The exact gain is irrelevant to the duplicate-report predicate.
++                point.x = min(32767, max(0, point.x + Int(Int8(bitPattern: bytes[1])) * 16))
++                point.y = min(32767, max(0, point.y + Int(Int8(bitPattern: bytes[2])) * 16))
++                if buttons == 0, bytes[0] != 0 { presses.append(point) }
++                buttons = bytes[0]
++            default:
++                break
++            }
++        }
++    }
++
++    static func decode(_ bytes: [UInt8]) -> Point {
++        Point(x: Int(bytes[1]) | Int(bytes[2]) << 8, y: Int(bytes[3]) | Int(bytes[4]) << 8)
++    }
++
++    static func target(_ x: Double, _ y: Double) -> Point {
++        Point(x: Int((x * 32767).rounded()), y: Int((y * 32767).rounded()))
++    }
++
++    func input(sleep: @escaping (TimeInterval) -> Void = { _ in }) -> DeviceInput {
++        DeviceInput(
++            host: host, session: session, screenSize: { CGSize(width: 1179, height: 2556) },
++            inputIsAllowed: { [unowned self] in allowed }, sleep: sleep,
++            reportSender: { [unowned self] in send($0, $1) })
++    }
++}
++
++final class DeviceInputAbsoluteResetTests: XCTestCase {
++    func testRepeatedAbsoluteTargetAfterNudgeRestoresObservedPosition() throws {
++        let phone = AbsoluteResetHost()
++        let input = phone.input()
++        let target = AbsoluteResetHost.target(0.4, 0.3)
++        try input.move(x: 0.4, y: 0.3)
++        try input.nudge(dx: 0, dy: 16, click: false)
++        XCTAssertNotEqual(phone.point, target)
++
++        try input.move(x: 0.4, y: 0.3)
++
++        XCTAssertEqual(phone.point, target)
++        XCTAssertTrue(phone.presses.isEmpty)
++        XCTAssertEqual(phone.delivered.last?.0, .absolutePointer)
++        XCTAssertEqual(phone.delivered.last.map { AbsoluteResetHost.decode($0.1) }, target)
++    }
++
++    func testResetSurvivesTransportBackpressureBeforeCoordinateTap() throws {
++        let phone = AbsoluteResetHost()
++        let input = phone.input()
++        let target = AbsoluteResetHost.target(0.4, 0.3)
++        try input.move(x: 0.4, y: 0.3)
++        try input.nudge(dx: 12, dy: 16, click: false)
++        phone.congested = true
++
++        try input.tap(x: 0.4, y: 0.3)
++        phone.drain()
++
++        XCTAssertEqual(phone.point, target)
++        XCTAssertEqual(phone.presses, [target])
++        let absolute = phone.delivered.filter { $0.0 == .absolutePointer }
++        XCTAssertEqual(absolute.count, 3, "the reset neighbor must survive the production queue's coalescing")
++        XCTAssertTrue(absolute.allSatisfy { $0.1[0] == 0 })
++    }
++
++    func testRepeatedSwipeOriginReanchorsBeforeSecondPress() throws {
++        let phone = AbsoluteResetHost()
++        let input = phone.input()
++        let origin = AbsoluteResetHost.target(0.3, 0.3)
++
++        try input.swipe(points: [(0.3, 0.3), (0.7, 0.6)], duration: 0.06)
++        XCTAssertNotEqual(phone.point, origin)
++        try input.swipe(points: [(0.3, 0.3), (0.7, 0.6)], duration: 0.06)
++
++        XCTAssertEqual(phone.presses, [origin, origin])
++    }
++
++    func testWindowDragThenTapOriginalPositionUsesLastAbsoluteReportNotDragEstimate() throws {
++        let phone = AbsoluteResetHost()
++        let input = phone.input()
++        let origin = AbsoluteResetHost.target(0.3, 0.3)
++
++        input.press(x: 0.3, y: 0.3)
++        input.release(x: 0.7, y: 0.6)
++        try input.nudge(dx: 0, dy: 0, click: false)
++        XCTAssertNotEqual(phone.point, origin)
++        try input.tap(x: 0.3, y: 0.3)
++
++        XCTAssertEqual(phone.presses, [origin, origin])
++    }
++
++    func testResetNeighborsStayInBoundsAndChangeBothAxesAtScreenEdges() throws {
++        for (x, y, dx, dy) in [(0.0, 0.0, 16, 16), (1.0, 1.0, -16, -16)] {
++            let phone = AbsoluteResetHost()
++            let input = phone.input()
++            let target = AbsoluteResetHost.target(x, y)
++            try input.move(x: x, y: y)
++            try input.nudge(dx: dx, dy: dy, click: false)
++            try input.move(x: x, y: y)
++
++            let absolute = phone.delivered.filter { $0.0 == .absolutePointer }
++            XCTAssertEqual(absolute.count, 3)
++            guard absolute.count == 3 else { continue }
++            let neighbor = AbsoluteResetHost.decode(absolute[1].1)
++            XCTAssertNotEqual(neighbor.x, target.x)
++            XCTAssertNotEqual(neighbor.y, target.y)
++            XCTAssertTrue((0...32767).contains(neighbor.x) && (0...32767).contains(neighbor.y))
++            XCTAssertGreaterThanOrEqual(Double(abs(neighbor.x - target.x)) / 32767 * 1179, 1)
++            XCTAssertGreaterThanOrEqual(Double(abs(neighbor.y - target.y)) / 32767 * 2556, 1)
++            XCTAssertLessThanOrEqual(Double(abs(neighbor.x - target.x)) / 32767 * 1179, 3)
++            XCTAssertLessThanOrEqual(Double(abs(neighbor.y - target.y)) / 32767 * 2556, 3)
++            XCTAssertEqual(phone.point, target)
++            XCTAssertTrue(phone.presses.isEmpty)
++        }
++    }
++
++    func testOrdinaryDuplicateAndChangedAbsoluteTargetsDoNotAddResetReports() throws {
++        let phone = AbsoluteResetHost()
++        let input = phone.input()
++        try input.move(x: 0.4, y: 0.3)
++        try input.move(x: 0.4, y: 0.3)
++        try input.nudge(dx: 0, dy: 16, click: false)
++        try input.move(x: 0.6, y: 0.7)
++
++        XCTAssertEqual(phone.delivered.filter { $0.0 == .absolutePointer }.count, 3)
++        XCTAssertEqual(phone.point, AbsoluteResetHost.target(0.6, 0.7))
++    }
++
++    func testCaptureInvalidationDuringResetSuppressesFinalTargetAndPress() throws {
++        let phone = AbsoluteResetHost()
++        var invalidateOnReset = false
++        let input = phone.input { _ in
++            if invalidateOnReset,
++                phone.offered.filter({ $0.0 == .absolutePointer }).count == 2
++            {
++                phone.allowed = false
++            }
++        }
++        try input.move(x: 0.4, y: 0.3)
++        try input.nudge(dx: 0, dy: 16, click: false)
++        invalidateOnReset = true
++
++        try input.tap(x: 0.4, y: 0.3)
++
++        XCTAssertEqual(phone.offered.filter { $0.0 == .absolutePointer }.count, 2)
++        XCTAssertTrue(phone.presses.isEmpty)
++        XCTAssertTrue(phone.offered.suffix(2).allSatisfy { $0.0 == .relativeMouse && $0.1 == [0, 0, 0, 0] })
++        invalidateOnReset = false
++        phone.allowed = true
++        try input.move(x: 0.4, y: 0.3)
++        XCTAssertEqual(phone.point, AbsoluteResetHost.target(0.4, 0.3))
++    }
++
++    func testHoverCancellationDuringResetDoesNotSendStaleFinalTarget() throws {
++        let phone = AbsoluteResetHost()
++        var cancelOnReset = false
++        var input: DeviceInput!
++        input = phone.input { _ in
++            if cancelOnReset,
++                phone.offered.filter({ $0.0 == .absolutePointer }).count == 2
++            {
++                cancelOnReset = false
++                input.cancelPointer()
++            }
++        }
++        try input.move(x: 0.4, y: 0.3)
++        try input.nudge(dx: 0, dy: 16, click: false)
++        cancelOnReset = true
++
++        input.positionPointer(x: 0.4, y: 0.3)
++        // The first barrier waits for the hover; the second also waits for the
++        // cancellation it scheduled while the hover was in progress.
++        try input.type("")
++        try input.type("")
++
++        XCTAssertEqual(phone.offered.filter { $0.0 == .absolutePointer }.count, 2)
++        XCTAssertNotEqual(phone.point, AbsoluteResetHost.target(0.4, 0.3))
++        XCTAssertTrue(phone.presses.isEmpty)
++        try input.move(x: 0.6, y: 0.7)
++        XCTAssertEqual(phone.point, AbsoluteResetHost.target(0.6, 0.7))
++    }
++
++    func testResetNeverReleasesAnActiveWindowPress() throws {
++        let phone = AbsoluteResetHost()
++        let input = phone.input()
++        input.press(x: 0.3, y: 0.3)
++        try input.type("")
++        input.drag(x: 0.6, y: 0.7)
++        try input.type("")
++        let before = phone.delivered.count
++
++        input.positionPointer(x: 0.3, y: 0.3)
++        try input.type("")
++
++        let additional = phone.delivered.dropFirst(before)
++        XCTAssertEqual(additional.count, 1)
++        XCTAssertTrue(additional.allSatisfy { $0.0 == .absolutePointer && $0.1[0] == 1 })
++        XCTAssertEqual(phone.presses.count, 1)
++        input.cancelPointer()
++        try input.type("")
++    }
++}
+diff --git a/Tests/iPhoneUseTests/MCP/MCPDeviceSelectionTests.swift b/Tests/iPhoneUseTests/MCP/MCPDeviceSelectionTests.swift
+new file mode 100644
+index 0000000..7b0d271
+--- /dev/null
++++ b/Tests/iPhoneUseTests/MCP/MCPDeviceSelectionTests.swift
+@@ -0,0 +1,25 @@
++import XCTest
++
++@testable import iPhoneUse
++
++final class MCPDeviceSelectionTests: XCTestCase {
++    private let devices = Data(
++        #"{"devices":[{"id":"spare-15","name":"Spare"},{"id":"daily-air","name":"Daily"}]}"#.utf8)
++
++    func testConfiguredDeviceIsExactAndOverridesAutomaticSingleDeviceChoice() throws {
++        XCTAssertEqual(try MCPServer.resolveDevice(nil, data: devices, configuredDevice: "spare-15"), "spare-15")
++        XCTAssertEqual(
++            try MCPServer.resolveDevice("SPARE-15", data: devices, configuredDevice: "spare-15"), "spare-15")
++        XCTAssertThrowsError(try MCPServer.resolveDevice("daily-air", data: devices, configuredDevice: "spare-15"))
++        XCTAssertThrowsError(try MCPServer.resolveDevice("spare", data: devices, configuredDevice: "spare-15"))
++        XCTAssertThrowsError(try MCPServer.resolveDevice(nil, data: devices, configuredDevice: ""))
++        let onlyDaily = Data(#"{"devices":[{"id":"daily-air","name":"Daily"}]}"#.utf8)
++        XCTAssertThrowsError(try MCPServer.resolveDevice(nil, data: onlyDaily, configuredDevice: "spare-15"))
++    }
++
++    func testUnconfiguredUpstreamResolutionStillAllowsNamesAndPrefixes() throws {
++        XCTAssertEqual(try MCPServer.resolveDevice("Spare", data: devices, configuredDevice: nil), "spare-15")
++        XCTAssertEqual(try MCPServer.resolveDevice("daily-", data: devices, configuredDevice: nil), "daily-air")
++        XCTAssertThrowsError(try MCPServer.resolveDevice(nil, data: devices, configuredDevice: nil))
++    }
++}

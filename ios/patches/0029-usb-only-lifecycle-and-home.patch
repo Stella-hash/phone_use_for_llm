@@ -1,0 +1,251 @@
+diff --git a/Sources/iPhoneUse/API/ControlAPI.swift b/Sources/iPhoneUse/API/ControlAPI.swift
+index 78b6a7b..e9f9dd9 100644
+--- a/Sources/iPhoneUse/API/ControlAPI.swift
++++ b/Sources/iPhoneUse/API/ControlAPI.swift
+@@ -177,7 +177,7 @@ enum ControlAPI {
+                 // Batch dispatch needs capture only. Each shared leaf performs
+                 // its existing capability-specific wait before execution.
+                 if request.path == "/act" { return frameReady }
+-                if CoreDeviceKeyboard.isConfigured, ["/key", "/type"].contains(request.path) { return frameReady }
++                if CoreDeviceKeyboard.isConfigured, ["/key", "/type", "/home"].contains(request.path) { return frameReady }
+                 return frameReady && target.host != nil
+                     && (try? DeviceRegistry.shared.input(for: target).isPointerReady) == true
+             }
+@@ -234,6 +234,7 @@ enum ControlAPI {
+         return .json([
+             "runtime_identity": RuntimeIdentity.current.json,
+             "bluetooth": HIDPeripheral.shared.state,
++            "bluetoothEnabled": HIDPeripheral.shared.bluetoothEnabled,
+             "bluetoothHosts": hosts,
+             "bluetoothHostSelection": HIDPeripheral.shared.selectedHostDescription,
+             "directTouch": CoreDeviceTouch.isConfigured,
+@@ -382,15 +383,21 @@ enum ControlAPI {
+             }
+         }
+         try validateLeaf(path: action.rawValue, body: body, screenSize: device.screen.size)
+-        if CoreDeviceKeyboard.isConfigured, action == .key || action == .type {
++        if CoreDeviceKeyboard.isConfigured, action == .key || action == .type || action == .home {
+             guard ProcessInfo.processInfo.environment["IPHONE_USE_DEVICE_ID"] == device.id else {
+                 throw InputRequestError("USB keyboard requires the exact configured capture device")
+             }
+             let request = try action == .type ? TypeTextRequest(body, language: AppLanguageStore.shared.language) : nil
+             let switchIME = request?.ensureChineseIME == true && device.screen.snapshot(png: false, maxEdge: 1600)
+                 .map { ChineseIMEHeuristic.isEnglish(ScreenOCR.recognize($0, device: device.id)) } == true
+-            let program = try request.map { try CoreDeviceKeyboardProgram.text($0, switchIME: switchIME) }
+-                ?? CoreDeviceKeyboardProgram.key(KeyRequest(body))
++            let program: CoreDeviceKeyboardProgram
++            if let request {
++                program = try CoreDeviceKeyboardProgram.text(request, switchIME: switchIME)
++            } else if action == .home {
++                program = try CoreDeviceKeyboardProgram.home()
++            } else {
++                program = try CoreDeviceKeyboardProgram.key(KeyRequest(body))
++            }
+             let captureSource = device.screen.sourceInstanceID
+             DeviceRegistry.shared.cancelBackgroundMotion(for: device)
+             let receipt = try CoreDeviceKeyboard.perform(program, device: device.id, beforeCommit: {
+@@ -742,6 +749,8 @@ struct ActRequest {
+             case "key":
+                 let request = try KeyRequest(step)
+                 if directKeyboardConfigured { plannedBudget += programmedSeconds(try CoreDeviceKeyboardProgram.key(request).samples) }
++            case "home":
++                if directKeyboardConfigured { plannedBudget += programmedSeconds(try CoreDeviceKeyboardProgram.home().samples) }
+             default: break
+             }
+             if type == "delay" || type == "wait_text" {
+diff --git a/Sources/iPhoneUse/Bluetooth/HIDConnectionState.swift b/Sources/iPhoneUse/Bluetooth/HIDConnectionState.swift
+index 7091c03..cac839e 100644
+--- a/Sources/iPhoneUse/Bluetooth/HIDConnectionState.swift
++++ b/Sources/iPhoneUse/Bluetooth/HIDConnectionState.swift
+@@ -422,6 +422,7 @@ enum HIDOnlineDisplayState: Equatable, Sendable {
+ /// ATT link that triggers `AP wakeup by LE Data` or drains battery unplugged.
+ struct HIDLifecyclePolicy: Equatable {
+     enum InactiveReason: Equatable {
++        case disabled
+         case notStarted
+         case stopped
+         case systemSleeping
+@@ -429,6 +430,8 @@ struct HIDLifecyclePolicy: Equatable {
+ 
+         var stateDescription: String {
+             switch self {
++            case .disabled:
++                return "disabled"
+             case .notStarted:
+                 return "starting"
+             case .stopped:
+@@ -443,6 +446,13 @@ struct HIDLifecyclePolicy: Equatable {
+ 
+     static let unknownDisplayRetryDelays: [TimeInterval] = [0.25, 1.0, 3.0]
+ 
++    /// A launch-time transport choice. USB, window and wake demand cannot enable it.
++    let allowBluetooth: Bool
++
++    init(allowBluetooth: Bool = true) {
++        self.allowBluetooth = allowBluetooth
++    }
++
+     private(set) var isStarted = false
+     private(set) var isPermanentlyStopped = false
+     private(set) var isSystemSleeping = false
+@@ -466,10 +476,11 @@ struct HIDLifecyclePolicy: Equatable {
+     }
+ 
+     var shouldRunCoreBluetooth: Bool {
+-        isStarted && !isPermanentlyStopped && !isSystemSleeping && hasEffectiveDemand
++        allowBluetooth && isStarted && !isPermanentlyStopped && !isSystemSleeping && hasEffectiveDemand
+     }
+ 
+     var inactiveReason: InactiveReason? {
++        if !allowBluetooth { return .disabled }
+         if isPermanentlyStopped { return .stopped }
+         if !isStarted { return .notStarted }
+         if isSystemSleeping { return .systemSleeping }
+@@ -478,7 +489,7 @@ struct HIDLifecyclePolicy: Equatable {
+     }
+ 
+     mutating func start(initialDisplayState: HIDOnlineDisplayState = .atLeastOneAwake) {
+-        guard !isPermanentlyStopped, !isStarted else { return }
++        guard allowBluetooth, !isPermanentlyStopped, !isStarted else { return }
+         isStarted = true
+         displayQueryGeneration &+= 1
+         unknownDisplayRetryAttempts = 0
+diff --git a/Sources/iPhoneUse/Bluetooth/HIDPeripheral.swift b/Sources/iPhoneUse/Bluetooth/HIDPeripheral.swift
+index be08066..cc76267 100644
+--- a/Sources/iPhoneUse/Bluetooth/HIDPeripheral.swift
++++ b/Sources/iPhoneUse/Bluetooth/HIDPeripheral.swift
+@@ -84,7 +84,7 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate, CBCentralManag
+     private let queue = DispatchQueue(label: "iphone-use.bluetooth")
+     private var manager: CBPeripheralManager?
+     private var centralManager: CBCentralManager?
+-    private var lifecyclePolicy = HIDLifecyclePolicy()
++    private var lifecyclePolicy: HIDLifecyclePolicy
+     private var reconnectTracker = HIDReconnectTracker()
+     private var reconnectingPeripherals: [UUID: CBPeripheral] = [:]
+     private let reconnectTimeout: TimeInterval = 12
+@@ -106,12 +106,16 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate, CBCentralManag
+ 
+     private var stateDescription = "starting"
+     var state: String { queue.sync { stateDescription } }
++    var bluetoothEnabled: Bool { queue.sync { lifecyclePolicy.allowBluetooth } }
+ 
+     /// Called on the Bluetooth queue when a phone starts or stops listening for input.
+     var onHostsChanged: (() -> Void)?
+     private let queryOnlineDisplayState: () -> HIDOnlineDisplayState = HIDPeripheral.onlineDisplayState
+ 
+     override init() {
++        let allowBluetooth = ProcessInfo.processInfo.environment["IPHONE_USE_BLUETOOTH_DISABLED"] != "1"
++        lifecyclePolicy = HIDLifecyclePolicy(allowBluetooth: allowBluetooth)
++        stateDescription = allowBluetooth ? "starting" : "disabled"
+         let selection = HIDHostSelection(
+             environmentValue: ProcessInfo.processInfo.environment["IPHONE_USE_BLUETOOTH_HOST"])
+         hostSelection = selection
+diff --git a/Sources/iPhoneUse/Devices/DeviceRegistry.swift b/Sources/iPhoneUse/Devices/DeviceRegistry.swift
+index 8acdcd3..2e36c36 100644
+--- a/Sources/iPhoneUse/Devices/DeviceRegistry.swift
++++ b/Sources/iPhoneUse/Devices/DeviceRegistry.swift
+@@ -10,10 +10,11 @@ struct Device {
+     var lockState: DeviceLockState { DeviceLockMonitor.shared.state(for: screen) }
+ 
+     var json: [String: Any] {
++        let bluetoothEnabled = HIDPeripheral.shared.bluetoothEnabled
+         var info: [String: Any] = [
+-            "id": id, "name": screen.name, "bluetooth": host != nil, "lockState": lockState.rawValue,
++            "id": id, "name": screen.name, "bluetooth": bluetoothEnabled && host != nil, "lockState": lockState.rawValue,
+         ]
+-        info["bluetoothState"] = bluetoothState.rawValue
++        info["bluetoothState"] = bluetoothEnabled ? bluetoothState.rawValue : "disabled"
+         if let size = screen.size {
+             info["width"] = Int(size.width)
+             info["height"] = Int(size.height)
+@@ -225,7 +226,9 @@ final class DeviceRegistry {
+     func status() -> [[String: Any]] {
+         all().map { device in
+             var info = device.json
+-            if let host = device.host {
++            if !HIDPeripheral.shared.bluetoothEnabled {
++                info["pointer"] = ["transport": "ble", "state": "disabled"]
++            } else if let host = device.host {
+                 var pointer = input(for: host, screen: device.screen).pointerStatus
+                 if !ScreenCaptureManager.shared.permitsPointerAssociation(for: device.screen) {
+                     pointer["ready"] = false
+@@ -274,6 +277,9 @@ final class DeviceRegistry {
+     /// Resolve only an already verified connection. A normal input request must
+     /// never restart discovery after it has just cancelled background motion.
+     func input(for device: Device) throws -> DeviceInput {
++        guard HIDPeripheral.shared.bluetoothEnabled else {
++            throw DeviceError("Bluetooth disabled; use configured USB actions")
++        }
+         let matched = try find(device.id)
+         if let host = matched.host {
+             guard HIDPeripheral.shared.allowsHost(host) else {
+diff --git a/Sources/iPhoneUse/Input/CoreDeviceKeyboard.swift b/Sources/iPhoneUse/Input/CoreDeviceKeyboard.swift
+index 3cb9577..f3d0e01 100644
+--- a/Sources/iPhoneUse/Input/CoreDeviceKeyboard.swift
++++ b/Sources/iPhoneUse/Input/CoreDeviceKeyboard.swift
+@@ -36,6 +36,12 @@ struct CoreDeviceKeyboardProgram {
+         return program
+     }
+ 
++    static func home() throws -> Self {
++        var program = Self()
++        try program.key("h", ["command"])
++        return program
++    }
++
+     static func text(_ request: TypeTextRequest, switchIME: Bool) throws -> Self {
+         var program = Self()
+         if switchIME {
+diff --git a/Sources/iPhoneUse/MCP/MCPTools.swift b/Sources/iPhoneUse/MCP/MCPTools.swift
+index 02f8bf9..ca04c64 100644
+--- a/Sources/iPhoneUse/MCP/MCPTools.swift
++++ b/Sources/iPhoneUse/MCP/MCPTools.swift
+@@ -60,8 +60,8 @@ enum MCPToolCatalog {
+             tool(
+                 "act",
+                 language == .zh
+-                    ? "顺序执行 tap（hold 可长按）、swipe、touch 多触点、type、key、home、delay 或 wait_text；失败立即停止，不重放。每批最多一个触控步骤且必须第一步，使用新截图的 frame_id 和像素；不支持归一化坐标或文字点按。触控须配置 USB，键盘沿已配置传输，Home 使用 BLE consumer。最多16步；USB计划输入加延时/等待总预算30秒，执行窗口耗尽后不再启动后续步骤；不会取消已经执行中的步骤。检查返回观察，本地发送不代表应用完成。"
+-                    : "Execute ordered tap (hold for long press), swipe, touch multitouch, type, key, home, delay or wait_text steps; stop on failure, never replay. At most one touch step, first in the batch, using a fresh screenshot frame_id and its pixels; no normalized or text-targeted touch. Touch requires configured USB; keyboard uses its configured transport and Home uses BLE consumer input. At most 16 steps; USB planned input plus delay/wait budget is 30 seconds. The execution window stops admission of later steps, not an already-running step. Inspect observations; local send is not app completion.",
++                    ? "顺序执行 tap（hold 可长按）、swipe、touch 多触点、type、key、home、delay 或 wait_text；失败立即停止，不重放。每批最多一个触控步骤且必须第一步，使用新截图的 frame_id 和像素；不支持归一化坐标或文字点按。触控须配置 USB，键盘沿已配置传输；Home 在配置 USB 键盘时使用 Cmd+H，否则使用 BLE consumer。最多16步；USB计划输入加延时/等待总预算30秒，执行窗口耗尽后不再启动后续步骤；不会取消已经执行中的步骤。检查返回观察，本地发送不代表应用完成。"
++                    : "Execute ordered tap (hold for long press), swipe, touch multitouch, type, key, home, delay or wait_text steps; stop on failure, never replay. At most one touch step, first in the batch, using a fresh screenshot frame_id and its pixels; no normalized or text-targeted touch. Touch requires configured USB; keyboard uses its configured transport. Home uses Cmd+H with configured USB keyboard, otherwise BLE consumer input. At most 16 steps; USB planned input plus delay/wait budget is 30 seconds. The execution window stops admission of later steps, not an already-running step. Inspect observations; local send is not app completion.",
+                 [
+                     "steps": actSteps(for: table),
+                     "device": device,
+diff --git a/Tests/iPhoneUseTests/Bluetooth/HIDConnectionStateTests.swift b/Tests/iPhoneUseTests/Bluetooth/HIDConnectionStateTests.swift
+index 079f120..73d1e06 100644
+--- a/Tests/iPhoneUseTests/Bluetooth/HIDConnectionStateTests.swift
++++ b/Tests/iPhoneUseTests/Bluetooth/HIDConnectionStateTests.swift
+@@ -478,6 +478,16 @@ final class HIDConnectionStateTests: XCTestCase {
+         XCTAssertEqual(tracker.attemptsUsed[host], 0)
+     }
+ 
++    func testDisabledLifecycleCannotStartForUSBOrWindowDemand() {
++        var policy = HIDLifecyclePolicy(allowBluetooth: false)
++        policy.start(initialDisplayState: .atLeastOneAwake)
++        policy.setUSBScreenDemand(true, revision: 1)
++        policy.beginWindowDemand(UUID())
++        XCTAssertFalse(policy.shouldRunCoreBluetooth)
++        XCTAssertEqual(policy.inactiveReason, .disabled)
++        XCTAssertEqual(policy.inactiveReason?.stateDescription, "disabled")
++    }
++
+     func testLifecyclePolicyStaysIdleUntilUSBOrAwakeControlWindowDemandsBluetooth() {
+         var policy = HIDLifecyclePolicy()
+         let waitingWindow = UUID()
+diff --git a/Tests/iPhoneUseTests/Input/DeviceInputKeyboardTests.swift b/Tests/iPhoneUseTests/Input/DeviceInputKeyboardTests.swift
+index d76ab8a..7947163 100644
+--- a/Tests/iPhoneUseTests/Input/DeviceInputKeyboardTests.swift
++++ b/Tests/iPhoneUseTests/Input/DeviceInputKeyboardTests.swift
+@@ -5,6 +5,12 @@ import XCTest
+ /// Exercises the public input entry points so payload refactors also preserve
+ /// report ordering, validation before sending, and held modifier lifetimes.
+ final class DeviceInputKeyboardTests: XCTestCase {
++    func testUSBHomeKeepsCommandHeldUntilHIsReleased() throws {
++        let samples = try CoreDeviceKeyboardProgram.home().samples
++        XCTAssertEqual(samples.compactMap { $0["at_ms"] as? Int }, [0, 100, 220, 320])
++        XCTAssertEqual(samples.compactMap { $0["usages"] as? [Int] }, [[227], [227, 11], [227], []])
++    }
++
+     func testTypingPreservesShiftPressAndReleaseReports() throws {
+         var reports: [(ReportID, [UInt8])] = []
+         let input = DeviceInput(host: UUID(), session: UUID(), reportSender: { reports.append(($0, $1)) }, reportReadiness: { _, _, _ in true })

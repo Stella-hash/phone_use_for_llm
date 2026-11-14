@@ -1,5 +1,8 @@
 # Deployment boundary
 
+This file describes the Android implementation. See [the iOS host boundary](ios/SECURITY.md)
+for the separate USB source preview; Android authorization controls do not apply there.
+
 This release candidate is for a dedicated, disposable Android device. It has
 not received independent approval for public release. No fixture test establishes
 production safety or compatibility with a particular physical phone.

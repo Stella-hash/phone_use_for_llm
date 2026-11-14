@@ -1,0 +1,1286 @@
+diff --git a/Sources/iPhoneUse/API/ControlAPI.swift b/Sources/iPhoneUse/API/ControlAPI.swift
+index ec80d91..5746531 100644
+--- a/Sources/iPhoneUse/API/ControlAPI.swift
++++ b/Sources/iPhoneUse/API/ControlAPI.swift
+@@ -252,6 +252,7 @@ enum ControlAPI {
+         return [
+             "idleSuspended": QuietModeActivityController.shared.isSuspended,
+             "identityState": manager.identityState.rawValue,
++            "lifecycle": manager.lifecycleDiagnostic,
+             "permitsPointerAssociation": manager.permitsPointerAssociation,
+             "screens": manager.all.map { screen -> [String: Any] in
+                 var info: [String: Any] = [
+diff --git a/Sources/iPhoneUse/Capture/CaptureLifecycleOwnership.swift b/Sources/iPhoneUse/Capture/CaptureLifecycleOwnership.swift
+new file mode 100644
+index 0000000..bd8b755
+--- /dev/null
++++ b/Sources/iPhoneUse/Capture/CaptureLifecycleOwnership.swift
+@@ -0,0 +1,351 @@
++import Foundation
++
++struct ScreenCaptureStopResult: Equatable {
++    let initiated: Bool
++    let captureDrained: Bool
++    let usbRestored: Bool
++
++    var isClean: Bool { initiated && captureDrained && usbRestored }
++}
++
++/// Enforces a single monotonic deadline across asynchronous capture session
++/// shutdown and post-drain USB configuration restoration.
++enum CaptureShutdownCoordinator {
++    static func stop(
++        waitTimeout: TimeInterval,
++        activeSources: [StoppableCaptureSource],
++        pendingUSBOperations: [StoppableCaptureSource] = [],
++        notifyQueue: DispatchQueue,
++        restoreAllUSB: @escaping (_ deadlineUptime: TimeInterval) -> Bool
++    ) -> ScreenCaptureStopResult {
++        let boundedWait = (waitTimeout.isFinite && waitTimeout > 0) ? waitTimeout : 0
++        let deadline = ProcessInfo.processInfo.systemUptime + boundedWait
++
++        let group = DispatchGroup()
++        let allResources = DispatchGroup()
++        for source in activeSources {
++            group.enter()
++            allResources.enter()
++            source.stop { group.leave(); allResources.leave() }
++        }
++        for operation in pendingUSBOperations {
++            allResources.enter()
++            operation.stop { allResources.leave() }
++        }
++
++        let usbDone = DispatchSemaphore(value: 0)
++        let resultLock = NSLock()
++        var usbClean = false
++        allResources.notify(queue: notifyQueue) {
++            let restored = restoreAllUSB(deadline)
++            resultLock.withLock { usbClean = restored }
++            usbDone.signal()
++        }
++
++        guard boundedWait > 0 else {
++            let drained = activeSources.isEmpty
++            let restoredNow =
++                drained
++                && (usbDone.wait(timeout: .now()) == .success)
++                && resultLock.withLock({ usbClean })
++            return ScreenCaptureStopResult(
++                initiated: true,
++                captureDrained: drained,
++                usbRestored: restoredNow)
++        }
++
++        let captureDrained: Bool
++        if activeSources.isEmpty {
++            captureDrained = true
++        } else {
++            let remainingForCapture = deadline - ProcessInfo.processInfo.systemUptime
++            if remainingForCapture > 0 {
++                captureDrained = group.wait(timeout: .now() + remainingForCapture) == .success
++            } else {
++                captureDrained = group.wait(timeout: .now()) == .success
++            }
++        }
++
++        guard captureDrained else {
++            return ScreenCaptureStopResult(
++                initiated: true,
++                captureDrained: false,
++                usbRestored: false)
++        }
++
++        let remainingForUSB = deadline - ProcessInfo.processInfo.systemUptime
++        let waitedOK: Bool
++        if remainingForUSB > 0 {
++            waitedOK = usbDone.wait(timeout: .now() + remainingForUSB) == .success
++        } else {
++            waitedOK = usbDone.wait(timeout: .now()) == .success
++        }
++        let usbRestored = waitedOK && resultLock.withLock({ usbClean })
++        return ScreenCaptureStopResult(
++            initiated: true,
++            captureDrained: true,
++            usbRestored: usbRestored)
++    }
++}
++
++
++protocol StoppableCaptureSource: AnyObject {
++    func stop(completion: (() -> Void)?)
++}
++
++/// A reservation owns an in-progress constructor as well as the resulting source.
++/// A stop before attach waits for attach (or construction failure), and every
++/// waiter observes the same, single underlying stop. No callback runs under lock.
++final class CaptureResourceLease: StoppableCaptureSource {
++    let token: UUID
++    private let lock = NSLock()
++    private var source: StoppableCaptureSource?
++    private var stopRequested = false
++    private var stopStarted = false
++    private var completed = false
++    private var completions: [() -> Void] = []
++
++    init(token: UUID = UUID(), onDrained: @escaping () -> Void = {}) {
++        self.token = token
++        completions = [onDrained]
++    }
++
++    func attach(_ source: StoppableCaptureSource) {
++        let shouldStop = lock.withLock { () -> Bool in
++            precondition(self.source == nil && !completed)
++            self.source = source
++            guard stopRequested else { return false }
++            stopStarted = true
++            return true
++        }
++        if shouldStop { source.stop { self.finish() } }
++    }
++
++    /// Also completes a failed constructor or a synchronous USB operation lease.
++    func finish() {
++        let callbacks: [() -> Void] = lock.withLock {
++            guard !completed else { return [] }
++            completed = true
++            source = nil
++            let callbacks = completions
++            completions.removeAll()
++            return callbacks
++        }
++        callbacks.forEach { $0() }
++    }
++
++    func stop(completion: (() -> Void)?) {
++        let action: (StoppableCaptureSource?, Bool) = lock.withLock {
++            if completed { return (nil, true) }
++            if let completion { completions.append(completion) }
++            stopRequested = true
++            guard !stopStarted, let source else { return (nil, false) }
++            stopStarted = true
++            return (source, false)
++        }
++        if action.1 { completion?() }
++        action.0?.stop { self.finish() }
++    }
++}
++
++/// The manager's ownership authority. All methods run under its lock; AV/IOKit
++/// work and lease callbacks run outside it. Published sources are only a lookup
++/// index: removal from that index does not release this resource ownership.
++struct CaptureLifecycleOwnership {
++    struct DiscoveryTicket: Equatable {
++        let generation: UInt64
++        let sequence: UInt64
++    }
++    private struct Resource {
++        let sourceID: String?
++        let entryID: UInt64?
++        let lease: CaptureResourceLease
++        let isUSBOperation: Bool
++        var published = false
++        var retiring = false
++        var isDeferredRestore = false
++        var deferredAttempt: UInt64 = 0
++        var whenReady: ((CaptureResourceLease) -> Void)?
++    }
++    private var resources: [UUID: Resource] = [:]
++    private var shutdowns: Set<UUID> = []
++    private var discoveryScheduled = false
++    private var pendingDiscovery: UInt64?
++    private var currentDiscovery: DiscoveryTicket?
++    private var discoverySequence: UInt64 = 0
++
++    /// One worker owns snapshot -> apply. Any number of concurrent requests
++    /// become one fresh follow-up snapshot, never a replay of an old device list.
++    mutating func requestDiscovery(generation: UInt64) -> Bool {
++        pendingDiscovery = generation
++        guard !discoveryScheduled else { return false }
++        discoveryScheduled = true
++        return true
++    }
++
++    mutating func nextDiscovery() -> DiscoveryTicket? {
++        guard let generation = pendingDiscovery else {
++            discoveryScheduled = false
++            currentDiscovery = nil
++            return nil
++        }
++        pendingDiscovery = nil
++        discoverySequence &+= 1
++        let ticket = DiscoveryTicket(generation: generation, sequence: discoverySequence)
++        currentDiscovery = ticket
++        return ticket
++    }
++
++    mutating func invalidateDiscovery() {
++        pendingDiscovery = nil
++        currentDiscovery = nil
++        // The existing worker still owns its queue slot, even across stop/start.
++    }
++
++    func accepts(_ ticket: DiscoveryTicket, generation: UInt64) -> Bool {
++        ticket == currentDiscovery && ticket.generation == generation && shutdowns.isEmpty
++    }
++
++    private func conflicts(_ resource: Resource, sourceID: String?, entryID: UInt64?) -> Bool {
++        if let sourceID, sourceID == resource.sourceID { return true }
++        if let entryID, let ownedEntry = resource.entryID { return entryID == ownedEntry }
++        // An unknown physical identity cannot prove independence from a drain.
++        return resource.entryID == nil || entryID == nil
++    }
++
++    var hasShutdown: Bool { !shutdowns.isEmpty }
++    var hasCaptureResources: Bool { resources.values.contains { !$0.isUSBOperation } }
++
++    mutating func reserveSource(
++        id: String, entryID: UInt64?, lease: CaptureResourceLease
++    ) -> Bool {
++        guard shutdowns.isEmpty,
++            !resources.values.contains(where: {
++                if $0.sourceID == id { return true }
++                if !$0.retiring && !$0.isUSBOperation { return false }
++                return conflicts($0, sourceID: id, entryID: entryID)
++            })
++        else { return false }
++        resources[lease.token] = Resource(
++            sourceID: id, entryID: entryID, lease: lease, isUSBOperation: false)
++        return true
++    }
++
++    mutating func publish(_ lease: CaptureResourceLease) -> Bool {
++        guard var resource = resources[lease.token], !resource.retiring,
++            shutdowns.isEmpty else { return false }
++        resource.published = true
++        resources[lease.token] = resource
++        return true
++    }
++
++    mutating func retireSource(id: String) -> CaptureResourceLease? {
++        guard let token = resources.first(where: {
++            !$0.value.isUSBOperation && $0.value.sourceID == id && !$0.value.retiring
++        })?.key else { return nil }
++        resources[token]?.retiring = true
++        return resources[token]?.lease
++    }
++
++    func permitsUSB(sourceID: String?, entryID: UInt64?, excluding token: UUID? = nil) -> Bool {
++        guard shutdowns.isEmpty else { return false }
++        if let token, resources[token]?.isUSBOperation != true { return false }
++        return !resources.values.contains {
++            if $0.lease.token == token { return false }
++            guard $0.retiring || !$0.published || $0.isUSBOperation else { return false }
++            return conflicts($0, sourceID: sourceID, entryID: entryID)
++        }
++    }
++
++    mutating func reserveUSB(
++        sourceID: String?, entryID: UInt64?, lease: CaptureResourceLease
++    ) -> Bool {
++        guard permitsUSB(sourceID: sourceID, entryID: entryID) else { return false }
++        resources[lease.token] = Resource(
++            sourceID: sourceID, entryID: entryID, lease: lease, isUSBOperation: true)
++        return true
++    }
++
++    /// A denied live restore retains one admission lease until its conflicting
++    /// drain finishes. This is queued work, not a second USB switch ledger.
++    mutating func deferUSBRestore(
++        entryID: UInt64, lease: CaptureResourceLease,
++        reusing: CaptureResourceLease?, whenReady: @escaping (CaptureResourceLease) -> Void
++    ) -> Bool {
++        guard shutdowns.isEmpty else { return false }
++        if let existing = resources.values.first(where: { $0.isDeferredRestore && $0.entryID == entryID }) {
++            if existing.lease === reusing {
++                resources[existing.lease.token]?.whenReady = whenReady
++            }
++            return false // coalesced; the newly offered lease is not owned
++        }
++        var resource = Resource(sourceID: nil, entryID: entryID, lease: lease, isUSBOperation: true)
++        resource.isDeferredRestore = true
++        resource.whenReady = whenReady
++        resources[lease.token] = resource
++        return true
++    }
++
++    mutating func takeReadyUSBRestores() -> [(lease: CaptureResourceLease, attempt: UInt64, body: (CaptureResourceLease) -> Void)] {
++        guard shutdowns.isEmpty else { return [] }
++        var ready: [(CaptureResourceLease, UInt64, (CaptureResourceLease) -> Void)] = []
++        for token in Array(resources.keys) {
++            guard let resource = resources[token], let body = resource.whenReady,
++                permitsUSB(sourceID: nil, entryID: resource.entryID, excluding: token) else { continue }
++            resources[token]?.whenReady = nil
++            resources[token]?.deferredAttempt &+= 1
++            ready.append((resource.lease, resources[token]!.deferredAttempt, body))
++        }
++        return ready
++    }
++
++    /// A previous callback cannot release a lease already admitted for a newer
++    /// retry. A drain may finish between requeue and that callback's return.
++    func completedUSBRestoreAttempt(_ token: UUID, attempt: UInt64) -> Bool {
++        guard let resource = resources[token] else { return false }
++        return resource.deferredAttempt == attempt && resource.whenReady == nil
++    }
++
++    @discardableResult
++    mutating func release(_ token: UUID) -> Bool {
++        guard let resource = resources.removeValue(forKey: token) else { return false }
++        return resource.retiring || resource.isUSBOperation
++    }
++
++    mutating func beginShutdown() -> (
++        token: UUID, leases: [StoppableCaptureSource], usbOperations: [StoppableCaptureSource],
++        cancelledRestores: [CaptureResourceLease]
++    ) {
++        let token = UUID()
++        shutdowns.insert(token)
++        invalidateDiscovery()
++        let cancelled = resources.values.filter { $0.whenReady != nil }.map(\.lease)
++        for key in resources.keys {
++            resources[key]?.retiring = true
++            resources[key]?.whenReady = nil
++        }
++        return (
++            token, resources.values.filter { !$0.isUSBOperation }.map(\.lease),
++            resources.values.filter(\.isUSBOperation).map(\.lease), cancelled)
++    }
++
++    /// Called only after every lease drained AND the prior USB restore queue
++    /// work settled. A bounded stop timeout does not remove this admission fence.
++    mutating func finishShutdown(_ token: UUID) { shutdowns.remove(token) }
++
++    var diagnostic: [String: Any] {
++        let admission = hasShutdown ? "blocked_by_previous_shutdown" :
++            (resources.values.contains(where: { $0.retiring }) ? "waiting_for_conflicting_source_drain" :
++                (resources.values.contains(where: { $0.isUSBOperation }) ? "waiting_for_conflicting_usb_operation" : "ready"))
++        return [
++            "admission": admission,
++            "draining": resources.values.filter(\.retiring).count,
++            "opening": resources.values.filter { !$0.published && !$0.isUSBOperation && !$0.retiring }.count,
++            "usbOperations": resources.values.filter(\.isUSBOperation).count,
++            "deferredUSBRestores": resources.values.filter { $0.whenReady != nil }.count,
++            "shutdownPending": shutdowns.count,
++            "discoveryPending": pendingDiscovery != nil,
++            "discoverySequence": discoverySequence,
++        ]
++    }
++}
+diff --git a/Sources/iPhoneUse/Capture/ScreenCapture.swift b/Sources/iPhoneUse/Capture/ScreenCapture.swift
+index 2b7a5e3..0d908a3 100644
+--- a/Sources/iPhoneUse/Capture/ScreenCapture.swift
++++ b/Sources/iPhoneUse/Capture/ScreenCapture.swift
+@@ -5,91 +5,6 @@ import Foundation
+ import ImageIO
+ import UniformTypeIdentifiers
+ 
+-struct ScreenCaptureStopResult: Equatable {
+-    let initiated: Bool
+-    let captureDrained: Bool
+-    let usbRestored: Bool
+-
+-    var isClean: Bool { initiated && captureDrained && usbRestored }
+-}
+-
+-protocol StoppableCaptureSource: AnyObject {
+-    func stop(completion: (() -> Void)?)
+-}
+-
+-/// Enforces a single monotonic deadline across asynchronous capture session
+-/// shutdown and post-drain USB configuration restoration.
+-enum CaptureShutdownCoordinator {
+-    static func stop(
+-        waitTimeout: TimeInterval,
+-        activeSources: [StoppableCaptureSource],
+-        notifyQueue: DispatchQueue,
+-        restoreAllUSB: @escaping (_ deadlineUptime: TimeInterval) -> Bool
+-    ) -> ScreenCaptureStopResult {
+-        let boundedWait = (waitTimeout.isFinite && waitTimeout > 0) ? waitTimeout : 0
+-        let deadline = ProcessInfo.processInfo.systemUptime + boundedWait
+-
+-        let group = DispatchGroup()
+-        for source in activeSources {
+-            group.enter()
+-            source.stop { group.leave() }
+-        }
+-
+-        let usbDone = DispatchSemaphore(value: 0)
+-        let resultLock = NSLock()
+-        var usbClean = false
+-        group.notify(queue: notifyQueue) {
+-            let restored = restoreAllUSB(deadline)
+-            resultLock.withLock { usbClean = restored }
+-            usbDone.signal()
+-        }
+-
+-        guard boundedWait > 0 else {
+-            let drained = activeSources.isEmpty
+-            let restoredNow =
+-                drained
+-                && (usbDone.wait(timeout: .now()) == .success)
+-                && resultLock.withLock({ usbClean })
+-            return ScreenCaptureStopResult(
+-                initiated: true,
+-                captureDrained: drained,
+-                usbRestored: restoredNow)
+-        }
+-
+-        let captureDrained: Bool
+-        if activeSources.isEmpty {
+-            captureDrained = true
+-        } else {
+-            let remainingForCapture = deadline - ProcessInfo.processInfo.systemUptime
+-            if remainingForCapture > 0 {
+-                captureDrained = group.wait(timeout: .now() + remainingForCapture) == .success
+-            } else {
+-                captureDrained = group.wait(timeout: .now()) == .success
+-            }
+-        }
+-
+-        guard captureDrained else {
+-            return ScreenCaptureStopResult(
+-                initiated: true,
+-                captureDrained: false,
+-                usbRestored: false)
+-        }
+-
+-        let remainingForUSB = deadline - ProcessInfo.processInfo.systemUptime
+-        let waitedOK: Bool
+-        if remainingForUSB > 0 {
+-            waitedOK = usbDone.wait(timeout: .now() + remainingForUSB) == .success
+-        } else {
+-            waitedOK = usbDone.wait(timeout: .now()) == .success
+-        }
+-        let usbRestored = waitedOK && resultLock.withLock({ usbClean })
+-        return ScreenCaptureStopResult(
+-            initiated: true,
+-            captureDrained: true,
+-            usbRestored: usbRestored)
+-    }
+-}
+-
+ /// Resolves single-device USB physical pinning outside manager locks so
+ /// `manager.lock -> USBValeriaConfigurator.queue` lock-order edges never exist.
+ enum CaptureDiscoveryPinResolver {
+@@ -220,6 +135,9 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
+     private var emptyRefreshCount = 0
+     private var deviceObservers: [NSObjectProtocol] = []
+     private let identityQueue = DispatchQueue(label: "iphone-use.capture-identity", qos: .utility)
++    private let discoveryQueue = DispatchQueue(label: "iphone-use.capture-discovery", qos: .userInitiated)
++    private var ownership = CaptureLifecycleOwnership()
++    private var preparingStartup: UInt64?
+     private let shutdownQueue = DispatchQueue(label: "iphone-use.capture-shutdown", qos: .userInitiated)
+     private var identityGeneration: UInt64 = 0
+     private var verificationState: ScreenCaptureIdentityState = .singleDevice
+@@ -230,7 +148,7 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
+     private var captureDiscoveryEnabled = false
+     private var lifecycleGeneration: UInt64 = 0
+     private var usbDemandRevision: UInt64 = 0
+-    private var isStopped = false
++    private var isStopped = true
+     private var retainsIdleUSBDemand = false
+     private let restoreAllUSB: (TimeInterval) -> Bool
+ 
+@@ -246,35 +164,26 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
+     var onScreensChanged: (() -> Void)?
+ 
+     func start() {
+-        // Query persisted USB ledger strictly outside `lock`; fail closed if the ledger
+-        // either contains unrestored same-boot switches or could not be loaded cleanly.
+-        let hasPendingSwitches = USBValeriaConfigurator.requiresStartupReconciliation
+-        let (generation, needsAsyncReconcile) = lock.withLock { () -> (UInt64, Bool) in
++        let generation: UInt64? = lock.withLock {
++            guard isStopped else { return nil }
+             isStopped = false
+             retainsIdleUSBDemand = false
+             captureDiscoveryEnabled = false
+             lifecycleGeneration &+= 1
+-            let gen = lifecycleGeneration
+-            let shouldReconcile = startupReconciliationGate.beginStart(
+-                generation: gen, hasPendingSwitches: hasPendingSwitches)
+-            return (gen, shouldReconcile)
+-        }
+-
+-        if needsAsyncReconcile {
+-            runStartupReconciliationAttempt(generation: generation)
+-        } else {
+-            enableCaptureDiscoveryIfNeeded(generation: generation)
+-            refresh()
++            startupReconciliationGate.reset()
++            return lifecycleGeneration
+         }
++        guard let generation else { return }
++        prepareStartup(generation: generation)
+ 
+-        // CoreMediaIO can publish the iPhone capture device shortly after USB trust,
+-        // camera permission, or the screen-capture switch completes. When startup USB
+-        // reconciliation is unresolved, this timer retries reconciliation serially
+-        // before enabling any capture discovery.
+-        refreshTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
++        // Installation is generation-checked too: stop may have run while the
++        // timer/observer objects were being created outside the manager lock.
++        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+             guard let self else { return }
++            self.prepareStartup(generation: generation)
+             let action = self.lock.withLock { () -> CaptureStartupReconciliationGate.TickAction in
+-                guard !self.isStopped, self.lifecycleGeneration == generation else { return .wait }
++                guard !self.isStopped, self.lifecycleGeneration == generation,
++                    !self.ownership.hasShutdown else { return .wait }
+                 return self.startupReconciliationGate.actionForPeriodicTick(generation: generation)
+             }
+             switch action {
+@@ -287,29 +196,65 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
+                 break
+             }
+         }
++        let installed = lock.withLock { () -> Bool in
++            guard !isStopped, lifecycleGeneration == generation else { return false }
++            refreshTimer = timer
++            RunLoop.main.add(timer, forMode: .common)
++            return true
++        }
++        if !installed { timer.invalidate() }
+ 
+         AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
+             log("camera access \(granted ? "granted" : "denied")")
+-            guard let self,
+-                self.lock.withLock({
+-                    !self.isStopped
+-                        && self.lifecycleGeneration == generation
+-                        && self.startupReconciliationGate.permitsCaptureDiscovery(generation: generation)
+-                })
+-            else {
+-                return
+-            }
++            guard let self else { return }
+             self.enableCaptureDiscoveryIfNeeded(generation: generation)
+             self.refresh()
+         }
+     }
+ 
++    private func prepareStartup(generation: UInt64) {
++        let admitted = lock.withLock { () -> Bool in
++            guard !isStopped, lifecycleGeneration == generation,
++                !ownership.hasShutdown, preparingStartup == nil,
++                startupReconciliationGate.phase == .idle else { return false }
++            preparingStartup = generation
++            return true
++        }
++        guard admitted else { return }
++        // Never wait for the USB queue on main or under the manager lock. In
++        // particular an earlier bounded stop can still have a restore in flight.
++        identityQueue.async { [weak self] in
++            guard let self else { return }
++            let pending = USBValeriaConfigurator.requiresStartupReconciliation
++            let reconcile: Bool? = self.lock.withLock {
++                if self.preparingStartup == generation { self.preparingStartup = nil }
++                guard !self.isStopped, self.lifecycleGeneration == generation,
++                    !self.ownership.hasShutdown else { return nil }
++                return self.startupReconciliationGate.beginStart(
++                    generation: generation, hasPendingSwitches: pending)
++            }
++            guard let reconcile else { return }
++            if reconcile {
++                self.runStartupReconciliationAttempt(generation: generation)
++            } else {
++                self.enableCaptureDiscoveryIfNeeded(generation: generation)
++                self.refresh()
++            }
++        }
++    }
++
+     private func runStartupReconciliationAttempt(generation: UInt64) {
++        let operation = lock.withLock {
++            beginRecoveryUSBOperationLocked(sourceID: nil, entryID: nil, expectedLifecycle: generation)
++        }
++        guard let operation else { return }
+         USBValeriaConfigurator.reconcilePersistedSwitchesAsync(budget: 1.0) { [weak self] clean in
++            operation.finish()
+             DispatchQueue.main.async {
+                 guard let self else { return }
+                 let outcome = self.lock.withLock { () -> CaptureStartupReconciliationGate.CompletionAction in
+-                    guard !self.isStopped, self.lifecycleGeneration == generation else {
++                    guard !self.isStopped, self.lifecycleGeneration == generation,
++                        !self.ownership.hasShutdown else {
+                         return .ignoredStale
+                     }
+                     return self.startupReconciliationGate.completeReconciliation(
+@@ -333,14 +278,14 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
+             guard !isStopped,
+                 lifecycleGeneration == generation,
+                 startupReconciliationGate.permitsCaptureDiscovery(generation: generation),
+-                !captureDiscoveryEnabled
++                !captureDiscoveryEnabled, !ownership.hasShutdown
+             else { return false }
+             captureDiscoveryEnabled = true
+             return true
+         }
+         guard shouldEnable else { return }
+         allowScreenCaptureDevices()
+-        observeDeviceChanges()
++        observeDeviceChanges(generation: generation)
+     }
+ 
+     @discardableResult
+@@ -387,33 +332,49 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
+         waitTimeout: TimeInterval,
+         retainingIdleUSBDemand: (_ hasActiveCapture: Bool) -> Bool = { _ in false }
+     ) -> ScreenCaptureStopResult {
+-        refreshTimer?.invalidate()
+-        refreshTimer = nil
+-        let (observers, activeSources) = lock.withLock {
+-            let hadActiveCapture = !sources.isEmpty || !screens.isEmpty || retainsIdleUSBDemand
++        let (timer, observers, shutdown) = lock.withLock {
++            let hadActiveCapture = ownership.hasCaptureResources || !screens.isEmpty || retainsIdleUSBDemand
+             isStopped = true
+             retainsIdleUSBDemand = retainingIdleUSBDemand(hadActiveCapture)
+             captureDiscoveryEnabled = false
+             startupReconciliationGate.reset()
+             lifecycleGeneration &+= 1
++            let currentTimer = refreshTimer
++            refreshTimer = nil
+             let currentObservers = deviceObservers
+             deviceObservers.removeAll()
+-            let currentSources = Array(sources.values)
++            let shutdown = ownership.beginShutdown()
+             sources.removeAll()
+             screens.removeAll()
+             verifiedScreenIDs.removeAll()
+             _ = valeriaRecovery.reset()
+             identityGeneration &+= 1
+-            return (currentObservers, currentSources)
+-        }
+-        for observer in observers {
+-            NotificationCenter.default.removeObserver(observer)
++            return (currentTimer, currentObservers, shutdown)
+         }
++        timer?.invalidate()
++        for lease in shutdown.cancelledRestores { lease.finish() }
++        for observer in observers { NotificationCenter.default.removeObserver(observer) }
++        log("capture lifecycle shutdown admitted; owned=\(shutdown.leases.count)")
+         return CaptureShutdownCoordinator.stop(
+             waitTimeout: waitTimeout,
+-            activeSources: activeSources,
++            activeSources: shutdown.leases,
++            pendingUSBOperations: shutdown.usbOperations,
+             notifyQueue: shutdownQueue,
+-            restoreAllUSB: restoreAllUSB)
++            restoreAllUSB: { [self] deadline in
++                let restored = restoreAllUSB(deadline)
++                // A deadline return can precede an already-running IOKit call.
++                // Retain the fence until the queue passes that work as well.
++                USBValeriaConfigurator.afterPendingOperations { [weak self] in
++                    guard let self else { return }
++                    let generation = self.lock.withLock { () -> UInt64 in
++                        self.ownership.finishShutdown(shutdown.token)
++                        return self.lifecycleGeneration
++                    }
++                    log("capture lifecycle shutdown settled")
++                    self.prepareStartup(generation: generation)
++                }
++                return restored
++            })
+     }
+ 
+     private func allowScreenCaptureDevices() {
+@@ -426,15 +387,22 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
+             CMIOObjectID(kCMIOObjectSystemObject), &address, 0, nil, UInt32(MemoryLayout<UInt32>.size), &allow)
+     }
+ 
+-    private func observeDeviceChanges() {
++    private func observeDeviceChanges(generation: UInt64) {
+         let connected = NotificationCenter.default.addObserver(
+             forName: AVCaptureDevice.wasConnectedNotification, object: nil, queue: nil
+         ) { [weak self] _ in self?.refresh() }
+         let disconnected = NotificationCenter.default.addObserver(
+             forName: AVCaptureDevice.wasDisconnectedNotification, object: nil, queue: nil
+         ) { [weak self] _ in self?.refresh() }
+-        lock.withLock {
++        let installed = lock.withLock { () -> Bool in
++            guard !isStopped, lifecycleGeneration == generation, captureDiscoveryEnabled,
++                deviceObservers.isEmpty else { return false }
+             deviceObservers = [connected, disconnected]
++            return true
++        }
++        if !installed {
++            NotificationCenter.default.removeObserver(connected)
++            NotificationCenter.default.removeObserver(disconnected)
+         }
+     }
+ 
+@@ -508,24 +476,66 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
+         scheduleIdentityVerification(generation: job.0, sources: job.1)
+     }
+ 
++    private func makeOwnershipLease() -> CaptureResourceLease {
++        let token = UUID()
++        return CaptureResourceLease(token: token) { [weak self] in
++            guard let self else { return }
++            let shouldRefresh = self.lock.withLock { () -> Bool in
++                let refresh = self.ownership.release(token)
++                self.scheduleReadyUSBRestoresLocked()
++                return refresh
++            }
++            if shouldRefresh {
++                log("capture lifecycle resource drained")
++                self.refresh()
++            }
++        }
++    }
++
++    var lifecycleDiagnostic: [String: Any] {
++        lock.withLock {
++            var result = ownership.diagnostic
++            result["state"] = isStopped ? "stopped" :
++                (ownership.hasShutdown ? "draining_previous_lifecycle" :
++                    (startupReconciliationGate.permitsCaptureDiscovery(generation: lifecycleGeneration)
++                        ? "discovering" : "waiting_for_usb_reconciliation"))
++            result["generation"] = lifecycleGeneration
++            return result
++        }
++    }
++
+     private func refresh() {
+-        let generation = lock.withLock { isStopped ? nil : lifecycleGeneration }
+-        guard let generation else { return }
++        let enqueue = lock.withLock { () -> Bool in
++            guard !isStopped, !ownership.hasShutdown,
++                startupReconciliationGate.permitsCaptureDiscovery(generation: lifecycleGeneration)
++            else { return false }
++            return ownership.requestDiscovery(generation: lifecycleGeneration)
++        }
++        guard enqueue else { return }
++        discoveryQueue.async { [weak self] in
++            guard let self else { return }
++            while let ticket = self.lock.withLock({ self.ownership.nextDiscovery() }) {
++                self.refresh(ticket: ticket)
++            }
++        }
++    }
++
++    private func refresh(ticket: CaptureLifecycleOwnership.DiscoveryTicket) {
++        func isCurrentLocked() -> Bool {
++            !isStopped && ownership.accepts(ticket, generation: lifecycleGeneration)
++        }
++        guard lock.withLock({ isCurrentLocked() }) else { return }
+         let devices = AVCaptureDevice.DiscoverySession(
+             deviceTypes: [.external], mediaType: .muxed, position: .unspecified
+         ).devices.filter { $0.modelID.contains("iOS") && $0.isConnected }
+         let discoveredIDs = devices.map(\.uniqueID)
+         let present = Set(discoveredIDs)
+-        // Query IOKit single-device USB identity strictly OUTSIDE `lock` so
+-        // `manager.lock -> USBValeriaConfigurator.queue` cycles are impossible.
+         let prequeriedPin = CaptureDiscoveryPinResolver.prequerySingleDevicePin(
+             discoveredIDs: discoveredIDs,
+             needsNewSourceForID: { id in
+-                lock.withLock { !isStopped && sources[id] == nil }
++                lock.withLock { isCurrentLocked() && sources[id] == nil }
+             },
+-            querySingleIOSDevice: {
+-                USBValeriaConfigurator.currentSingleIOSDeviceIdentity()
+-            })
++            querySingleIOSDevice: { USBValeriaConfigurator.currentSingleIOSDeviceIdentity() })
+ 
+         var changed = false
+         var shouldReallowCaptureDevices = false
+@@ -533,57 +543,88 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
+         var shouldReconcilePendingSwitch = false
+         var removedUSBEntries: [UInt64] = []
+         var postSwitchChecks: [CaptureValeriaRecoveryTracker.ScheduledPostSwitchCheck] = []
++        var newlyClaimedSwitches: [CaptureValeriaRecoveryTracker.ScheduledPostSwitchCheck] = []
+         var sourcesSnapshot: [String: ScreenCaptureSource] = [:]
+         var refreshLifecycle: UInt64 = 0
+         var job: (UInt64, [String: ScreenCaptureSource])?
+-        let didRun = lock.withLock { () -> Bool in
+-            guard !isStopped, lifecycleGeneration == generation else { return false }
+-            refreshLifecycle = lifecycleGeneration
+-            var newlyClaimedSwitches: [CaptureValeriaRecoveryTracker.ScheduledPostSwitchCheck] = []
+-            for (id, source) in sources where !present.contains(id) {
+-                source.stop()
++        let retired: [CaptureResourceLease]? = lock.withLock {
++            guard isCurrentLocked() else { return nil }
++            var retired: [CaptureResourceLease] = []
++            let topologyChanged = present != Set(sources.keys)
++            for id in sources.keys where !present.contains(id) {
++                if let lease = ownership.retireSource(id: id) { retired.append(lease) }
+                 sources[id] = nil
+                 changed = true
+-                log("screen gone: \(source.name)")
+             }
+-            for device in devices where sources[device.uniqueID] == nil {
+-                let pinnedUSBDevice: USBValeriaConfigurator.PinnedUSBDevice? =
+-                    if present.count == 1,
+-                        let prequeriedPin,
+-                        prequeriedPin.deviceID == device.uniqueID
+-                    {
+-                        prequeriedPin.pin
+-                    } else {
+-                        nil
+-                    }
+-                do {
+-                    let newSource = try ScreenCaptureSource(
+-                        device: device,
+-                        pinnedUSBDevice: pinnedUSBDevice,
+-                        onFirstFrame: { [weak self] in self?.onScreensChanged?() },
+-                        onNeedsValeriaRecovery: { [weak self] source, restartAfter in
+-                            self?.recoverValeriaIfNeeded(for: source, restartSource: restartAfter)
+-                        })
+-                    sources[device.uniqueID] = newSource
++            if topologyChanged {
++                // Construction is now outside the lock. Revoke topology-dependent
++                // input permission before exposing any intermediate previews.
++                // Surviving frames remain readable while identity is pending.
++                changed = true
++                identityGeneration &+= 1
++                verificationState = .pending
++                rebuildScreens(mapping: [:], verified: false)
++            }
++            return retired
++        }
++        guard let retired else {
++            log("capture lifecycle discovery rejected; generation=\(ticket.generation) sequence=\(ticket.sequence)")
++            return
++        }
++        if changed { onScreensChanged?() }
++        if !retired.isEmpty { log("capture lifecycle retiring=\(retired.count)") }
++        for lease in retired { lease.stop(completion: nil) }
++
++        var deferredAdmissions = 0
++        for device in devices {
++            let pin = present.count == 1 && prequeriedPin?.deviceID == device.uniqueID
++                ? prequeriedPin?.pin : nil
++            let lease = makeOwnershipLease()
++            let admitted = lock.withLock { () -> Bool in
++                guard isCurrentLocked(), sources[device.uniqueID] == nil else { return false }
++                let reserved = ownership.reserveSource(
++                    id: device.uniqueID, entryID: pin?.registryEntryID, lease: lease)
++                if !reserved { deferredAdmissions += 1 }
++                return reserved
++            }
++            guard admitted else { continue }
++            log("capture lifecycle source admitted; generation=\(ticket.generation) sequence=\(ticket.sequence)")
++            do {
++                // AVCaptureDeviceInput/session construction may block: the lease
++                // is already owned, but the manager lock is never held here.
++                let source = try ScreenCaptureSource(
++                    device: device, pinnedUSBDevice: pin,
++                    onFirstFrame: { [weak self] in self?.onScreensChanged?() },
++                    onNeedsValeriaRecovery: { [weak self] source, restartAfter in
++                        self?.recoverValeriaIfNeeded(for: source, restartSource: restartAfter)
++                    })
++                lease.attach(source)
++                let published = lock.withLock { () -> Bool in
++                    guard isCurrentLocked(), ownership.publish(lease) else { return false }
++                    sources[device.uniqueID] = source
+                     if present.count == 1,
+-                        let claimedEntryID = valeriaRecovery.claimPendingEmptyDiscoverySwitch(
+-                            for: newSource.instanceID,
+-                            sourceID: device.uniqueID,
+-                            pinnedDevice: pinnedUSBDevice)
++                        let entryID = valeriaRecovery.claimPendingEmptyDiscoverySwitch(
++                            for: source.instanceID, sourceID: device.uniqueID, pinnedDevice: pin)
+                     {
+-                        newlyClaimedSwitches.append(
+-                            .init(
+-                                sourceID: device.uniqueID,
+-                                sourceInstanceID: newSource.instanceID,
+-                                entryID: claimedEntryID,
+-                                supersedeExisting: true))
++                        newlyClaimedSwitches.append(.init(
++                            sourceID: device.uniqueID, sourceInstanceID: source.instanceID,
++                            entryID: entryID, supersedeExisting: true))
+                     }
+                     changed = true
+-                    log("capturing \(device.localizedName) (\(device.uniqueID))")
+-                } catch {
+-                    log("capture failed for \(device.localizedName): \(error)")
++                    return true
+                 }
++                if !published { lease.stop(completion: nil) }
++            } catch {
++                lease.finish()
++                log("capture lifecycle construction failed; retry deferred to next discovery request")
+             }
++        }
++        if deferredAdmissions > 0 {
++            log("capture lifecycle admission deferred; count=\(deferredAdmissions) sequence=\(ticket.sequence)")
++        }
++        let didRun = lock.withLock { () -> Bool in
++            guard isCurrentLocked() else { return false }
++            refreshLifecycle = lifecycleGeneration
+             sourcesSnapshot = sources
+             let activeSourceStates = sources.values.map {
+                 CaptureValeriaRecoveryTracker.RefreshSourceState(
+@@ -636,7 +677,7 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
+                 guard let self else { return }
+                 for entryID in removedUSBEntries {
+                     _ = CaptureValeriaRecoveryCoordinator.performGatedLiveRestore(
+-                        host: self, entryID: entryID)
++                        host: self, entryID: entryID, expectedLifecycle: refreshLifecycle)
+                 }
+             }
+         }
+@@ -668,6 +709,43 @@ final class ScreenCaptureManager: CaptureValeriaRecoveryHost {
+     var recoveryIdentityGenerationLocked: UInt64 { identityGeneration }
+     var recoveryVerificationStateLocked: ScreenCaptureIdentityState { verificationState }
+ 
++    func permitsRecoveryUSBLocked(sourceID: String?, entryID: UInt64?, excluding: UUID?) -> Bool {
++        ownership.permitsUSB(sourceID: sourceID, entryID: entryID, excluding: excluding)
++    }
++
++    func beginRecoveryUSBOperationLocked(
++        sourceID: String?, entryID: UInt64?, expectedLifecycle: UInt64
++    ) -> CaptureResourceLease? {
++        guard !isStopped, lifecycleGeneration == expectedLifecycle else { return nil }
++        let lease = makeOwnershipLease()
++        guard ownership.reserveUSB(sourceID: sourceID, entryID: entryID, lease: lease) else { return nil }
++        return lease
++    }
++
++    func deferRecoveryUSBRestoreLocked(
++        entryID: UInt64, expectedLifecycle: UInt64, reusing: CaptureResourceLease?,
++        whenReady: @escaping (CaptureResourceLease) -> Void
++    ) {
++        guard !isStopped, lifecycleGeneration == expectedLifecycle else { return }
++        _ = ownership.deferUSBRestore(
++            entryID: entryID, lease: makeOwnershipLease(), reusing: reusing, whenReady: whenReady)
++        scheduleReadyUSBRestoresLocked()
++    }
++
++    private func scheduleReadyUSBRestoresLocked() {
++        for (lease, attempt, body) in ownership.takeReadyUSBRestores() {
++            identityQueue.async { [weak self] in
++                body(lease)
++                // If another drain intervened before execution, the same lease
++                // was requeued. Actual USB failure is not an immediate retry.
++                let completed = self?.lock.withLock {
++                    self?.ownership.completedUSBRestoreAttempt(lease.token, attempt: attempt) == true
++                } ?? true
++                if completed { lease.finish() }
++            }
++        }
++    }
++
+     func withValeriaTrackerLocked<T>(_ body: (inout CaptureValeriaRecoveryTracker) -> T) -> T {
+         body(&valeriaRecovery)
+     }
+diff --git a/Sources/iPhoneUse/Capture/CaptureValeriaRecovery.swift b/Sources/iPhoneUse/Capture/CaptureValeriaRecovery.swift
+index 4366428..3091690 100644
+--- a/Sources/iPhoneUse/Capture/CaptureValeriaRecovery.swift
++++ b/Sources/iPhoneUse/Capture/CaptureValeriaRecovery.swift
+@@ -180,8 +180,9 @@ struct CaptureValeriaRecoveryTracker {
+             activeSwitchEntryID: entry.activeSwitchEntryID)
+     }
+ 
+-    mutating func cancelInFlight(sourceInstanceID: UUID) {
++    mutating func cancelInFlight(sourceInstanceID: UUID, refundUnadmittedProbe: Bool = false) {
+         guard var entry = entries[sourceInstanceID] else { return }
++        if refundUnadmittedProbe, entry.inFlight, entry.usbAttemptsUsed > 0 { entry.usbAttemptsUsed -= 1 }
+         entry.inFlight = false
+         entry.pendingRestartRequested = false
+         entries[sourceInstanceID] = entry
+@@ -283,7 +284,8 @@ struct CaptureValeriaRecoveryTracker {
+         }
+     }
+ 
+-    mutating func cancelEmptyDiscoveryInFlight() {
++    mutating func cancelEmptyDiscoveryInFlight(refundingUnadmittedEntry entryID: UInt64? = nil) {
++        if let entryID { emptyDiscoveryAttemptedEntries.remove(entryID) }
+         emptyDiscoveryInFlight = false
+     }
+ 
+@@ -464,12 +466,34 @@ protocol CaptureValeriaRecoveryHost: AnyObject {
+     var recoverySourcesLocked: [String: Source] { get }
+     var recoveryIdentityGenerationLocked: UInt64 { get }
+     var recoveryVerificationStateLocked: ScreenCaptureIdentityState { get }
++    func permitsRecoveryUSBLocked(sourceID: String?, entryID: UInt64?, excluding: UUID?) -> Bool
++    func beginRecoveryUSBOperationLocked(
++        sourceID: String?, entryID: UInt64?, expectedLifecycle: UInt64
++    ) -> CaptureResourceLease?
++    func deferRecoveryUSBRestoreLocked(
++        entryID: UInt64, expectedLifecycle: UInt64, reusing: CaptureResourceLease?,
++        whenReady: @escaping (CaptureResourceLease) -> Void
++    )
+     func withValeriaTrackerLocked<T>(_ body: (inout CaptureValeriaRecoveryTracker) -> T) -> T
+     func enterMultiDevicePendingForValeriaLocked()
+     func notifyScreensChangedAfterValeriaGate()
+     func scheduleValeriaIdentityVerification(generation: UInt64, sources: [String: Source])
+ }
+ 
++extension CaptureValeriaRecoveryHost {
++    func deferRecoveryUSBRestoreLocked(
++        entryID: UInt64, expectedLifecycle: UInt64, reusing: CaptureResourceLease?,
++        whenReady: @escaping (CaptureResourceLease) -> Void
++    ) {}
++    func permitsRecoveryUSBLocked(sourceID: String?, entryID: UInt64?, excluding: UUID?) -> Bool { true }
++    func beginRecoveryUSBOperationLocked(
++        sourceID: String?, entryID: UInt64?, expectedLifecycle: UInt64
++    ) -> CaptureResourceLease? {
++        guard !isRecoveryStoppedLocked, recoveryLifecycleGenerationLocked == expectedLifecycle else { return nil }
++        return CaptureResourceLease()
++    }
++}
++
+ /// Executes bounded USB Valeria activation, capture session restarts, and live USB
+ /// configuration rollbacks inside re-validated transactions across `recoveryLock`
+ /// and `recoveryQueue`.
+@@ -575,7 +599,7 @@ enum CaptureValeriaRecoveryCoordinator {
+             }
+             guard shouldRestore else { return }
+             let restoreOutcome = performGatedLiveRestore(
+-                host: host, entryID: trackedSwitchID, restoreUSB: restoreUSB)
++                host: host, entryID: trackedSwitchID, expectedLifecycle: expectedLifecycle, restoreUSB: restoreUSB)
+             if restoreOutcome.isTerminal {
+                 host.recoveryLock.withLock {
+                     host.withValeriaTrackerLocked {
+@@ -641,7 +665,7 @@ enum CaptureValeriaRecoveryCoordinator {
+                 break
+             case .restoreNow:
+                 _ = performGatedLiveRestore(
+-                    host: host, entryID: pendingEntryID, restoreUSB: restoreUSB)
++                    host: host, entryID: pendingEntryID, expectedLifecycle: expectedLifecycle, restoreUSB: restoreUSB)
+             case .retrySingleSourceReconciliation:
+                 reconcilePendingEmptyDiscoverySwitchIfNeeded(
+                     host: host,
+@@ -733,7 +757,7 @@ enum CaptureValeriaRecoveryCoordinator {
+                 }
+                 if took {
+                     _ = performGatedLiveRestore(
+-                        host: host, entryID: entryID, restoreUSB: restoreUSB)
++                        host: host, entryID: entryID, expectedLifecycle: lifecycle, restoreUSB: restoreUSB)
+                 }
+             }
+         case .queryUSBForSingleSource(let expectedPendingEntryID, let lifecycle):
+@@ -841,7 +865,7 @@ enum CaptureValeriaRecoveryCoordinator {
+                         restoreUSB: restoreUSB)
+                 case .restoreNow(let entryID):
+                     _ = performGatedLiveRestore(
+-                        host: host, entryID: entryID, restoreUSB: restoreUSB)
++                        host: host, entryID: entryID, expectedLifecycle: lifecycle, restoreUSB: restoreUSB)
+                 case .scheduleAmbiguousRollback(let entryID):
+                     scheduleAmbiguousPendingRollbackIfNeeded(
+                         host: host,
+@@ -869,6 +893,7 @@ enum CaptureValeriaRecoveryCoordinator {
+         let expectedLifecycle: UInt64? = host.recoveryLock.withLock {
+             guard !host.isRecoveryStoppedLocked,
+                 host.recoverySourcesLocked.isEmpty,
++                host.permitsRecoveryUSBLocked(sourceID: nil, entryID: nil, excluding: nil),
+                 host.withValeriaTrackerLocked({ $0.beginEmptyDiscovery() })
+             else { return nil }
+             return host.recoveryLifecycleGenerationLocked
+@@ -878,7 +903,8 @@ enum CaptureValeriaRecoveryCoordinator {
+         host.recoveryQueue.async { [weak host] in
+             guard let host else { return }
+             func stillEmptyLocked() -> Bool {
+-                guard host.recoverySourcesLocked.isEmpty else {
++                guard host.recoverySourcesLocked.isEmpty,
++                    host.permitsRecoveryUSBLocked(sourceID: nil, entryID: nil, excluding: nil) else {
+                     host.withValeriaTrackerLocked { $0.cancelEmptyDiscoveryInFlight() }
+                     return false
+                 }
+@@ -911,15 +937,30 @@ enum CaptureValeriaRecoveryCoordinator {
+ 
+             if let detachedSwitchID = evaluation.detachedSwitchID {
+                 _ = performGatedLiveRestore(
+-                    host: host, entryID: detachedSwitchID, restoreUSB: restoreUSB)
++                    host: host, entryID: detachedSwitchID, expectedLifecycle: expectedLifecycle, restoreUSB: restoreUSB)
+             }
+             guard let candidate = evaluation.candidate else { return }
+ 
++            let operation = host.recoveryLock.withLock { () -> CaptureResourceLease? in
++                let lease = host.beginRecoveryUSBOperationLocked(
++                    sourceID: nil, entryID: candidate.registryEntryID, expectedLifecycle: expectedLifecycle)
++                if lease == nil, host.recoveryLifecycleGenerationLocked == expectedLifecycle {
++                    host.withValeriaTrackerLocked {
++                        $0.cancelEmptyDiscoveryInFlight(refundingUnadmittedEntry: candidate.registryEntryID)
++                    }
++                }
++                return lease
++            }
++            guard let operation else { return }
++            defer { operation.finish() }
+             let isEligibleToMutateUSB: () -> Bool = { [weak host] in
+                 guard let host else { return false }
+                 return withCurrentLifecycle(
+                     host: host, expectedLifecycle: expectedLifecycle, otherwise: false
+-                ) { host.recoverySourcesLocked.isEmpty }
++                ) {
++                    host.recoverySourcesLocked.isEmpty && host.permitsRecoveryUSBLocked(
++                        sourceID: nil, entryID: candidate.registryEntryID, excluding: operation.token)
++                }
+             }
+ 
+             let outcome = activateUSB(nil, true, candidate, isEligibleToMutateUSB)
+@@ -988,13 +1029,12 @@ enum CaptureValeriaRecoveryCoordinator {
+             switch completion {
+             case .none:
+                 break
+-            case .rollback(let entryID, let managerStopped):
+-                if managerStopped {
+-                    _ = restoreUSB(entryID)
+-                } else {
+-                    _ = performGatedLiveRestore(
+-                        host: host, entryID: entryID, restoreUSB: restoreUSB)
+-                }
++            case .rollback(let entryID, _):
++                // A stopped/stale generation is covered by its full-stop restore;
++                // never let a delayed old callback mutate a later lifecycle.
++                _ = performGatedLiveRestore(
++                    host: host, entryID: entryID, expectedLifecycle: expectedLifecycle,
++                    withinOperation: operation, restoreUSB: restoreUSB)
+             case .claimedFrameless(let source, let entryID):
+                 schedulePostSwitchRestoreIfNeeded(
+                     host: host,
+@@ -1037,17 +1077,42 @@ enum CaptureValeriaRecoveryCoordinator {
+     static func performGatedLiveRestore<Host: CaptureValeriaRecoveryHost>(
+         host: Host,
+         entryID: UInt64,
+-        restoreUSB: USBRestorer = USBValeriaConfigurator.restorePreviousConfiguration
++        expectedLifecycle: UInt64? = nil,
++        withinOperation: CaptureResourceLease? = nil,
++        restoreUSB: @escaping USBRestorer = USBValeriaConfigurator.restorePreviousConfiguration
+     ) -> USBValeriaConfigurator.RestoreOutcome {
+-        let preState: (shouldProceed: Bool, closedGate: Bool) = host.recoveryLock.withLock {
+-            guard !host.isRecoveryStoppedLocked else { return (false, false) }
++        let preState: (operation: CaptureResourceLease?, closedGate: Bool, generation: UInt64) = host.recoveryLock.withLock {
++            let generation = expectedLifecycle ?? host.recoveryLifecycleGenerationLocked
++            guard !host.isRecoveryStoppedLocked,
++                host.recoveryLifecycleGenerationLocked == generation else { return (nil, false, generation) }
++            let operation: CaptureResourceLease?
++            if let withinOperation {
++                operation = host.permitsRecoveryUSBLocked(
++                    sourceID: nil, entryID: entryID, excluding: withinOperation.token) ? withinOperation : nil
++            } else {
++                operation = host.beginRecoveryUSBOperationLocked(
++                    sourceID: nil, entryID: entryID, expectedLifecycle: generation)
++            }
++            guard let operation else {
++                host.deferRecoveryUSBRestoreLocked(
++                    entryID: entryID, expectedLifecycle: generation, reusing: withinOperation
++                ) { [weak host] lease in
++                    guard let host else { return }
++                    _ = performGatedLiveRestore(
++                        host: host, entryID: entryID, expectedLifecycle: generation,
++                        withinOperation: lease, restoreUSB: restoreUSB)
++                }
++                return (nil, false, generation)
++            }
+             if host.recoverySourcesLocked.count > 1 {
+                 host.enterMultiDevicePendingForValeriaLocked()
+-                return (true, true)
++                return (operation, true, generation)
+             }
+-            return (true, false)
++            return (operation, false, generation)
+         }
+-        guard preState.shouldProceed else { return .notTracked }
++        // Deferred restoration is not terminal: leave the USB ledger obligation.
++        guard let operation = preState.operation else { return .transientFailure }
++        defer { if withinOperation == nil { operation.finish() } }
+         if preState.closedGate {
+             host.notifyScreensChangedAfterValeriaGate()
+         }
+@@ -1057,6 +1122,7 @@ enum CaptureValeriaRecoveryCoordinator {
+         let postVerify: (closedGate: Bool, job: (UInt64, [String: Host.Source])?) =
+             host.recoveryLock.withLock {
+                 guard !host.isRecoveryStoppedLocked,
++                    host.recoveryLifecycleGenerationLocked == preState.generation,
+                     host.recoverySourcesLocked.count > 1
+                 else { return (false, nil) }
+                 host.enterMultiDevicePendingForValeriaLocked()
+@@ -1085,6 +1151,14 @@ enum CaptureValeriaRecoveryCoordinator {
+                 source.isDeviceConnected,
+                 !source.hasFrame
+             else { return nil }
++            // Preserve the existing bounded restart request merge while this
++            // source's first probe owns its USB operation lease.
++            let alreadyInFlight = host.withValeriaTrackerLocked {
++                $0.entries[source.instanceID]?.inFlight == true
++            }
++            guard alreadyInFlight || host.permitsRecoveryUSBLocked(
++                sourceID: source.id, entryID: source.pinnedUSBDevice?.registryEntryID, excluding: nil)
++            else { return nil }
+             let decision = host.withValeriaTrackerLocked {
+                 $0.begin(sourceInstanceID: source.instanceID, restartRequested: restartSource)
+             }
+@@ -1109,10 +1183,26 @@ enum CaptureValeriaRecoveryCoordinator {
+                 guard host.recoverySourcesLocked[source.id] === source else { return nil }
+                 return snapshotLocked(host: host, source: source)
+             }
++            let operation = host.recoveryLock.withLock { () -> CaptureResourceLease? in
++                let lease = host.beginRecoveryUSBOperationLocked(
++                    sourceID: source.id, entryID: source.pinnedUSBDevice?.registryEntryID,
++                    expectedLifecycle: plan.snapshot.lifecycleGeneration)
++                if lease == nil, host.recoveryLifecycleGenerationLocked == plan.snapshot.lifecycleGeneration {
++                    host.withValeriaTrackerLocked {
++                        $0.cancelInFlight(sourceInstanceID: source.instanceID, refundUnadmittedProbe: plan.tryUSB)
++                    }
++                }
++                return lease
++            }
++            guard let operation else { return }
++            defer { operation.finish() }
+             let isEligibleToMutateUSB: () -> Bool = { [weak host] in
+                 guard let host else { return false }
+                 return host.recoveryLock.withLock {
+-                    guard host.recoverySourcesLocked[source.id] === source else { return false }
++                    guard host.recoverySourcesLocked[source.id] === source,
++                        host.permitsRecoveryUSBLocked(
++                            sourceID: source.id, entryID: source.pinnedUSBDevice?.registryEntryID,
++                            excluding: operation.token) else { return false }
+                     let current = snapshotLocked(host: host, source: source)
+                     return plan.snapshot.remainsValidForExecution(current: current)
+                 }
+@@ -1194,7 +1284,8 @@ enum CaptureValeriaRecoveryCoordinator {
+ 
+             if let rollbackEntryID = postAction.rollbackEntryID {
+                 _ = performGatedLiveRestore(
+-                    host: host, entryID: rollbackEntryID, restoreUSB: restoreUSB)
++                    host: host, entryID: rollbackEntryID, expectedLifecycle: plan.snapshot.lifecycleGeneration,
++                    withinOperation: operation, restoreUSB: restoreUSB)
+             }
+             if postAction.shouldRestart {
+                 source.restart()
+diff --git a/Sources/iPhoneUse/Capture/USBValeriaConfigurator.swift b/Sources/iPhoneUse/Capture/USBValeriaConfigurator.swift
+index 1ff0ed6..2947cb3 100644
+--- a/Sources/iPhoneUse/Capture/USBValeriaConfigurator.swift
++++ b/Sources/iPhoneUse/Capture/USBValeriaConfigurator.swift
+@@ -910,6 +910,12 @@ enum USBValeriaConfigurator {
+         }
+     }
+ 
++    /// Asynchronous completion barrier, including work whose bounded caller
++    /// already returned. Never waits on the calling thread.
++    static func afterPendingOperations(_ completion: @escaping () -> Void) {
++        queue.async(execute: completion)
++    }
++
+     @discardableResult
+     static func restorePreviousConfiguration(registryEntryID: UInt64) -> RestoreOutcome {
+         queue.sync {
+diff --git a/Tests/iPhoneUseTests/Capture/USBValeriaConfiguratorTests.swift b/Tests/iPhoneUseTests/Capture/USBValeriaConfiguratorTests.swift
+index 5aa6242..6a06a22 100644
+--- a/Tests/iPhoneUseTests/Capture/USBValeriaConfiguratorTests.swift
++++ b/Tests/iPhoneUseTests/Capture/USBValeriaConfiguratorTests.swift
+@@ -1660,8 +1660,9 @@ final class USBValeriaConfiguratorTests: XCTestCase {
+         XCTAssertEqual(ledger.restore(registryEntryID: 101, session: session), .restored)
+         XCTAssertTrue(ledger.trackedEntryIDs.isEmpty)
+ 
+-        // Stale-generation `activateUSB` returning `.switched` after `stop() + start()` rolls back
+-        // without polluting the new generation's tracker.
++        // A stale generation must not restore USB after a later lifecycle starts.
++        // Its operation is owned by full shutdown, whose post-drain restore handles
++        // the persisted switch; this delayed callback does not mutate the new life.
+         let host2 = MockValeriaRecoveryHost(queue: queue)
+         let enteredActivate = expectation(description: "entered empty activateUSB")
+         let releaseActivate = DispatchSemaphore(value: 0)
+@@ -1687,7 +1688,7 @@ final class USBValeriaConfiguratorTests: XCTestCase {
+         }
+         releaseActivate.signal()
+         queue.sync {}
+-        XCTAssertEqual(staleRollbacks, [101])
++        XCTAssertTrue(staleRollbacks.isEmpty)
+         XCTAssertNil(host2.recoveryLock.withLock { host2.tracker.pendingEmptyDiscoverySwitch })
+     }
+ 

@@ -1,0 +1,436 @@
+diff --git a/Sources/iPhoneUse/Input/DeviceClipboard.swift b/Sources/iPhoneUse/Input/DeviceClipboard.swift
+new file mode 100644
+index 0000000..87aa594
+--- /dev/null
++++ b/Sources/iPhoneUse/Input/DeviceClipboard.swift
+@@ -0,0 +1,106 @@
++import Darwin
++import Foundation
++
++/// Literal UTF-8 delivery to the selected phone's clipboard. This changes the
++/// phone clipboard, not an accessibility field value. Cmd+V and observation are
++/// separate steps; a successful service reply does not verify the focused field.
++enum DeviceClipboard {
++    static let pythonKey = "IPHONE_USE_USB_CLIPBOARD_PYTHON"
++    static let deviceKey = "IPHONE_USE_USB_DEVICE_ID"
++
++    static var isConfigured: Bool { isConfigured(environment: ProcessInfo.processInfo.environment) }
++
++    static func isConfigured(environment: [String: String]) -> Bool {
++        environment[pythonKey] != nil || environment[deviceKey] != nil
++    }
++
++    struct Configuration {
++        let python: URL
++        let deviceID: String
++
++        init(environment: [String: String]) throws {
++            guard let python = environment[pythonKey], python.hasPrefix("/"),
++                !python.contains("\0"), let deviceID = environment[deviceKey],
++                deviceID.range(of: "^(?:[0-9A-Fa-f]{8}-[0-9A-Fa-f]{16}|[0-9A-Fa-f]{40})$", options: .regularExpression)
++                    != nil
++            else {
++                throw DeviceError("USB clipboard requires an absolute Python path and the exact physical iPhone UDID")
++            }
++            self.python = URL(fileURLWithPath: python)
++            self.deviceID = deviceID
++        }
++
++        var arguments: [String] { ["-m", "pymobiledevice3", "developer", "core-device", "copy", "--userspace"] }
++
++        func childEnvironment(_ inherited: [String: String]) -> [String: String] {
++            // Do not let a shell's tunnel or native-transport override select a
++            // different service route. --userspace and this exact ID are fixed.
++            var result = inherited.filter { !$0.key.hasPrefix("PYMOBILEDEVICE3_") }
++            result["PYMOBILEDEVICE3_UDID"] = deviceID
++            result["PYMOBILEDEVICE3_USERSPACE"] = "1"
++            return result
++        }
++    }
++
++    static func write(
++        _ text: String, environment: [String: String] = ProcessInfo.processInfo.environment,
++        timeout: TimeInterval = 10
++    ) throws {
++        let configuration = try Configuration(environment: environment)
++        guard timeout.isFinite, timeout > 0 else { throw DeviceError("USB clipboard timeout must be positive") }
++        guard FileManager.default.isExecutableFile(atPath: configuration.python.path) else {
++            throw DeviceError("USB clipboard Python is unavailable; run the configured USB setup before typing")
++        }
++
++        // A private, short-lived stdin file avoids pipe backpressure and SIGPIPE
++        // if the helper rejects its configuration before reading input. Text is
++        // never a command argument, shell command, or diagnostic log entry.
++        let directory = FileManager.default.temporaryDirectory
++            .appendingPathComponent("iphone-use-device-clipboard-\(UUID().uuidString)")
++        try FileManager.default.createDirectory(
++            at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
++        defer { try? FileManager.default.removeItem(at: directory) }
++        let inputURL = directory.appendingPathComponent("stdin")
++        let errorURL = directory.appendingPathComponent("stderr")
++        guard
++            FileManager.default.createFile(
++                atPath: inputURL.path, contents: Data(text.utf8), attributes: [.posixPermissions: 0o600]),
++            FileManager.default.createFile(
++                atPath: errorURL.path, contents: nil, attributes: [.posixPermissions: 0o600])
++        else { throw DeviceError("Could not prepare USB clipboard input") }
++        let input = try FileHandle(forReadingFrom: inputURL)
++        let diagnostic = try FileHandle(forWritingTo: errorURL)
++        defer {
++            try? input.close()
++            try? diagnostic.close()
++        }
++
++        let process = Process()
++        process.executableURL = configuration.python
++        process.arguments = configuration.arguments
++        process.environment = configuration.childEnvironment(environment)
++        process.standardInput = input
++        process.standardOutput = FileHandle.nullDevice
++        process.standardError = diagnostic
++        let finished = DispatchSemaphore(value: 0)
++        process.terminationHandler = { _ in finished.signal() }
++        do { try process.run() } catch {
++            throw DeviceError("Could not start USB clipboard helper: \(error.localizedDescription)")
++        }
++        guard finished.wait(timeout: .now() + timeout) == .success else {
++            // Stop only this helper. Do not switch transports or repeat SET.
++            if process.isRunning { process.terminate() }
++            if finished.wait(timeout: .now() + 1) == .timedOut {
++                if process.isRunning { kill(process.processIdentifier, SIGKILL) }
++                _ = finished.wait(timeout: .now() + 1)
++            }
++            throw DeviceError("USB clipboard timed out; delivery is uncertain. No paste or clear keys were sent")
++        }
++        guard process.terminationReason == .exit, process.terminationStatus == 0 else {
++            let detail = (try? String(contentsOf: errorURL, encoding: .utf8)) ?? ""
++            let bounded = String(detail.trimmingCharacters(in: .whitespacesAndNewlines).prefix(1200))
++            throw DeviceError(
++                "USB clipboard failed (\(process.terminationStatus)); no paste or clear keys were sent. \(bounded)")
++        }
++    }
++}
+diff --git a/Sources/iPhoneUse/Input/TextEntry.swift b/Sources/iPhoneUse/Input/TextEntry.swift
+index 2fa52f5..6b81ca7 100644
+--- a/Sources/iPhoneUse/Input/TextEntry.swift
++++ b/Sources/iPhoneUse/Input/TextEntry.swift
+@@ -11,6 +11,10 @@ enum TextEntry {
+     }
+ 
+     static func writeClipboard(_ text: String) throws {
++        if DeviceClipboard.isConfigured {
++            try DeviceClipboard.write(text)
++            return
++        }
+         let write = {
+             NSPasteboard.general.clearContents()
+             return NSPasteboard.general.setString(text, forType: .string)
+@@ -47,7 +51,10 @@ struct TypeTextRequest {
+     let actions: [TextEntryStep]
+     let ensureChineseIME: Bool
+ 
+-    init(_ body: [String: Any], language: AppLanguage = .en) throws {
++    init(
++        _ body: [String: Any], language: AppLanguage = .en,
++        deviceClipboardConfigured: Bool = DeviceClipboard.isConfigured
++    ) throws {
+         let table = StringsAPI(language: language)
+         guard let text = body["text"] as? String else { throw DeviceError(table.textRequired) }
+         for option in TextEntry.textOptions where body[option] != nil {
+@@ -55,7 +62,7 @@ struct TypeTextRequest {
+                 throw DeviceError(language == .zh ? "\(option) 必须是布尔值" : "\(option) must be a boolean")
+             }
+         }
+-        let clipboard = body["use_clipboard"] as? Bool == true
++        let clipboard = (body["use_clipboard"] as? Bool) ?? deviceClipboardConfigured
+         guard clipboard || KeyboardMap.keyboardText(for: text) != nil else {
+             throw DeviceError(
+                 language == .zh
+diff --git a/Sources/iPhoneUse/Localization/StringsMCP.swift b/Sources/iPhoneUse/Localization/StringsMCP.swift
+index 3012570..c2c25da 100644
+--- a/Sources/iPhoneUse/Localization/StringsMCP.swift
++++ b/Sources/iPhoneUse/Localization/StringsMCP.swift
+@@ -94,11 +94,11 @@ struct StringsMCP: LocalizedTable {
+         toolLongPress: "长按某个点，例如打开上下文菜单。",
+         toolSwipe: "沿至少两个点的有序路径持续拖动，直到最后一个点才抬起。默认使用最新截图像素；normalized=true 时每轴使用 0...1000。",
+         toolTypeText:
+-            "通过蓝牙键盘输入 ASCII 或中文（中文转拼音并以空格选择首个候选词）。clear_before 先全选清空；commit_ime 在文字后按空格提交候选词；press_enter 最后按回车。ensure_chinese_ime 使用 OCR 尝试切换中文；设为 false 只保持当前输入法，不会切到英文。字面 ASCII/URL 需先在画面确认拉丁输入法；拼音可能把数字用于选择候选、回车用于提交。可用 press_key 的 Ctrl+Space 切换，然后观察。",
++            "配置 USB 剪贴板后，默认将原样 Unicode（中文、emoji 等）写入指定手机剪贴板再按 Cmd+V；use_clipboard=false 显式选择 HID。未配置时默认 HID，true 使用 Mac 剪贴板。会覆盖所用剪贴板，不读取旧内容。clear_before 先清空；press_enter 最后按回车；请检查字段结果，剪贴板送达不代表字段验证。HID 中文转拼音选首词；ensure_chinese_ime=false 保持当前输入法，拼音可能消费数字/回车；可 Ctrl+Space 切换后观察。",
+         toolPressKey:
+             "按下按键，可带修饰键。按键：enter、escape、backspace、tab、space、up、down、left、right 或单个字符。修饰键：cmd、shift、alt、ctrl。cmd+space 打开聚焦搜索。",
+         toolKeyboardSequence:
+-            "在当前应用中执行简短键盘序列，最后返回截图；预先校验全部步骤，同一手机全程加锁，失败即停且不重放。支持 steps/actions 别名、可选 type、0...5 秒的 delay/wait；最多 16 步、文字总量 256 字符。文字步骤支持 clear_before、commit_ime、press_enter、ensure_chinese_ime；中文转拼音并选择首个候选。ensure_chinese_ime=false 保持当前输入法。字面 ASCII/URL 需先在画面确认拉丁输入法；拼音可能消费数字和回车以选择/提交候选。切换用 press_key 的 Ctrl+Space 后单独观察，再继续序列。",
++            "执行简短键盘序列，最后返回截图；预先校验全部步骤，同一手机全程加锁，失败即停且不重放。支持 steps/actions、可选 type、0...5 秒 delay/wait；最多 16 步、文字总量 256 字符。文字步骤使用与 type_text 相同的传输和选项：配置 USB 剪贴板后默认原样 Unicode，use_clipboard=false 保留 HID。每个文字步骤保留为一次请求，剪贴板写入失败不会先清空该字段。会覆盖所用剪贴板；观察字段以确认结果。",
+         toolHome: "回到主屏幕。",
+         unknownTool: { "未知工具 \($0)" },
+         coordinateFinite: { "\($0) 必须是有限且非负的截图坐标" },
+@@ -106,7 +106,7 @@ struct StringsMCP: LocalizedTable {
+         parameterRequired: { "缺少 \($0)" },
+         keyboardSequenceRange: "keyboard_sequence 需要 1...16 个 steps/actions 步骤和可选的 device/device_id；同时提供的步骤数组必须相同",
+         kbStepLabel: { "keyboard_sequence 第 \($0) 步" },
+-        kbAscii: { "\($0)：文字必须可转换为美式 ASCII 按键或中文拼音；文字总量上限 256" },
++        kbAscii: { "\($0)：文字不能为空；文字总量上限 256" },
+         kbExpected: { "\($0)：需要文字、受支持的按键（可带修饰键）或 delay/wait 延时" },
+         kbDelay: { "\($0)：延时必须是 0...5 秒内的非布尔有限数值" },
+         booleanRequired: { "\($0) 必须是布尔值" },
+@@ -161,11 +161,11 @@ struct StringsMCP: LocalizedTable {
+         toolSwipe:
+             "Drag continuously through an ordered path of at least two points, keeping contact until the last point. Coordinates default to pixels of the latest screenshot; normalized=true uses 0...1000 per axis.",
+         toolTypeText:
+-            "Type with the Bluetooth keyboard; Hanzi becomes pinyin and selects the first candidate. clear_before selects all and deletes; commit_ime presses space after text; press_enter presses Enter. ensure_chinese_ime uses OCR to attempt Chinese selection; false leaves the active IME unchanged and does not select English. Literal ASCII/URLs require a visually verified Latin IME: Pinyin may consume digits as candidate selection and Enter as composition commit. Cycle with press_key Ctrl+Space, then inspect.",
++            "With USB clipboard configured, default pastes literal Unicode (Chinese, emoji, etc.) through the selected phone clipboard and Cmd+V; use_clipboard=false explicitly selects HID. Otherwise default is HID and true uses the Mac clipboard. Overwrites that clipboard without reading its old content. clear_before clears first; press_enter sends Enter last. Inspect the field: clipboard delivery is not field verification. HID turns Hanzi into pinyin; ensure_chinese_ime=false preserves the active IME. Pinyin may consume digits/Enter; cycle with Ctrl+Space then inspect.",
+         toolPressKey:
+             "Press a key, optionally with modifiers. Keys: enter, escape, backspace, tab, space, up, down, left, right, or a character. Modifiers: cmd, shift, alt, ctrl. cmd+space opens Spotlight.",
+         toolKeyboardSequence:
+-            "Run a short keyboard sequence with one final screenshot. Validates all steps first, locks the phone throughout and stops on error without replay. Accepts steps/actions aliases, optional type tags, 0...5-second delay/wait steps; maximum 16 steps and 256 text characters. Text accepts clear_before, commit_ime, press_enter and ensure_chinese_ime; Hanzi becomes pinyin and selects the first candidate. ensure_chinese_ime=false preserves the active IME. Literal ASCII/URLs require a visually verified Latin IME; Pinyin may consume digits/Enter as candidate selection/commit. Cycle with press_key Ctrl+Space and inspect separately before continuing.",
++            "Run a short keyboard sequence with one final screenshot. Validates all steps first, locks the phone throughout and stops on error without replay. Accepts steps/actions, optional type tags, 0...5-second delay/wait; maximum 16 steps and 256 text characters. Text uses type_text's transport/options: configured USB clipboard defaults to literal Unicode; use_clipboard=false selects HID. Each text step stays one request so clipboard failure precedes clearing that field. Overwrites the selected clipboard; inspect the field to verify the result.",
+         toolHome: "Go to the Home Screen.",
+         unknownTool: { "unknown tool \($0)" },
+         coordinateFinite: { "\($0) must be a finite, nonnegative screenshot coordinate" },
+@@ -174,7 +174,7 @@ struct StringsMCP: LocalizedTable {
+         keyboardSequenceRange:
+             "keyboard_sequence requires 1...16 steps/actions and optional device/device_id; both arrays must match when supplied",
+         kbStepLabel: { "keyboard_sequence step \($0)" },
+-        kbAscii: { "\($0): text must be representable as US ASCII keys or Chinese pinyin; total text limit is 256" },
++        kbAscii: { "\($0): text must be nonempty; total text limit is 256" },
+         kbExpected: { "\($0): expected text, a supported key with optional modifiers, or delay/wait" },
+         kbDelay: { "\($0): delay must be a finite, non-boolean number in 0...5 seconds" },
+         booleanRequired: { "\($0) must be a boolean" },
+diff --git a/Sources/iPhoneUse/MCP/MCPKeyboardSequence.swift b/Sources/iPhoneUse/MCP/MCPKeyboardSequence.swift
+index 67d0d87..cdbf4ca 100644
+--- a/Sources/iPhoneUse/MCP/MCPKeyboardSequence.swift
++++ b/Sources/iPhoneUse/MCP/MCPKeyboardSequence.swift
+@@ -66,11 +66,17 @@ enum MCPKeyboardSequence {
+                 step["type"] == nil || step["type"] as? String == "text"
+             {
+                 textCount += text.count
+-                guard !text.isEmpty, textCount <= 256,
+-                    step["use_clipboard"] as? Bool == true || KeyboardMap.keyboardText(for: text) != nil
++                guard !text.isEmpty, textCount <= 256
+                 else { throw MCPServer.MCPError(table.kbAscii(label)) }
+-                let request = try TypeTextRequest(step, language: language)
+-                return request.actions.map { .request(MCPToolRequest(path: $0.path, body: $0.body)) }
++                do { _ = try TypeTextRequest(step, language: language) } catch {
++                    throw MCPServer.MCPError("\(label): \(error)")
++                }
++                // Keep clear/type/submit within one preflighted request. Expanding
++                // them into separate requests could clear a field before the
++                // clipboard write fails, and lost an explicit HID opt-out.
++                var body = step
++                body.removeValue(forKey: "type")
++                return [.request(MCPToolRequest(path: "/type", body: body))]
+             }
+             if let key = step["key"] as? String,
+                 Set(step.keys).isSubset(of: ["type", "key", "modifiers"]),
+diff --git a/Tests/PythonTests/test_mcp_stdio.py b/Tests/PythonTests/test_mcp_stdio.py
+index ee39634..b2ebe11 100644
+--- a/Tests/PythonTests/test_mcp_stdio.py
++++ b/Tests/PythonTests/test_mcp_stdio.py
+@@ -503,11 +503,8 @@ class MCPStdioTests(unittest.TestCase):
+         ]})])[0]
+         self.assertNotIn("isError", result)
+         self.assertEqual([event for event in self.server.events if event[0] == "POST"], [
+-            ("POST", "/key", {"key": "a", "modifiers": ["command"], "device": "phone-1"}),
+-            ("POST", "/key", {"key": "backspace", "modifiers": [], "device": "phone-1"}),
+-            ("POST", "/type", {"text": "nihao", "device": "phone-1"}),
+-            ("POST", "/key", {"key": "space", "modifiers": [], "device": "phone-1"}),
+-            ("POST", "/key", {"key": "enter", "modifiers": [], "device": "phone-1"}),
++            ("POST", "/type", {"text": "nihao", "device": "phone-1", "clear_before": True,
++                                "commit_ime": True, "press_enter": True}),
+             ("POST", "/key", {"key": "tab", "modifiers": [], "device": "phone-1"}),
+         ])
+         self.assertEqual(sum(event[1].startswith("/screenshot") for event in self.server.events), 1)
+@@ -524,6 +521,33 @@ class MCPStdioTests(unittest.TestCase):
+             ("POST", "/type", {"text": "快捷指令", "device": "phone-1", "ensure_chinese_ime": True}),
+         ])
+ 
++    def test_configured_usb_unicode_preserves_default_and_hid_optout_in_all_paths(self):
++        self.env.update(IPHONE_USE_USB_CLIPBOARD_PYTHON="/unused/test/python",
++                        IPHONE_USE_USB_DEVICE_ID="00000000-0000000000000001")
++        calls = [
++            ("type_text", {"text": "中文 🧩", "clear_before": True, "observe": "none"}),
++            ("keyboard_sequence", {"steps": [{"text": "中文 🧩", "clear_before": True}], "observe": "none"}),
++            ("keyboard_sequence", {"steps": [{"text": "ascii", "use_clipboard": False}], "observe": "none"}),
++            ("act", {"steps": [{"type": "type", "text": "中文 🧩"}], "observe": "none"}),
++        ]
++        results = self.exchange(calls)
++        self.assertTrue(all("isError" not in result for result in results))
++        self.assertEqual([event for event in self.server.events if event[0] == "POST"], [
++            ("POST", "/type", {"text": "中文 🧩", "clear_before": True, "device": "phone-1"}),
++            ("POST", "/type", {"text": "中文 🧩", "clear_before": True, "device": "phone-1"}),
++            ("POST", "/type", {"text": "ascii", "use_clipboard": False, "device": "phone-1"}),
++            ("POST", "/act", {"steps": [{"type": "type", "text": "中文 🧩"}], "device": "phone-1"}),
++        ])
++
++    def test_text_sequence_failure_does_not_send_clear_or_enter_separately(self):
++        self.server.fail_actions = True
++        result = self.exchange([("keyboard_sequence", {
++            "steps": [{"text": "中文 🧩", "use_clipboard": True, "clear_before": True, "press_enter": True}],
++            "observe": "none",
++        })])[0]
++        self.assertTrue(result["isError"])
++        self.assertEqual([event[1] for event in self.server.events if event[0] == "POST"], ["/type"])
++
+     def test_new_invalid_forms_fail_before_device_lookup(self):
+         invalid = [
+             {"actions": [{"delay": True}]}, {"actions": [{"wait": 5.1}]},
+diff --git a/Tests/iPhoneUseTests/Input/DeviceClipboardTests.swift b/Tests/iPhoneUseTests/Input/DeviceClipboardTests.swift
+new file mode 100644
+index 0000000..fff7168
+--- /dev/null
++++ b/Tests/iPhoneUseTests/Input/DeviceClipboardTests.swift
+@@ -0,0 +1,107 @@
++import Foundation
++import XCTest
++
++@testable import iPhoneUse
++
++final class DeviceClipboardTests: XCTestCase {
++    private let deviceID = "00000000-0000000000000001"
++
++    private func temporary() throws -> URL {
++        let directory = FileManager.default.temporaryDirectory
++            .appendingPathComponent("iphone-use-clipboard-test-\(UUID().uuidString)")
++        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
++        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
++        return directory
++    }
++
++    private func helper(_ script: String, in directory: URL) throws -> [String: String] {
++        let executable = directory.appendingPathComponent("helper")
++        try Data(("#!/bin/sh\n" + script).utf8).write(to: executable)
++        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
++        return [DeviceClipboard.pythonKey: executable.path, DeviceClipboard.deviceKey: deviceID]
++    }
++
++    func testConfiguredDefaultIsLiteralAndExplicitFalsePreservesHID() throws {
++        let literal = try TypeTextRequest(["text": "中文 🧩\né"], deviceClipboardConfigured: true)
++        XCTAssertFalse(literal.ensureChineseIME)
++        XCTAssertEqual(literal.actions.first?.body["use_clipboard"] as? Bool, true)
++        let hid = try TypeTextRequest(["text": "abc", "use_clipboard": false], deviceClipboardConfigured: true)
++        XCTAssertNil(hid.actions.first?.body["use_clipboard"])
++        XCTAssertThrowsError(
++            try TypeTextRequest(["text": "🧩", "use_clipboard": false], deviceClipboardConfigured: true))
++        XCTAssertThrowsError(try TypeTextRequest(["text": "🧩"], deviceClipboardConfigured: false))
++        XCTAssertNoThrow(try TypeTextRequest(["text": "🧩", "use_clipboard": true], deviceClipboardConfigured: false))
++    }
++
++    func testPartialConfigurationCannotFallBackToAnotherClipboard() throws {
++        XCTAssertFalse(DeviceClipboard.isConfigured(environment: [:]))
++        for environment in [
++            [DeviceClipboard.pythonKey: "/missing/python"],
++            [DeviceClipboard.deviceKey: deviceID],
++            [DeviceClipboard.pythonKey: "relative/python", DeviceClipboard.deviceKey: deviceID],
++            [DeviceClipboard.pythonKey: "/missing/python", DeviceClipboard.deviceKey: ""],
++            [DeviceClipboard.pythonKey: "/missing/python", DeviceClipboard.deviceKey: "another phone"],
++        ] {
++            XCTAssertTrue(DeviceClipboard.isConfigured(environment: environment))
++            XCTAssertThrowsError(try DeviceClipboard.Configuration(environment: environment))
++        }
++    }
++
++    func testExactUTF8TravelsThroughStdinWithOneFixedTargetAndNoShellExpansion() throws {
++        let directory = try temporary()
++        let text = "E 中文 🧩 — café\n$HOME `touch do-not-create` \"quote\""
++        let environment = try helper(
++            "/bin/cat > '\(directory.path)/payload'\n"
++                + "printf '%s\\n' \"$@\" > '\(directory.path)/arguments'\n"
++                + "printf '%s' \"$PYMOBILEDEVICE3_UDID\" > '\(directory.path)/target'\n"
++                + "printf '%s' \"$PYMOBILEDEVICE3_NATIVE\" > '\(directory.path)/native'\n",
++            in: directory
++        )
++        .merging(["PYMOBILEDEVICE3_UDID": "wrong", "PYMOBILEDEVICE3_NATIVE": "1"]) { _, new in new }
++        try DeviceClipboard.write(text, environment: environment)
++        XCTAssertEqual(try Data(contentsOf: directory.appendingPathComponent("payload")), Data(text.utf8))
++        XCTAssertEqual(try String(contentsOf: directory.appendingPathComponent("target"), encoding: .utf8), deviceID)
++        XCTAssertEqual(try String(contentsOf: directory.appendingPathComponent("native"), encoding: .utf8), "")
++        let arguments = try String(contentsOf: directory.appendingPathComponent("arguments"), encoding: .utf8)
++        XCTAssertEqual(arguments, "-m\npymobiledevice3\ndeveloper\ncore-device\ncopy\n--userspace\n")
++        XCTAssertFalse(arguments.contains(text))
++    }
++
++    func testHelperFailurePrecedesClearAndPasteReports() throws {
++        let environment = try helper("printf 'service unavailable' >&2\nexit 7\n", in: temporary())
++        var reports = 0
++        let input = DeviceInput(host: UUID(), session: UUID(), sleep: { _ in }, reportSender: { _, _ in reports += 1 })
++        let request = try TypeTextRequest(
++            ["text": "中文 🧩", "clear_before": true, "press_enter": true], deviceClipboardConfigured: true)
++        XCTAssertThrowsError(
++            try request.perform(on: input, clipboard: { try DeviceClipboard.write($0, environment: environment) })
++        ) { error in
++            XCTAssertTrue(String(describing: error).contains("service unavailable"))
++        }
++        XCTAssertEqual(reports, 0)
++    }
++
++    func testTimeoutIsBoundedAndDoesNotRetryTheHelper() throws {
++        let directory = try temporary()
++        let environment = try helper(
++            "printf 'called\\n' >> '\(directory.path)/calls'\nexec /bin/sleep 5\n", in: directory)
++        let started = ProcessInfo.processInfo.systemUptime
++        XCTAssertThrowsError(try DeviceClipboard.write("text", environment: environment, timeout: 0.2)) {
++            XCTAssertTrue(String(describing: $0).contains("delivery is uncertain"))
++        }
++        XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - started, 3)
++        // Under a busy test runner the deadline can precede the child's main.
++        // If it did run, there must be only one invocation, never a retry.
++        let calls = (try? String(contentsOf: directory.appendingPathComponent("calls"), encoding: .utf8)) ?? ""
++        XCTAssertTrue(calls.isEmpty || calls == "called\n")
++    }
++
++    func testLongUnicodePayloadIsNotRestrictedByAnInventedServiceLimit() throws {
++        let directory = try temporary()
++        let environment = try helper("/bin/cat > '\(directory.path)/payload'\n", in: directory)
++        let text = String(repeating: "中文🧩\n", count: 1000)
++        XCTAssertGreaterThan(text.utf16.count, 4096)
++        try DeviceClipboard.write(text, environment: environment)
++        XCTAssertEqual(try Data(contentsOf: directory.appendingPathComponent("payload")), Data(text.utf8))
++    }
++}
+diff --git a/Tests/iPhoneUseTests/MCP/MCPProtocolTests.swift b/Tests/iPhoneUseTests/MCP/MCPProtocolTests.swift
+index 7795616..0020c44 100644
+--- a/Tests/iPhoneUseTests/MCP/MCPProtocolTests.swift
++++ b/Tests/iPhoneUseTests/MCP/MCPProtocolTests.swift
+@@ -338,15 +338,17 @@ final class MCPKeyboardAliasTests: XCTestCase {
+             if case .request(let request) = action { return request }
+             return nil
+         }
+-        XCTAssertEqual(requests.map(\.path), ["/key", "/key", "/type", "/key", "/key", "/key"])
+-        XCTAssertEqual(requests.compactMap { $0.body["key"] as? String }, ["a", "backspace", "space", "enter", "tab"])
+-        XCTAssertEqual(requests[0].body["modifiers"] as? [String], ["command"])
++        XCTAssertEqual(requests.map(\.path), ["/type", "/key"])
++        XCTAssertEqual(requests.compactMap { $0.body["key"] as? String }, ["tab"])
++        XCTAssertEqual(requests[0].body["clear_before"] as? Bool, true)
++        XCTAssertEqual(requests[0].body["commit_ime"] as? Bool, true)
++        XCTAssertEqual(requests[0].body["press_enter"] as? Bool, true)
+         let delays = actions.compactMap { action -> Double? in
+             if case .delay(let seconds) = action { return seconds }
+             return nil
+         }
+         XCTAssertEqual(delays, [0, 5, 0.25, 1])
+-        XCTAssertEqual(try MCPKeyboardSequence.actions(arguments: ["steps": steps, "actions": steps]).count, 10)
++        XCTAssertEqual(try MCPKeyboardSequence.actions(arguments: ["steps": steps, "actions": steps]).count, 6)
+         XCTAssertThrowsError(try MCPKeyboardSequence.actions(arguments: ["steps": steps, "actions": [["wait": 0]]]))
+     }
+ 
+@@ -363,6 +365,20 @@ final class MCPKeyboardAliasTests: XCTestCase {
+         XCTAssertEqual(try TypeTextRequest(request.body).actions.first?.body["text"] as? String, "蓝牙")
+     }
+ 
++    func testTextSequenceKeepsClipboardPreflightBeforeClearAndPreservesExplicitHID() throws {
++        for flag in [true, false] {
++            let actions = try MCPKeyboardSequence.actions(arguments: [
++                "steps": [["text": "literal", "use_clipboard": flag, "clear_before": true, "press_enter": true]]
++            ])
++            XCTAssertEqual(actions.count, 1)
++            guard case .request(let request) = actions[0] else { return XCTFail("expected request") }
++            XCTAssertEqual(request.path, "/type")
++            XCTAssertEqual(request.body["use_clipboard"] as? Bool, flag)
++            XCTAssertEqual(request.body["clear_before"] as? Bool, true)
++            XCTAssertEqual(request.body["press_enter"] as? Bool, true)
++        }
++    }
++
+     func testInvalidSequenceFormsAreRejectedBeforeExecution() {
+         let invalid: [[String: Any]] = [
+             ["type": "key", "text": "x"], ["type": "text", "key": "enter"],
