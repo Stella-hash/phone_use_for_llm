@@ -6,7 +6,7 @@ Initial review base: `41651b77369033958d551a73d43f571fcd92cfb8`; updated by a
 normal merge from `main@169cbb79ee4fdef54852c766f9179f4927b9e53c` after Android
 PR #13 landed. The iOS source recipe is unchanged by that merge.
 Native input: `YueChen-C/iPhone-use@577d5f2d0ec5831ed6e3e5d9c3ae482ee1dc4f5c`
-plus ordered patches 0001–0043. The PR head identifies the integration revision.
+plus ordered patches 0001–0044. The PR head identifies the integration revision.
 This page adds iOS evidence; it does not supersede the Android validation records.
 
 ## Remediation after the 7aff1e1 review
@@ -16,7 +16,8 @@ read from the same exact UDID as input. It verifies the sole USB attachment befo
 and after screenshots and immediately before input commit. Managed startup and
 shutdown do not enter the old AV/Valeria/Bluetooth lifecycle. Mismatched legacy
 capture/USB configuration is rejected before a helper or clipboard operation.
-The native tree is `fbbf99283c329740dea740fda893b2dcdf8ef4e1`.
+The native tree is `7b9d8e77c9d57c79e427a563f3b2405f135537dd`. Patch 0044 only migrates the AX isolated-Python
+argument and native Home localization assertions; production files are unchanged.
 
 The same patch separates HID and clipboard effects, compares OCR against retained
 pre-input pixels from the current call, and marks every internal screenshot as
