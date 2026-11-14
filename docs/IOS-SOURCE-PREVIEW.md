@@ -6,7 +6,7 @@ Initial review base: `41651b77369033958d551a73d43f571fcd92cfb8`; updated by a
 normal merge from `main@169cbb79ee4fdef54852c766f9179f4927b9e53c` after Android
 PR #13 landed. The iOS source recipe is unchanged by that merge.
 Native input: `YueChen-C/iPhone-use@577d5f2d0ec5831ed6e3e5d9c3ae482ee1dc4f5c`
-plus ordered patches 0001–0040. The PR head identifies the integration revision.
+plus ordered patches 0001–0041. The PR head identifies the integration revision.
 This page adds iOS evidence; it does not supersede the Android validation records.
 
 ## What is included
@@ -35,11 +35,12 @@ Android authorization and owner-signing claims do not cover this host.
 
 The source recipe was assembled independently in the public checkout and built
 successfully on the development Mac. Its native Git tree was
-`5f77b233ee0083e5a7120ec534446f4b97e01ad7`. Patch 0040 removes unused MCP
+`eabcf7363f788bc1f025b85521f2154d351a76a9`. Patch 0040 removes unused MCP
 compatibility handlers and migrates protocol/driver assertions to `act.steps`.
 Both checkouts built this recipe. The 115-test native overlay and 116-test release
 protocol suite passed on the same production source; the final recipe additionally
-corrects a test-only numeric cast and the architecture file inventory.
+corrects a test-only numeric cast, the architecture file inventory, and the
+expected-error test helper (0041); production source remains unchanged.
 
 | Check | Observed result |
 | --- | --- |
@@ -76,6 +77,14 @@ count, endpoints and final all-up checks. It also migrates all successful Python
 protocol inputs to explicit `act.steps`; the generic test exchange is unchanged.
 Valid old-tool payloads are rejected in both USB and non-USB modes with zero
 HTTP requests and a not-sent receipt. No tests are skipped to retire these APIs.
+
+The 0040 hosted run compiled and executed 542 XCTest cases plus 28 Swift Testing
+cases. All 96 failures originated in the same new `actRequest` test helper:
+wrapping a throwing validator inside `XCTUnwrap` records an unexpected failure
+before an outer `XCTAssertThrowsError` can inspect it. Patch 0041 evaluates the
+validator first, then unwraps its optional result. Every successful-input and
+invalid-input assertion remains; production source is unchanged. The corrected
+full suite must be read at the new head, not inferred from the earlier run.
 
 The actual loopback listener accepted passive status and the same-origin viewer.
 It rejected foreign Host, cross-origin input, cross-site screenshot and non-JSON
