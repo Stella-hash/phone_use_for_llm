@@ -6,7 +6,7 @@ Initial review base: `41651b77369033958d551a73d43f571fcd92cfb8`; updated by a
 normal merge from `main@169cbb79ee4fdef54852c766f9179f4927b9e53c` after Android
 PR #13 landed. The iOS source recipe is unchanged by that merge.
 Native input: `YueChen-C/iPhone-use@577d5f2d0ec5831ed6e3e5d9c3ae482ee1dc4f5c`
-plus ordered patches 0001–0038. The PR head identifies the integration revision.
+plus ordered patches 0001–0039. The PR head identifies the integration revision.
 This page adds iOS evidence; it does not supersede the Android validation records.
 
 ## What is included
@@ -32,7 +32,7 @@ Android authorization and owner-signing claims do not cover this host.
 
 The source recipe was assembled independently in the public checkout and built
 successfully on the development Mac. Its native Git tree was
-`84c9450b3eca0443a86ce0ebdb97e8c57b582ca0`. Patch 0038 changes native tests only;
+`5dbbfab6f3b7c46421c8ccff252fb33ea2501282`. Patches 0038–0039 change native tests only;
 the device-tested runtime source is unchanged from the 0037 recipe.
 
 | Check | Observed result |
@@ -56,7 +56,10 @@ The first hosted full-suite compilation exposed stale localization tests that
 referenced retired normalized-coordinate strings and the old tool catalog.
 Patch 0038 updates those tests to the seven-tool, nested `act` and frame-bound
 contracts, retaining bilingual schema/validation coverage. It adds no legacy
-runtime interface or test skip.
+runtime interface or test skip. The following full run exposed three remaining
+legacy routing assertions; 0039 tests frame-bound MCP → JSON HTTP → USB contact
+program behavior and rejection of normalized/unbound input. The old pointer
+driver's continuous-drag regression remains a separate driver-level test.
 
 The actual loopback listener accepted passive status and the same-origin viewer.
 It rejected foreign Host, cross-origin input, cross-site screenshot and non-JSON
