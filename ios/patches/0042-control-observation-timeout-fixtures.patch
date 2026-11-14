@@ -1,0 +1,145 @@
+diff --git a/Tests/PythonTests/test_mcp_stdio.py b/Tests/PythonTests/test_mcp_stdio.py
+index ce8ac7f..d9b56ba 100644
+--- a/Tests/PythonTests/test_mcp_stdio.py
++++ b/Tests/PythonTests/test_mcp_stdio.py
+@@ -1053,8 +1053,17 @@ class MCPStdioTests(unittest.TestCase):
+         self.assertTrue(late_finished.wait(timeout=2))
+ 
+     def test_failed_capture_does_not_turn_acknowledged_input_into_a_retryable_action_error(self):
+-        self.server.screenshot_response = lambda path: (503, b'{"error":"capture unavailable"}', None)
+-        result = self.exchange([("act", {"steps": [{"type": "home"}], "observation_timeout": 0.3})])[0]
++        observation_requested = threading.Event()
++
++        def unavailable_capture(path):
++            if "stability=1" not in path:
++                observation_requested.set()
++            return 503, b'{"error":"capture unavailable"}', None
++
++        self.server.screenshot_response = unavailable_capture
++        # Exercise the failed HTTP response, not scheduler exhaustion before the GET.
++        result = self.exchange([("act", {"steps": [{"type": "home"}], "observation_timeout": 5})])[0]
++        self.assertTrue(observation_requested.is_set(), "The post-input capture GET was never requested")
+         self.assertNotIn("isError", result)
+         metadata = result["structuredContent"]
+         self.assertTrue(metadata["action_acknowledged"])
+@@ -1069,15 +1078,21 @@ class MCPStdioTests(unittest.TestCase):
+         self.server.act_response = (200, {"ok": True, "completed": 1, "step_receipts": [
+             {"step": 1, "type": "tap", "ok": True, "touch_receipt": transport}]})
+         sequence = 0
++        observation_requested = threading.Event()
++        release_observation = threading.Event()
++        delayed_threads = []
+ 
+         def screenshot(path):
+             nonlocal sequence
+             sequence += 1
+             return identified_capture_reply(160, sequence, capture_uptime())
+ 
+-        def slow_first_observation(path):
++        def hold_first_observation(path):
+             self.server.before_screenshot = None
+-            time.sleep(0.3)  # Exceeds the first observation's remaining 0.2s budget.
++            delayed_threads.append(threading.current_thread())
++            observation_requested.set()
++            # Only cleanup releases this response, after the MCP call has timed out.
++            release_observation.wait()
+ 
+         original_handle_error = self.server.handle_error
+ 
+@@ -1087,22 +1102,80 @@ class MCPStdioTests(unittest.TestCase):
+ 
+         self.server.handle_error = handle_error
+         self.server.screenshot_response = screenshot
+-        self.server.before_screenshot = slow_first_observation
+-        result, recovered = self.exchange([
+-            ("act", {"steps": [{"type": "tap", "frame_id": FRAME, "x": 7, "y": 9}],
+-                     "observe": "full", "observation_timeout": 0.2}),
+-            ("screenshot", {}),
+-        ])
+-        self.assertNotIn("isError", result)
+-        metadata = result["structuredContent"]
+-        self.assertEqual(metadata["input_receipt"]["status"], "sent_unverified")
+-        self.assertEqual(metadata["observation"]["status"], "unobserved")
+-        self.assertEqual(metadata["observation"]["reason"], "no_frame")
+-        self.assertIn("HTTP response timed out after", metadata["observation"]["detail"])
+-        self.assertNotIn("app is not running", metadata["observation"]["detail"])
+-        self.assertEqual(sum(event[0] == "POST" for event in self.server.events), 1)
+-        self.assertNotIn("isError", recovered)
+-        self.assertTrue(recovered["structuredContent"]["frame"]["id"])
++        self.server.before_screenshot = hold_first_observation
++        process = subprocess.Popen([str(LAUNCHER)], env=self.env, cwd="/",
++                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
++                                   stderr=subprocess.PIPE, text=True, bufsize=1)
++
++        def send(message):
++            process.stdin.write(json.dumps(message) + "\n")
++            process.stdin.flush()
++
++        def read_reply(identifier):
++            with selectors.DefaultSelector() as selector:
++                selector.register(process.stdout, selectors.EVENT_READ)
++                self.assertTrue(selector.select(10), f"MCP reply {identifier} did not arrive")
++            line = process.stdout.readline()
++            self.assertTrue(line, f"MCP exited before reply {identifier}")
++            reply = json.loads(line)
++            self.assertEqual(reply["id"], identifier)
++            self.assertNotIn("error", reply)
++            return reply["result"]
++
++        try:
++            send({"jsonrpc": "2.0", "id": "init", "method": "initialize", "params": {
++                "protocolVersion": "2025-06-18", "capabilities": {},
++                "clientInfo": {"name": "observation-timeout-test", "version": "1.0.0"},
++            }})
++            read_reply("init")
++            send({"jsonrpc": "2.0", "method": "notifications/initialized"})
++            # The five-second window leaves room for hosted-runner scheduling before
++            # the GET. The Event holds its response for the entire actual HTTP wait.
++            send({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
++                "name": "act", "arguments": {"steps": [
++                    {"type": "tap", "frame_id": FRAME, "x": 7, "y": 9}],
++                    "observe": "full", "observation_timeout": 5},
++            }})
++            self.assertTrue(observation_requested.wait(8),
++                            "The action observation GET never started; an idle deadline is not an HTTP timeout")
++            result = read_reply(1)
++            self.assertNotIn("isError", result)
++            metadata = result["structuredContent"]
++            self.assertEqual(metadata["input_receipt"]["status"], "sent_unverified")
++            self.assertEqual(metadata["observation"]["status"], "unobserved")
++            self.assertEqual(metadata["observation"]["reason"], "no_frame")
++            self.assertIn("HTTP response timed out after", metadata["observation"]["detail"])
++            self.assertNotIn("app is not running", metadata["observation"]["detail"])
++            self.assertEqual(sum(event[0] == "POST" for event in self.server.events), 1)
++            # Submit recovery only after reading the action result. Otherwise its GET
++            # could satisfy observation_requested without exercising the timeout.
++            send({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
++                "name": "screenshot", "arguments": {},
++            }})
++            recovered = read_reply(2)
++            self.assertNotIn("isError", recovered)
++            self.assertTrue(recovered["structuredContent"]["frame"]["id"])
++            self.assertEqual(sum(event[0] == "POST" for event in self.server.events), 1)
++            self.assertFalse(release_observation.is_set())
++            process.stdin.close()
++            self.assertEqual(process.wait(timeout=5), 0, process.stderr.read())
++        finally:
++            release_observation.set()
++            if not process.stdin.closed:
++                try:
++                    process.stdin.close()
++                except BrokenPipeError:
++                    pass  # The fixture child may already have failed; still release its HTTP thread.
++            try:
++                process.wait(timeout=5)
++            except subprocess.TimeoutExpired:
++                process.kill()
++                process.wait(timeout=5)
++            for stream in (process.stdout, process.stderr):
++                stream.close()
++            for thread in delayed_threads:
++                thread.join(timeout=5)
++                self.assertFalse(thread.is_alive(), "Delayed capture fixture did not finish cleanup")
+ 
+     def test_cached_selector_miss_refreshes_list_without_replaying_input(self):
+         def attach_second(body):

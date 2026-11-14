@@ -6,7 +6,7 @@ Initial review base: `41651b77369033958d551a73d43f571fcd92cfb8`; updated by a
 normal merge from `main@169cbb79ee4fdef54852c766f9179f4927b9e53c` after Android
 PR #13 landed. The iOS source recipe is unchanged by that merge.
 Native input: `YueChen-C/iPhone-use@577d5f2d0ec5831ed6e3e5d9c3ae482ee1dc4f5c`
-plus ordered patches 0001–0041. The PR head identifies the integration revision.
+plus ordered patches 0001–0042. The PR head identifies the integration revision.
 This page adds iOS evidence; it does not supersede the Android validation records.
 
 ## What is included
@@ -35,12 +35,13 @@ Android authorization and owner-signing claims do not cover this host.
 
 The source recipe was assembled independently in the public checkout and built
 successfully on the development Mac. Its native Git tree was
-`eabcf7363f788bc1f025b85521f2154d351a76a9`. Patch 0040 removes unused MCP
+`3362be624053940f0ca2880b50511c1623d9daf9`. Patch 0040 removes unused MCP
 compatibility handlers and migrates protocol/driver assertions to `act.steps`.
 Both checkouts built this recipe. The 115-test native overlay and 116-test release
 protocol suite passed on the same production source; the final recipe additionally
 corrects a test-only numeric cast, the architecture file inventory, and the
-expected-error test helper (0041); production source remains unchanged.
+expected-error test helper (0041) and observation HTTP fixtures (0042);
+production source remains unchanged.
 
 | Check | Observed result |
 | --- | --- |
@@ -85,6 +86,20 @@ before an outer `XCTAssertThrowsError` can inspect it. Patch 0041 evaluates the
 validator first, then unwraps its optional result. Every successful-input and
 invalid-input assertion remains; production source is unchanged. The corrected
 full suite must be read at the new head, not inferred from the earlier run.
+
+The subsequent hosted head passed all 542 XCTest and 28 Swift Testing cases.
+Its release protocol run had one error among 116 tests: a 0.2-second fixture
+assumed an observation HTTP request started before the window elapsed. The
+runtime may legitimately exhaust that window before its first capture GET, in
+which case no HTTP error detail exists. Patch 0042 gives the integration fixture
+a five-second window, confirms that the action GET entered the mock service,
+and holds its response with an Event until the HTTP timeout. Only after reading
+the action result does the same MCP process request recovery, so that recovery
+cannot masquerade as the tested GET. A related 503 fixture also confirms an
+actual GET. All timeout classification, not-replayed input, receipt and recovery
+assertions remain; minimum/maximum budget validation remains in native tests.
+The two fixtures passed three consecutive runs (6/6), and the full local release
+suite passed 116/116 in 68.642 seconds. No production code, retry or skip changed.
 
 The actual loopback listener accepted passive status and the same-origin viewer.
 It rejected foreign Host, cross-origin input, cross-site screenshot and non-JSON
