@@ -22,25 +22,27 @@ const decision=(r,action='yield',extra={})=>({intentVersion:r.input.intentVersio
   targetIndex:null,value:null,reason:'Synthetic local observation',localNotes:'',finding:['yield','finish','blocked'].includes(action)?{
     summary:'A source-bound synthetic finding',question:'',uncertainty:'',references:[{readEventId:r.input.sources[0].eventId,spanIds:[0]}],visualEventIds:[]}:null,...extra});
 let serial=0;
-function harness() {
+function harness(overrides={}) {
   fs.mkdirSync('.runtime',{recursive:true});const dir=fs.mkdtempSync(path.resolve('.runtime/delegation-'));
-  const owner=fixtureOwner(dir,{gameGrants:[{package:'org.example.game',tools:['android_swipe'],disposableOfflineGame:true}]});
+  const owner=fixtureOwner(dir,{gameGrants:[{package:'org.example.game',tools:['android_swipe'],disposableOfflineGame:true}],...overrides});
   const keyFile=path.join(dir,'owner-config','delegate.key');writePrivate(keyFile,'synthetic-fixture-credential-only');
   const cfg={...owner.config,delegation:{enabled:true,acceptsModelEgress:true,allowImages:false,keyFile,model:'fixture-model'}};
   fs.writeFileSync(owner.file,JSON.stringify(cfg));const security=new OwnerSecurity(owner.file);
   const common={expectedPackage:{type:'string'},expectedUrl:{type:'string'},requestId:{type:'string'},context:{type:'object'},imageMode:{type:'string'},approval:{type:'object'}};
   const tool=(name,props={})=>({name,inputSchema:{type:'object',properties:{...common,...props},additionalProperties:false}});
   const catalog=[...delegationTools,tool('android_take_screenshot'),tool('android_list_elements'),
+    tool('android_set_text',{text:{type:'string'},resourceId:{type:'string'}}),
     tool('android_swipe',{direction:{type:'string'},x:{type:'integer'},y:{type:'integer'},distance:{type:'integer'},duration:{type:'integer'}}),
     tool('android_press_key',{key:{type:'string'}}),tool('android_activity_open',{eventId:{type:'integer'},receiptOnly:{type:'boolean'},includeScreenshot:{type:'boolean'}})];
   const state={inputs:[],modelCalls:[],reads:0,model:async r=>({answer:decision(r),totalTokens:100}),onInput:async()=>{}};
   const executor=new Executor(security,'synthetic-device',{callTool:async r=>{
-    if(r.name==='android_list_elements')return json({elements});
+    if(r.name==='android_list_elements')return json({elements:state.freshElements??elements});
     state.inputs.push(r);await state.onInput(r);return json({acknowledged:true});
   }},catalog);
   executor.adb={getCurrentApp:()=>({packageName:'org.example.game',activity:'.Main'}),getFocusedPackage:()=>state.package??'org.example.game',
     adb:(_, ...args)=>{state.reads++;if(args[0]==='get-state')return Buffer.from('device');if(args.includes('screencap'))return png;throw Error('unexpected fixture ADB')},
     shell:(_, ...args)=>{state.reads++;if(args.join(' ')==='dumpsys window policy')return state.locked?'showing=true':'showing=false';
+      if(args.at(-1)==='dev.gc.agentphone.helper/.UnicodeInstrumentation')return state.helper(args);
       if(args.join(' ')==='dumpsys power')return 'mWakefulness=Awake';throw Error('unexpected fixture shell')}};
   executor.ui={getElements:()=>elements,getLastCaptureInfo:()=>({backend:'synthetic'})};
   executor.delegation.model=async(r,key,signal)=>{assert.equal(key,'synthetic-fixture-credential-only');state.modelCalls.push(r);return state.model(r,signal)};
@@ -138,6 +140,29 @@ test('finite delegation uses the real public Executor and preserves grant, takeo
     assert(!r.isError);assert.equal(data(r).find(o=>o.phoneReceipt).phoneReceipt.execution,'acknowledged');h.executor.latency.record=saved;
     const jobs=h.executor.journal.meta('delegation-v1');assert(jobs.length<=8);assert(Buffer.byteLength(JSON.stringify(jobs))<=16384);
   });
+});
+
+for (const drift of [false,true]) test(`delegated search keeps its identifier through Executor and Unicode payload; focus drift=${drift}`,async t=>{
+  const h=harness({expertSandbox:{trustedOperators:true,disposablePhone:true,isolatedEnvironment:true,acceptsRisk:true,
+    grants:[{package:'org.example.game',tools:['android_set_text']}]}});
+  t.after(()=>h.executor.close());
+  const searchId='org.example.game:id/search';
+  h.state.freshElements=[{type:'android.widget.EditText',identifier:searchId,label:'Search',focused:true,editable:true,rect:{x:0,y:0,width:100,height:40}}];
+  let calls=0,accepted=0;
+  h.state.helper=args=>{
+    calls++;const payload=JSON.parse(Buffer.from(args[args.indexOf('payload')+1],'base64').toString());
+    assert.equal(payload.resourceId,searchId);assert.equal(payload.expectedPackage,'org.example.game');
+    // Synthetic Android boundary: another same-app, non-password editor gained focus after list_elements.
+    const focusedId=drift?'org.example.game:id/comment':searchId;
+    const ok=!payload.resourceId||payload.resourceId===focusedId;
+    if(ok)accepted++;
+    return 'phone_result_b64='+Buffer.from(JSON.stringify({ok,...(!ok?{error:'Focused input resource id changed; inspect again'}:{})})).toString('base64');
+  };
+  h.state.model=async r=>({answer:decision(r,r.input.remaining.intentModelCalls===4?'search':'yield',
+    r.input.remaining.intentModelCalls===4?{value:'synthetic query'}:{}),totalTokens:1});
+  const job=await h.start(),result=await h.status(job.runId);
+  assert.equal(calls,1);assert.equal(accepted,drift?0:1);assert.equal(result.status,drift?'input_unresolved':'yielded');
+  assert.equal(result.handoffReady,!drift);assert.equal(h.state.inputs.length,0);
 });
 
 test('restart never resumes jobs; unresolved receipt identity withholds takeover and does not trust foreign receipts',async t=>{

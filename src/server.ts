@@ -350,6 +350,7 @@ export const createServer = (options: { uiSnapshotApps?: string[] } = {}): McpSe
 				clickable: el.clickable,
 				editable: el.editable,
 				password: el.password,
+				webView: el.webView,
 				coordinates: {
 					x: el.rect.x + Math.floor(el.rect.width / 2),
 					y: el.rect.y + Math.floor(el.rect.height / 2),

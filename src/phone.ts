@@ -108,7 +108,7 @@ for (const tool of catalog) {
     tool.description += " Optional observeAfterMs waits before the one post-action observation/image; phoneObservation.delay reports elapsed time and any budget limit. Never repeats the input or infers action completion.";
   }
   tool.inputSchema.properties!.context = { type: "object", additionalProperties: false,
-    description: "Caller labels grant no authority and are not retained. private=true omits observation text and screenshots from archival.",
+    description: "Caller labels grant no authority and are not written to storage; latency hints use derived cursors only in memory. private=true omits observation text and screenshots from archival.",
     properties: { actor: { type: "string", maxLength: 80 }, session: { type: "string", maxLength: 120 }, intent: { type: "string", maxLength: 400 }, private: { type: "boolean" } } };
   tool.annotations = { ...tool.annotations, openWorldHint: true };
 }

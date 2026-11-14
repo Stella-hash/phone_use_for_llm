@@ -6,6 +6,7 @@ import { LIMITS } from "./limits.js";
 type Store = { meta(key: string): any; setMeta(key: string, value: any): void; open(id: number): any };
 type Sample = { eventId: number; at: string; app: string; tool: string; backend: string;
   wake: boolean | null; failed: boolean; metrics: Record<string, number> };
+type Delivery = { revision: number; uiMs: number; conditions: { backend: string | null; wakeRequested: boolean | null }; at: number };
 const number = (n: unknown): n is number => typeof n === "number" && Number.isFinite(n) && n >= 0;
 function distribution(values: number[]) {
   const sorted = values.slice(-32).sort((a, b) => a - b), n = sorted.length;
@@ -24,17 +25,20 @@ export const latencyTool: Tool = { name: "android_latency_profile", title: "Read
 export class LatencyProfiles {
   private key: string;
   private deviceKey: string;
+  private deliveries = new Map<string, Delivery>();
   constructor(private store: Store, device: string) {
     this.deviceKey = createHash("sha256").update(device).digest("hex").slice(0, 16);
     this.key = "latency-v1";
+    try {
+      // Remove cursors saved by the earlier candidate; only samples persist.
+      if (Object.hasOwn(this.store.meta(this.key) ?? {}, "deliveries")) this.prune();
+    } catch { process.stderr.write("Latency cache cleanup pending; maintenance will retry.\n"); }
   }
-  private data(): { revision: number; samples: Sample[]; deliveries: Record<string, any> } {
+  private data(): { revision: number; samples: Sample[] } {
     const saved = this.store.meta(this.key);
-    const data = saved?.deviceKey === this.deviceKey ? saved : { revision: 0, samples: [], deliveries: {} };
-    data.samples = data.samples.filter((s: Sample) => Date.parse(s.at) > Date.now() - LIMITS.retentionMs
-      && this.store.open(s.eventId)?.callerClaim?.private !== true && !!this.store.open(s.eventId));
-    data.deliveries = Object.fromEntries(Object.entries(data.deliveries).filter(([, v]: any) => v.at > Date.now() - LIMITS.retentionMs));
-    return data;
+    const data = saved?.deviceKey === this.deviceKey ? saved : { revision: 0, samples: [] };
+    return { revision: data.revision, samples: data.samples.filter((s: Sample) => Date.parse(s.at) > Date.now() - LIMITS.retentionMs
+      && this.store.open(s.eventId)?.callerClaim?.private !== true && !!this.store.open(s.eventId)) };
   }
   private save(data: any) {
     data.deviceKey = this.deviceKey;
@@ -42,7 +46,10 @@ export class LatencyProfiles {
     while (Buffer.byteLength(JSON.stringify(data)) > 15000 && data.samples.length) data.samples.shift();
     this.store.setMeta(this.key, data);
   }
-  prune() { this.save(this.data()); }
+  private expireDeliveries() {
+    for (const [id, value] of this.deliveries) if (value.at <= Date.now() - LIMITS.retentionMs) this.deliveries.delete(id);
+  }
+  prune() { this.expireDeliveries(); this.save(this.data()); }
   record(input: { eventId: number; at: string; tool: string; observation: any; queueMs: number; workMs: number; failed: boolean; private?: boolean }) {
     const o = input.observation, app = o?.foregroundApp?.packageName;
     if (input.private || typeof app !== "string" || app.length > 200 || !o?.timing || o.timing.clock !== "host_monotonic_ms") return;
@@ -92,21 +99,22 @@ export class LatencyProfiles {
     }
     return result;
   }
-  /** Delivery cursors suppress repetitive hints; they carry no caller authority. */
+  /** Process-only cursors suppress hints; neither labels nor their hashes persist. */
   notice(app: string | undefined, caller: { actor?: string; session?: string }): any | undefined {
     const profile = this.read(app), n = profile.uiRead.n;
     if (!profile.app || n < 5) return;
     const key = createHash("sha256").update(JSON.stringify([caller.actor ?? "", caller.session ?? "", profile.app])).digest("hex");
-    const data = this.data(), prior = data.deliveries[key];
+    this.expireDeliveries();
+    const prior = this.deliveries.get(key);
     const conditions = { backend: profile.conditions.backend, wakeRequested: profile.conditions.wakeRequested };
     const changed = prior && profile.revision >= prior.revision + 5 &&
       (JSON.stringify(prior.conditions) !== JSON.stringify(conditions) ||
         (Math.abs(profile.uiRead.medianMs - prior.uiMs) >= 250 &&
          Math.max(profile.uiRead.medianMs, prior.uiMs) >= Math.max(1, Math.min(profile.uiRead.medianMs, prior.uiMs)) * 1.75));
     if (prior && !changed) return;
-    data.deliveries[key] = { revision: profile.revision, uiMs: profile.uiRead.medianMs, conditions, at: Date.now() };
-    const entries = Object.entries(data.deliveries).sort((a, b) => a[1].at - b[1].at).slice(-8);
-    data.deliveries = Object.fromEntries(entries); this.save(data);
+    this.deliveries.delete(key);
+    this.deliveries.set(key, { revision: profile.revision, uiMs: profile.uiRead.medianMs, conditions, at: Date.now() });
+    while (this.deliveries.size > 8) this.deliveries.delete(this.deliveries.keys().next().value!);
     return { reason: prior ? "material_change" : "initial_sample_ready", app: profile.app, throughEventId: profile.throughEventId,
       uiRead: profile.uiRead, imageCapture: profile.imageCapture, conditions: profile.conditions,
       note: "Observed host work only. No extra wait or compensation was applied. Read android_latency_profile for details." };

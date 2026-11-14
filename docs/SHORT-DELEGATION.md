@@ -122,6 +122,15 @@ can stop at the existing post-check. The worker does not guess a new URL to
 bypass that check. Label-based refusal of sensitive controls is additional
 guidance, not a semantic firewall; the disposable-device rules still apply.
 
+Tap and targeted scroll require matching old/new element features, geometry and
+WebView group. In Chrome both targets must be inside the same observed WebView
+group; untargeted browser scrolling and native toolbar targets are refused.
+The group is a per-dump consistency marker, not a persistent document identity;
+the existing exact-URL checks remain necessary. Native search requires a unique
+focused search field with a nonempty resource ID. That ID travels to the Unicode
+helper, which checks it again before setting text. Missing IDs or a different
+focused field are refused, with no fallback to unbound text input.
+
 The worker owns this service's UI/input lane while running. It does not exclude
 human touches, Android itself or another ADB client. Version checks discard late
 model answers; queued actions check again at admission. An already admitted input

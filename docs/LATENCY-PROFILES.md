@@ -9,6 +9,12 @@ The default response is compact; `detail: true` includes distributions grouped
 by tool, UI backend and wake condition, plus source event IDs. After five usable
 samples an ordinary observation can include one compact hint; another appears
 only after a material change. Caller labels only suppress repeated hints.
+The service keeps at most eight notice cursors in process memory, expiring within
+seven days; neither the labels nor their derived hashes are written to the
+profile cache. Restarting the service or evicting a cursor can repeat a hint.
+On upgrade, startup removes notice hashes persisted by the earlier review
+candidate. If the cache is temporarily unwritable, a fixed diagnostic reports
+pending cleanup and maintenance retries; measurement samples remain usable.
 
 The monotonic host clock measures UI collection, screenshot capture and archive
 work, queue delay, and server work. Nested measurements are not additive.

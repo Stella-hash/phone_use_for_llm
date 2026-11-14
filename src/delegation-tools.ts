@@ -27,6 +27,6 @@ const descriptions = {
 export const delegationTools: Tool[] = Object.entries(delegateSchemas).map(([name, schema]) => {
   const inputSchema: any = z.toJSONSchema(schema, { io: "input" }); delete inputSchema.$schema;
   return { name, description: descriptions[name as keyof typeof descriptions], inputSchema,
-    annotations: { readOnlyHint: name === "android_delegate_status", destructiveHint: false, openWorldHint: name !== "android_delegate_status" && name !== "android_delegate_stop" } };
+    annotations: { readOnlyHint: name === "android_delegate_status", destructiveHint: name !== "android_delegate_status", openWorldHint: name !== "android_delegate_status" && name !== "android_delegate_stop" } };
 });
 export const delegationNames = new Set(Object.keys(delegateSchemas));
